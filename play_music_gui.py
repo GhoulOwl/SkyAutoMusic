@@ -14,6 +14,8 @@ import psutil
 import sys
 import ctypes
 import webbrowser
+import random
+from enum import Enum
 
 # 资源路径适配函数，兼容PyInstaller打包和开发环境
 def resource_path(relative_path):
@@ -45,55 +47,273 @@ def is_dark_mode():
     except Exception:
         return False
 
-class AutoPlayer:
-    def __init__(self, notes_by_time, sorted_times):
+class PlaybackState(Enum):
+    """三态状态机：未播放 / 播放中 / 暂停中。"""
+    STOPPED = "stopped"
+    PLAYING = "playing"
+    PAUSED = "paused"
+
+
+class KeyController:
+    """统一的按键抽象层。
+
+    - 调试模式：开启后只输出日志，不真正按下按键（PR 调试模式前置能力）。
+    - 优先使用 keyboard 库，失败时回退 pyautogui。
+    - 支持运行时切换按键映射（多套键盘映射的前置能力）。
+    """
+
+    def __init__(self, mapping=None, debug=False, log_func=None):
+        self.mapping = dict(mapping or {})
+        self.debug = debug
+        self.log_func = log_func or (lambda msg: print(msg))
+
+    def set_mapping(self, mapping):
+        self.mapping = dict(mapping or {})
+
+    def set_debug(self, debug):
+        self.debug = debug
+
+    def _resolve(self, note):
+        return self.mapping.get(note)
+
+    def press(self, note):
+        key = self._resolve(note)
+        if not key:
+            return
+        if self.debug:
+            self.log_func(f"[DEBUG] press  {note} -> {key}")
+            return
+        try:
+            keyboard.press(key)
+        except Exception:
+            try:
+                pyautogui.keyDown(key)
+            except Exception:
+                self.log_func(f"[WARN] 按键失败: {key}")
+
+    def release(self, note):
+        key = self._resolve(note)
+        if not key:
+            return
+        if self.debug:
+            self.log_func(f"[DEBUG] release {note} -> {key}")
+            return
+        try:
+            keyboard.release(key)
+        except Exception:
+            try:
+                pyautogui.keyUp(key)
+            except Exception:
+                self.log_func(f"[WARN] 释放失败: {key}")
+
+    def press_keys(self, notes):
+        for n in notes:
+            self.press(n)
+
+    def release_keys(self, notes):
+        for n in notes:
+            self.release(n)
+
+
+class MusicPlayer:
+    """播放内核：三态状态机 + 严格 time 差值 + 速度/模拟/调试参数。
+
+    时序规则（依据 1.md）：严格按乐谱 time（毫秒绝对时间戳）的差值播放，
+    不乘任何 bpm 系数；speed 为可实时调节的用户速度倍率（1.0 = 原速）。
+    simulate 开启后加入自然的随机变速与随机失误（模拟真实演奏）。
+    """
+
+    DEFAULT_MISS_PROB = 0.03        # 每个音符被"失误跳过"的概率
+    DEFAULT_JITTER = (0.85, 1.15)   # 间隔随机抖动范围
+    NOTE_HOLD = 0.05                # 单音符按住基准时长（秒）
+
+    def __init__(self, key_controller, update_status=None, update_elapsed=None,
+                 update_total=None, update_progress=None):
+        self.key_controller = key_controller
+        self.update_status = update_status or (lambda msg: None)
+        self.update_elapsed = update_elapsed or (lambda sec: None)
+        self.update_total = update_total or (lambda sec: None)
+        self.update_progress = update_progress or (lambda frac: None)
+        self.state = PlaybackState.STOPPED
+        self._stop = threading.Event()
+        self.notes_by_time = None
+        self.sorted_times = None
+        self.current_idx = 0
+        self.thread = None
+        # 可调参数（由 UI 注入）
+        self.speed = 1.0
+        self.simulate = False
+        self.miss_prob = self.DEFAULT_MISS_PROB
+        self.jitter = self.DEFAULT_JITTER
+        # 内部控制
+        self._seek_requested = False
+        self._seek_target_idx = 0
+        self._held_keys = []
+
+    # ---------- 状态查询 ----------
+    def is_playing(self):
+        return self.state == PlaybackState.PLAYING
+
+    def is_paused(self):
+        return self.state == PlaybackState.PAUSED
+
+    def is_stopped(self):
+        return self.state == PlaybackState.STOPPED
+
+    # ---------- 控制入口（供 UI 调用） ----------
+    def start(self, notes_by_time, sorted_times):
+        """仅当处于 STOPPED 态时，从曲谱开头开始播放。"""
+        if self.state != PlaybackState.STOPPED or not sorted_times:
+            return False
         self.notes_by_time = notes_by_time
         self.sorted_times = sorted_times
-        self._stop = threading.Event()
-        self._pause = threading.Event()
-        self._pause.set()  # 初始为未暂停
         self.current_idx = 0
-        self.is_playing = False
-
-    def play(self, update_status):
-        self.is_playing = True
         self._stop.clear()
-        self._pause.set()
-        for idx in range(self.current_idx, len(self.sorted_times)):
-            if self._stop.is_set():
-                break
-            while not self._pause.is_set():
-                time.sleep(0.1)
-            t = self.sorted_times[idx]
-            keys = self.notes_by_time[t]
-            for k in keys:
-                key = note_to_key.get(k)
-                if key:
-                    pyautogui.keyDown(key)
-            time.sleep(0.05)
-            for k in keys:
-                key = note_to_key.get(k)
-                if key:
-                    pyautogui.keyUp(key)
-            update_status(f"演奏进度: {idx+1}/{len(self.sorted_times)}")
-            if idx < len(self.sorted_times) - 1:
-                interval = (self.sorted_times[idx + 1] - t) / 1000.0
-                if interval > 0:
-                    time.sleep(interval)
-            self.current_idx = idx + 1
-        self.is_playing = False
-        update_status("演奏结束！")
-
-    def stop(self):
-        self._stop.set()
-        self.is_playing = False
-        self.current_idx = 0
+        self._seek_requested = False
+        self._held_keys = []
+        self.state = PlaybackState.PLAYING
+        self.thread = threading.Thread(target=self._run, daemon=True)
+        self.thread.start()
+        return True
 
     def pause(self):
-        self._pause.clear()
+        if self.state == PlaybackState.PLAYING:
+            self.state = PlaybackState.PAUSED
 
     def resume(self):
-        self._pause.set()
+        if self.state == PlaybackState.PAUSED:
+            self.state = PlaybackState.PLAYING
+
+    def stop(self):
+        """切回 STOPPED 态（自动播放完成或点击结束按钮都走这里）。"""
+        self._stop.set()
+        self.state = PlaybackState.STOPPED
+        self.current_idx = 0
+        self._release_held()
+
+    def seek(self, target_idx):
+        """定位到指定音符索引（播放中/暂停中均可；STOPPED 态忽略）。"""
+        if self.state == PlaybackState.STOPPED or not self.sorted_times:
+            return
+        self._seek_target_idx = max(0, min(int(target_idx), len(self.sorted_times) - 1))
+        self._seek_requested = True
+
+    # ---------- 内部实现 ----------
+    def _release_held(self):
+        if self._held_keys:
+            try:
+                self.key_controller.release_keys(self._held_keys)
+            except Exception:
+                pass
+            self._held_keys = []
+
+    def _run(self):
+        try:
+            self._playback_loop()
+        finally:
+            self._release_held()
+            self.state = PlaybackState.STOPPED
+            self.current_idx = 0
+            # 仅自然播放完成时提示"结束"，手动停止由 UI 控制文案
+            if not self._stop.is_set():
+                self.update_progress(1.0)
+                self.update_status("演奏结束！")
+
+    def _playback_loop(self):
+        notes_by_time = self.notes_by_time
+        sorted_times = self.sorted_times
+        total = len(sorted_times)
+        if total == 0:
+            return
+        t0 = sorted_times[0]
+        last_t = sorted_times[-1]
+        span = max(1, last_t - t0)
+        self.update_total((last_t - t0) / 1000.0)
+        # 起播前给窗口聚焦预留一点时间
+        if not self._sleep_with_controls(0.5):
+            return
+        idx = self.current_idx
+        while idx < total:
+            if self._stop.is_set():
+                break
+            if not self._wait_if_paused():
+                break
+            if self._seek_requested:
+                idx = self._consume_seek(t0, last_t, span)
+                continue
+            t = sorted_times[idx]
+            keys = notes_by_time[t]
+            # 模拟真实演奏：按概率"失误"跳过该音符
+            if self.simulate and random.random() < self.miss_prob:
+                self.update_status(f"演奏进度: {idx + 1}/{total}（失误跳过）")
+            else:
+                held = list(keys)
+                self._held_keys = held
+                self.key_controller.press_keys(held)
+                hold = self.NOTE_HOLD
+                if self.simulate:
+                    hold *= random.uniform(0.7, 1.4)
+                if not self._sleep_with_controls(hold):
+                    break
+                self.key_controller.release_keys(held)
+                if self._held_keys is held:
+                    self._held_keys = []
+                self.update_status(f"演奏进度: {idx + 1}/{total}")
+            # 进度与时间显示（严格按 time 差值）
+            elapsed_sec = max(0, (t - t0) / 1000.0)
+            self.update_elapsed(elapsed_sec)
+            self.update_progress((t - t0) / span)
+            if idx < total - 1:
+                interval = (sorted_times[idx + 1] - t) / 1000.0
+                # 用户速度倍率：speed>1 更快，间隔相应缩短
+                if self.speed and self.speed > 0:
+                    interval = interval / self.speed
+                # 模拟真实演奏：自然的随机变速
+                if self.simulate:
+                    interval *= random.uniform(*self.jitter)
+                if interval > 0 and not self._sleep_with_controls(interval):
+                    break
+            idx += 1
+            self.current_idx = idx
+
+    def _wait_if_paused(self):
+        """暂停态下阻塞，直到 resume / stop / seek。返回 False 表示被 stop。"""
+        step = 0.05
+        while self.state == PlaybackState.PAUSED:
+            if self._stop.is_set():
+                return False
+            if self._seek_requested:
+                return True
+            time.sleep(step)
+        return not self._stop.is_set()
+
+    def _consume_seek(self, t0, last_t, span):
+        self._seek_requested = False
+        target = max(0, min(self._seek_target_idx, len(self.sorted_times) - 1))
+        self.current_idx = target
+        t = self.sorted_times[target]
+        elapsed_sec = max(0, (t - t0) / 1000.0)
+        self.update_elapsed(elapsed_sec)
+        self.update_progress((t - t0) / span)
+        return target
+
+    def _sleep_with_controls(self, duration):
+        """可在小步长内响应 stop / pause / seek 的睡眠。返回 False 表示被 stop 中断。"""
+        step = 0.02
+        slept = 0.0
+        while slept < duration:
+            if self._stop.is_set():
+                return False
+            if self._seek_requested:
+                return True
+            if self.state == PlaybackState.PAUSED:
+                if not self._wait_if_paused():
+                    return False
+                if self._seek_requested:
+                    return True
+            time.sleep(step)
+            slept += step
+        return True
 
 class MusicGUI:
     def __init__(self, root):
@@ -157,11 +377,27 @@ class MusicGUI:
         self.all_music_files = self.get_all_music_files() or []
         self.filtered_music_files = self.all_music_files.copy()
         self.refresh_music_listbox()
-        self.player = None
+        # 统一按键抽象层（调试模式、可切换映射的前置能力）
+        self.key_controller = KeyController(
+            mapping=note_to_key, debug=False, log_func=self._debug_log)
+        # 播放内核（三态状态机），回调绑定到本类方法
+        self.player = MusicPlayer(
+            key_controller=self.key_controller,
+            update_status=self._on_status,
+            update_elapsed=self._on_elapsed,
+            update_total=self._on_total,
+            update_progress=self._on_progress,
+        )
         self.music_data = None
         self.notes_by_time = None
         self.sorted_times = None
-        self.play_thread = None
+        # 播放相关可调参数（后续 UI 注入，这里给默认值）
+        self.debug = False
+        self.speed = 1.0
+        self.simulate = False
+        self.miss_prob = 0.03
+        self._progress_frac = 0.0
+        self.debug_logs = []
         self.last_music_files = set(self.all_music_files or [])
         self.schedule_music_dir_watch()
 
@@ -434,85 +670,66 @@ class MusicGUI:
         self.music_info_vars['transcribedBy'].set(transcribed)
 
     def start_play(self):
-        if not self.check_and_set_game_window():
+        # 三态约束：从头开始必须处于"未播放"态，否则异常（依据 1.md）
+        if self.player.state != PlaybackState.STOPPED:
+            self.status_var.set("请先停止当前演奏（F7）再重新开始")
             return
-        if self.player and self.player.is_playing:
+        if not self.check_and_set_game_window():
             return
         if not self.load_music():
             return
-        self.player = AutoPlayer(self.notes_by_time, self.sorted_times)
-        self.play_thread = threading.Thread(target=self.play_with_progress, args=(self.status_var.set,))
-        self.play_thread.daemon = True
-        self.play_thread.start()
+        # 把当前可调参数注入播放器
+        self.player.speed = self.speed
+        self.player.simulate = self.simulate
+        self.player.miss_prob = self.miss_prob
+        self.key_controller.set_debug(self.debug)
+        if not self.player.start(self.notes_by_time, self.sorted_times):
+            return
         self.start_btn.config(state="disabled")
         self.stop_btn.config(state="normal")
-        self.status_var.set("演奏中... 可用F7停止")
-
-    def play_with_progress(self, update_status):
-        import keyboard
-        if self.sorted_times is None or self.notes_by_time is None or self.player is None:
-            update_status("未加载乐谱，无法演奏！")
-            return
-        total = len(self.sorted_times)
-        if total == 0:
-            self.elapsed_time_var.set("0:00")
-            return
-        t0 = self.sorted_times[0]
-        # ====== bpm节奏系数，标准bpm为120，可自定义 ======
-        bpm = getattr(self, 'bpm', 120)
-        bpm_factor = 120 / bpm if bpm else 1.0  # bpm越大越快
-        time.sleep(0.5)
-        for idx in range(total):
-            if self.player._stop.is_set():
-                break
-            # 必须始终引用self.player._pause，防止对象被替换
-            while self.player and not self.player._pause.is_set():
-                time.sleep(0.05)
-            if not self.player or self.player._stop.is_set():
-                break
-            t = self.sorted_times[idx]
-            keys = self.notes_by_time[t]
-            for k in keys:
-                key = note_to_key.get(k)
-                if key:
-                    try:
-                        keyboard.press(key)
-                    except Exception:
-                        try:
-                            pyautogui.keyDown(key)
-                        except Exception:
-                            pass
-            time.sleep(0.05)
-            for k in keys:
-                key = note_to_key.get(k)
-                if key:
-                    try:
-                        keyboard.release(key)
-                    except Exception:
-                        try:
-                            pyautogui.keyUp(key)
-                        except Exception:
-                            pass
-            elapsed_sec = max(0, (t - t0) / 1000)
-            m, s = divmod(int(elapsed_sec), 60)
-            self.elapsed_time_var.set(f"{m}:{s:02d}")
-            update_status(f"演奏进度: {idx+1}/{total}")
-            if idx < total - 1:
-                interval = (self.sorted_times[idx + 1] - t) / 1000.0 * bpm_factor  # 按bpm调整节奏
-                if interval > 0:
-                    time.sleep(interval)
-            self.player.current_idx = idx + 1
-        if self.player:
-            self.player.is_playing = False
-            self.elapsed_time_var.set(self.total_time_var.get())
-        update_status("演奏结束！")
+        self.status_var.set("演奏中... F11 暂停 / F7 停止")
 
     def stop_play(self):
         if self.player:
             self.player.stop()
+        self.elapsed_time_var.set("0:00")
+        self._progress_frac = 0.0
         self.status_var.set("已停止，点击开始或按F5重新演奏")
         self.start_btn.config(state="normal")
         self.stop_btn.config(state="disabled")
+
+    def toggle_play_pause(self):
+        """F11：播放中 <-> 暂停中 切换。STOPPED 态忽略（需点播放按钮从头开始）。"""
+        if not self.player:
+            return
+        if self.player.state == PlaybackState.PLAYING:
+            self.player.pause()
+            self.status_var.set("已暂停（F11 继续 / F7 停止）")
+        elif self.player.state == PlaybackState.PAUSED:
+            self.player.resume()
+            self.status_var.set("演奏中... F11 暂停 / F7 停止")
+
+    # ---------- 播放内核回调 ----------
+    def _on_status(self, msg):
+        self.status_var.set(msg)
+
+    def _on_elapsed(self, sec):
+        m, s = divmod(int(sec), 60)
+        self.elapsed_time_var.set(f"{m}:{s:02d}")
+
+    def _on_total(self, sec):
+        m, s = divmod(int(sec), 60)
+        self.total_time_var.set(f"{m}:{s:02d}")
+
+    def _on_progress(self, frac):
+        self._progress_frac = max(0.0, min(1.0, frac))
+
+    def _debug_log(self, msg):
+        # 调试模式日志：打印并保留最近若干条，供后续调试面板使用
+        print(msg)
+        self.debug_logs.append(msg)
+        if len(self.debug_logs) > 200:
+            self.debug_logs = self.debug_logs[-200:]
 
     def check_and_set_game_window(self):
         # 查找进程名为'Sky'或'光遇'的窗口，优先'Sky'
@@ -584,6 +801,9 @@ class MusicGUI:
         return True
 
     def on_close(self):
+        # 退出软件前确保处于"未播放"态并释放可能按住的按键
+        if getattr(self, 'player', None):
+            self.player.stop()
         # 保存窗口大小和位置
         try:
             geo = self.root.geometry()
@@ -614,9 +834,10 @@ class MusicGUI:
             keyboard.unhook_all_hotkeys()
         except Exception:
             pass
-        # 只注册开始和停止热键
+        # 注册开始、播放/暂停、停止热键
         try:
             keyboard.add_hotkey(self.hotkeys['start'], lambda: self.start_play())
+            keyboard.add_hotkey('F11', lambda: self.toggle_play_pause())
             keyboard.add_hotkey(self.hotkeys['stop'], lambda: self.stop_play())
         except Exception as e:
             messagebox.showwarning("热键注册失败", f"全局热键注册失败，可能需要以管理员身份运行。\n详细信息：{e}")
