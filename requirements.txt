@@ -2,3 +2,10 @@ pyautogui==0.9.54
 keyboard==0.13.5
 pywin32==306
 psutil==5.9.8
+# ---- 扒谱（音频转乐谱）功能依赖 ----
+# 提示：librosa 会拉 numba、soundfile、audioread 等，安装包体积较大。
+# macOS/Linux 上如需解析 mp3 还需要 ffmpeg；wav/flac/ogg 无需 ffmpeg。
+numpy>=1.21
+scipy>=1.7
+soundfile>=0.12
+librosa>=0.10

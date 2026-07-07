@@ -554,6 +554,9 @@ class MusicGUI:
         self.start_btn.grid(row=0, column=0, padx=10, pady=6)
         self.stop_btn = ttk.Button(btn_frame, text="停止 (F7)", command=self.stop_play, state="disabled", style='Accent.TButton', width=14)
         self.stop_btn.grid(row=0, column=1, padx=10, pady=6)
+        # 扒谱（音频→乐谱）入口
+        self.generate_btn = ttk.Button(btn_frame, text="生成乐谱", command=self.open_generate_dialog, style='Accent.TButton', width=14)
+        self.generate_btn.grid(row=1, column=0, columnspan=2, padx=10, pady=6)
         # 状态栏
         self.status_label = ttk.Label(center_frame, textvariable=self.status_var, anchor="center", font=("微软雅黑", 10, "bold"), background=self.bg_color, foreground=self.accent, width=32)
         self.status_label.pack(pady=6, fill="x")
@@ -805,6 +808,114 @@ class MusicGUI:
         self.notes_by_time = notes_by_time
         self.sorted_times = sorted_times
         return True
+
+    # ---------- 扒谱（音频 → 乐谱） ----------
+    def open_generate_dialog(self):
+        """打开文件选择对话框，启动后台线程批量转写音频为乐谱 JSON。
+
+        软限幅到 0/14，保留原曲和弦（不人为叠音）。完成后写入 Sheet Music/ 并刷新列表。
+        """
+        from tkinter import filedialog
+        from transcriber import Transcriber, is_audio_file
+
+        # 检查依赖（numpy/librosa）—— Transcriber 会在 __init__ 内做懒导入 + 错误抛出
+        try:
+            transcriber = Transcriber()
+        except Exception as e:
+            messagebox.showerror(
+                "依赖缺失",
+                f"无法启动扒谱功能：\n{e}\n\n请先运行: pip install librosa numpy soundfile",
+            )
+            return
+
+        files = filedialog.askopenfilenames(
+            title="选择要转写的音频文件",
+            filetypes=[("音频文件", "*.mp3 *.wav *.flac *.ogg *.m4a *.aac"), ("全部", "*.*")],
+        )
+        if not files:
+            return
+
+        # 进度窗口
+        win = tk.Toplevel(self.root)
+        win.title("生成乐谱")
+        win.geometry("520x220")
+        win.transient(self.root)
+        win.grab_set()
+        ttk.Label(win, text="正在转写音频 → 乐谱 JSON ...", font=("微软雅黑", 10, "bold"), foreground=self.accent).pack(pady=(14, 6))
+        info_var = tk.StringVar(value="准备中…")
+        ttk.Label(win, textvariable=info_var, font=("微软雅黑", 9)).pack(pady=(0, 6), padx=10, anchor="w")
+        bar = ttk.Progressbar(win, mode="determinate", style='Modern.Horizontal.TProgressbar', maximum=1000, value=0)
+        bar.pack(fill="x", padx=14, pady=(2, 6))
+        detail_var = tk.StringVar(value="")
+        ttk.Label(win, textvariable=detail_var, font=("微软雅黑", 8), foreground="#888").pack(pady=(0, 8), padx=10, anchor="w")
+        cancel_flag = {"cancel": False}
+
+        def on_cancel():
+            cancel_flag["cancel"] = True
+            info_var.set("正在取消…")
+
+        ttk.Button(win, text="取消", command=on_cancel).pack(pady=(4, 8))
+
+        def progress_cb(filename, frac, status):
+            # 转到 Tk 主线程
+            def _apply():
+                if cancel_flag["cancel"]:
+                    return
+                bar["value"] = int(max(0.0, min(1.0, frac)) * 1000)
+                info_var.set(status)
+                if filename:
+                    detail_var.set(os.path.basename(filename))
+                else:
+                    detail_var.set("")
+            try:
+                win.after(0, _apply)
+            except Exception:
+                pass
+
+        def worker():
+            try:
+                # 用本地 list 防止被 Cancel 修改（iterable 一次性）
+                files_list = list(files)
+                # 用户取消：transcriber.run 不支持逐文件中断，最简做法：等本批跑完，UI 层关进度窗口
+                transcriber.run(
+                    files_list,
+                    output_dir=SHEET_MUSIC_DIR,
+                    progress_cb=progress_cb,
+                )
+            except Exception as e:
+                win.after(0, lambda: messagebox.showerror("转写失败", str(e)))
+            finally:
+                def _finish():
+                    # 通知主线程刷新列表（schedule_music_dir_watch 每秒会扫一次，但这里立刻刷更直观）
+                    try:
+                        self.all_music_files = self.get_all_music_files() or []
+                        self.filtered_music_files = self.all_music_files.copy()
+                        self.on_search()
+                        self.last_music_files = set(self.all_music_files)
+                    except Exception:
+                        pass
+                    # 计算本次成功数
+                    ok_n = 0
+                    for fp in files:
+                        out = os.path.join(SHEET_MUSIC_DIR,
+                                           os.path.splitext(os.path.basename(fp))[0] + ".json")
+                        if os.path.exists(out):
+                            ok_n += 1
+                    try:
+                        win.destroy()
+                    except Exception:
+                        pass
+                    messagebox.showinfo(
+                        "生成完成",
+                        f"已生成 {ok_n}/{len(files)} 份乐谱到 Sheet Music/ 文件夹。\n"
+                        f"点击列表中对应文件即可开始演奏。",
+                    )
+                try:
+                    win.after(0, _finish)
+                except Exception:
+                    pass
+
+        threading.Thread(target=worker, daemon=True).start()
 
     def on_close(self):
         # 退出软件前确保处于"未播放"态并释放可能按住的按键
