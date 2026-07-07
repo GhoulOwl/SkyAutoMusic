@@ -38,6 +38,30 @@ pip install pyautogui keyboard psutil pywin32
 6. 程序会自动检测Sky/光遇窗口并置顶，未检测到会提示。
 7. 窗口大小和位置、收藏数据等会自动保存，无需手动配置。
 
+## 构建与发布（EXE）
+
+本工具提供两种方式获取 Windows 可执行文件（exe）。**乐谱与配置文件均不打包进 exe，需自行放置**（见下方说明）。
+
+### 方式一：GitHub Actions 自动构建（推荐）
+1. 进入仓库的 **Actions** 页面，选择 `Build EXE & Release` 工作流。
+2. 点击 **Run workflow**，可填写可选的 Release 名称，确认后即开始构建。
+3. 构建完成后，自动在 **Releases** 中生成 `build-<序号>` 版本，下载其中的 `SkyAutoMusic.exe` 即可。
+
+> 构建在 GitHub 云端 Windows 环境中完成（依赖 Windows API），无需本地环境。
+
+### 方式二：本地用 PyInstaller 构建
+```bash
+pip install -r requirements.txt pyinstaller
+pyinstaller --noconfirm --onefile --windowed --name SkyAutoMusic ^
+  --hidden-import keyboard --hidden-import win32timezone play_music_gui.py
+```
+生成的 `dist/SkyAutoMusic.exe` 即为可执行文件。
+
+### 运行 exe 前的准备
+- 将 `SkyAutoMusic.exe` 放到一个**有写入权限**的目录（如桌面或专门文件夹）。
+- 在该 exe **同级目录**放入 `Sheet Music/` 文件夹，并存放你的乐谱 JSON 文件。
+- 首次运行会自动在同目录生成 `config.json`、`favorites.json` 等配置文件，设置与收藏可持久化保存。
+
 ## 乐谱文件格式说明
 - 乐谱为JSON文件，需包含`songNotes`字段。
 - 示例结构：

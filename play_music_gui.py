@@ -19,7 +19,13 @@ from enum import Enum
 
 # 资源路径适配函数，兼容PyInstaller打包和开发环境
 def resource_path(relative_path):
-    base_path = getattr(sys, '_MEIPASS', os.path.dirname(os.path.abspath(__file__)))
+    if getattr(sys, 'frozen', False):
+        # 打包后（PyInstaller onefile/onedir）：使用 exe 所在目录，
+        # 使 Sheet Music/、config.json、favorites.json 等定位到 exe 同级，
+        # 用户自行放置的乐谱能被找到，且配置可持久化。
+        base_path = os.path.dirname(sys.executable)
+    else:
+        base_path = os.path.dirname(os.path.abspath(__file__))
     return os.path.join(base_path, relative_path)
 
 # 配置
