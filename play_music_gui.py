@@ -1,21 +1,24 @@
 import os
 import json
-import time
 import threading
 import tkinter as tk
 from tkinter import ttk, messagebox
-import pyautogui
-import keyboard
-from collections import defaultdict
-import win32gui
-import win32process
-import win32con
-import psutil
 import sys
-import ctypes
 import webbrowser
-import random
-from enum import Enum
+
+from key_controller import KeyController, note_to_key
+from player import MusicPlayer, PlaybackState
+from score_loader import ScoreValidationError, load_score, read_json_with_fallback, summarize_meta
+from score_overlay import ScoreOverlay
+from window_focus import (
+    bring_window_to_front,
+    describe_foreground_window,
+    describe_window,
+    find_sky_game_window,
+    is_admin,
+    is_sky_game_window_identity,
+    release_topmost,
+)
 
 # 资源路径适配函数，兼容PyInstaller打包和开发环境
 def resource_path(relative_path):
@@ -32,33 +35,6 @@ def resource_path(relative_path):
 SHEET_MUSIC_DIR = resource_path('Sheet Music')
 if not os.path.exists(SHEET_MUSIC_DIR):
     os.makedirs(SHEET_MUSIC_DIR)
-note_to_key = {
-    "1Key0": "Y", "1Key1": "U", "1Key2": "I", "1Key3": "O", "1Key4": "P",
-    "1Key5": "H", "1Key6": "J", "1Key7": "K", "1Key8": "L", "1Key9": ";",
-    "1Key10": "N", "1Key11": "M", "1Key12": ",", "1Key13": ".", "1Key14": "/",
-    "2Key0": "Y", "2Key1": "U", "2Key2": "I", "2Key3": "O", "2Key4": "P",
-    "2Key5": "H", "2Key6": "J", "2Key7": "K", "2Key8": "L", "2Key9": ";",
-    "2Key10": "N", "2Key11": "M", "2Key12": ",", "2Key13": ".", "2Key14": "/"
-}
-
-SKY_PROCESS_NAMES = {"sky.exe", "sky"}
-
-
-def is_sky_game_window_identity(process_name, window_title="", pid=None, current_pid=None):
-    """Return True for the game window, while excluding this app process."""
-    if pid is not None and current_pid is not None and pid == current_pid:
-        return False
-
-    name = (process_name or "").strip()
-    title = (window_title or "").strip()
-    name_lower = name.lower()
-    title_lower = title.lower()
-
-    if name_lower in SKY_PROCESS_NAMES or title_lower == "sky":
-        return True
-    return "光遇" in name or "光遇" in title
-
-
 CONFIG_FILE = resource_path('config.json')
 
 def is_dark_mode():
@@ -71,287 +47,6 @@ def is_dark_mode():
     except Exception:
         return False
 
-class PlaybackState(Enum):
-    """三态状态机：未播放 / 播放中 / 暂停中。"""
-    STOPPED = "stopped"
-    PLAYING = "playing"
-    PAUSED = "paused"
-
-
-class KeyController:
-    """统一的按键抽象层。
-
-    - 调试模式：开启后只输出日志，不真正按下按键（PR 调试模式前置能力）。
-    - 优先使用 keyboard 库，失败时回退 pyautogui。
-    - 支持运行时切换按键映射（多套键盘映射的前置能力）。
-    """
-
-    def __init__(self, mapping=None, debug=False, log_func=None):
-        self.mapping = dict(mapping or {})
-        self.debug = debug
-        self.log_func = log_func or (lambda msg: print(msg))
-
-    def set_mapping(self, mapping):
-        self.mapping = dict(mapping or {})
-
-    def set_debug(self, debug):
-        self.debug = debug
-
-    def _resolve(self, note):
-        return self.mapping.get(note)
-
-    def _normalize_key(self, key):
-        """单字母键名统一小写，避免 keyboard / pyautogui 把大写解析成 'Shift+字母'。
-
-        光遇 PC 版乐器对应键盘物理键（小写键名）。若发送 'Y' 这类大写，
-        keyboard.press('Y') 会被理解为「按住 Shift 再按 y」，游戏收不到正确的
-        音符键位 → 表现为「按键未生效」。统一转小写即可正确按到目标键。
-        """
-        if isinstance(key, str) and len(key) == 1 and key.isalpha():
-            return key.lower()
-        return key
-
-    def press(self, note):
-        key = self._resolve(note)
-        if not key:
-            return
-        key = self._normalize_key(key)
-        if self.debug:
-            self.log_func(f"[DEBUG] press  {note} -> {key}")
-            return
-        try:
-            keyboard.press(key)
-        except Exception:
-            try:
-                pyautogui.keyDown(key)
-            except Exception:
-                self.log_func(f"[WARN] 按键失败: {key}")
-
-    def release(self, note):
-        key = self._resolve(note)
-        if not key:
-            return
-        key = self._normalize_key(key)
-        if self.debug:
-            self.log_func(f"[DEBUG] release {note} -> {key}")
-            return
-        try:
-            keyboard.release(key)
-        except Exception:
-            try:
-                pyautogui.keyUp(key)
-            except Exception:
-                self.log_func(f"[WARN] 释放失败: {key}")
-
-    def press_keys(self, notes):
-        for n in notes:
-            self.press(n)
-
-    def release_keys(self, notes):
-        for n in notes:
-            self.release(n)
-
-
-class MusicPlayer:
-    """播放内核：三态状态机 + 严格 time 差值 + 速度/模拟/调试参数。
-
-    时序规则（依据 1.md）：严格按乐谱 time（毫秒绝对时间戳）的差值播放，
-    不乘任何 bpm 系数；speed 为可实时调节的用户速度倍率（1.0 = 原速）。
-    simulate 开启后加入自然的随机变速与随机失误（模拟真实演奏）。
-    """
-
-    DEFAULT_MISS_PROB = 0.03        # 每个音符被"失误跳过"的概率
-    DEFAULT_JITTER = (0.85, 1.15)   # 间隔随机抖动范围
-    NOTE_HOLD = 0.05                # 单音符按住基准时长（秒）
-
-    def __init__(self, key_controller, update_status=None, update_elapsed=None,
-                 update_total=None, update_progress=None):
-        self.key_controller = key_controller
-        self.update_status = update_status or (lambda msg: None)
-        self.update_elapsed = update_elapsed or (lambda sec: None)
-        self.update_total = update_total or (lambda sec: None)
-        self.update_progress = update_progress or (lambda frac: None)
-        self.state = PlaybackState.STOPPED
-        self._stop = threading.Event()
-        self.notes_by_time = None
-        self.sorted_times = None
-        self.current_idx = 0
-        self.thread = None
-        # 可调参数（由 UI 注入）
-        self.speed = 1.0
-        self.simulate = False
-        self.miss_prob = self.DEFAULT_MISS_PROB
-        self.jitter = self.DEFAULT_JITTER
-        # 内部控制
-        self._seek_requested = False
-        self._seek_target_idx = 0
-        self._held_keys = []
-
-    # ---------- 状态查询 ----------
-    def is_playing(self):
-        return self.state == PlaybackState.PLAYING
-
-    def is_paused(self):
-        return self.state == PlaybackState.PAUSED
-
-    def is_stopped(self):
-        return self.state == PlaybackState.STOPPED
-
-    # ---------- 控制入口（供 UI 调用） ----------
-    def start(self, notes_by_time, sorted_times):
-        """仅当处于 STOPPED 态时，从曲谱开头开始播放。"""
-        if self.state != PlaybackState.STOPPED or not sorted_times:
-            return False
-        self.notes_by_time = notes_by_time
-        self.sorted_times = sorted_times
-        self.current_idx = 0
-        self._stop.clear()
-        self._seek_requested = False
-        self._held_keys = []
-        self.state = PlaybackState.PLAYING
-        self.thread = threading.Thread(target=self._run, daemon=True)
-        self.thread.start()
-        return True
-
-    def pause(self):
-        if self.state == PlaybackState.PLAYING:
-            self.state = PlaybackState.PAUSED
-
-    def resume(self):
-        if self.state == PlaybackState.PAUSED:
-            self.state = PlaybackState.PLAYING
-
-    def stop(self):
-        """切回 STOPPED 态（自动播放完成或点击结束按钮都走这里）。"""
-        self._stop.set()
-        self.state = PlaybackState.STOPPED
-        self.current_idx = 0
-        self._release_held()
-
-    def seek(self, target_idx):
-        """定位到指定音符索引（播放中/暂停中均可；STOPPED 态忽略）。"""
-        if self.state == PlaybackState.STOPPED or not self.sorted_times:
-            return
-        self._seek_target_idx = max(0, min(int(target_idx), len(self.sorted_times) - 1))
-        self._seek_requested = True
-
-    # ---------- 内部实现 ----------
-    def _release_held(self):
-        if self._held_keys:
-            try:
-                self.key_controller.release_keys(self._held_keys)
-            except Exception:
-                pass
-            self._held_keys = []
-
-    def _run(self):
-        try:
-            self._playback_loop()
-        finally:
-            self._release_held()
-            self.state = PlaybackState.STOPPED
-            self.current_idx = 0
-            # 仅自然播放完成时提示"结束"，手动停止由 UI 控制文案
-            if not self._stop.is_set():
-                self.update_progress(1.0)
-                self.update_status("演奏结束！")
-
-    def _playback_loop(self):
-        notes_by_time = self.notes_by_time
-        sorted_times = self.sorted_times
-        total = len(sorted_times)
-        if total == 0:
-            return
-        t0 = sorted_times[0]
-        last_t = sorted_times[-1]
-        span = max(1, last_t - t0)
-        self.update_total((last_t - t0) / 1000.0)
-        # 起播前给窗口聚焦预留一点时间
-        if not self._sleep_with_controls(0.5):
-            return
-        idx = self.current_idx
-        while idx < total:
-            if self._stop.is_set():
-                break
-            if not self._wait_if_paused():
-                break
-            if self._seek_requested:
-                idx = self._consume_seek(t0, last_t, span)
-                continue
-            t = sorted_times[idx]
-            keys = notes_by_time[t]
-            # 模拟真实演奏：按概率"失误"跳过该音符
-            if self.simulate and random.random() < self.miss_prob:
-                self.update_status(f"演奏进度: {idx + 1}/{total}（失误跳过）")
-            else:
-                held = list(keys)
-                self._held_keys = held
-                self.key_controller.press_keys(held)
-                hold = self.NOTE_HOLD
-                if self.simulate:
-                    hold *= random.uniform(0.7, 1.4)
-                if not self._sleep_with_controls(hold):
-                    break
-                self.key_controller.release_keys(held)
-                if self._held_keys is held:
-                    self._held_keys = []
-                self.update_status(f"演奏进度: {idx + 1}/{total}")
-            # 进度与时间显示（严格按 time 差值）
-            elapsed_sec = max(0, (t - t0) / 1000.0)
-            self.update_elapsed(elapsed_sec)
-            self.update_progress((t - t0) / span)
-            if idx < total - 1:
-                interval = (sorted_times[idx + 1] - t) / 1000.0
-                # 用户速度倍率：speed>1 更快，间隔相应缩短
-                if self.speed and self.speed > 0:
-                    interval = interval / self.speed
-                # 模拟真实演奏：自然的随机变速
-                if self.simulate:
-                    interval *= random.uniform(*self.jitter)
-                if interval > 0 and not self._sleep_with_controls(interval):
-                    break
-            idx += 1
-            self.current_idx = idx
-
-    def _wait_if_paused(self):
-        """暂停态下阻塞，直到 resume / stop / seek。返回 False 表示被 stop。"""
-        step = 0.05
-        while self.state == PlaybackState.PAUSED:
-            if self._stop.is_set():
-                return False
-            if self._seek_requested:
-                return True
-            time.sleep(step)
-        return not self._stop.is_set()
-
-    def _consume_seek(self, t0, last_t, span):
-        self._seek_requested = False
-        target = max(0, min(self._seek_target_idx, len(self.sorted_times) - 1))
-        self.current_idx = target
-        t = self.sorted_times[target]
-        elapsed_sec = max(0, (t - t0) / 1000.0)
-        self.update_elapsed(elapsed_sec)
-        self.update_progress((t - t0) / span)
-        return target
-
-    def _sleep_with_controls(self, duration):
-        """可在小步长内响应 stop / pause / seek 的睡眠。返回 False 表示被 stop 中断。"""
-        step = 0.02
-        slept = 0.0
-        while slept < duration:
-            if self._stop.is_set():
-                return False
-            if self._seek_requested:
-                return True
-            if self.state == PlaybackState.PAUSED:
-                if not self._wait_if_paused():
-                    return False
-                if self._seek_requested:
-                    return True
-            time.sleep(step)
-            slept += step
-        return True
-
 class MusicGUI:
     def __init__(self, root):
         self.root = root
@@ -359,6 +54,7 @@ class MusicGUI:
         # 读取窗口配置
         win_w, win_h = 600, 480
         x, y = None, None
+        cfg = {}
         if os.path.exists(CONFIG_FILE):
             try:
                 with open(CONFIG_FILE, 'r', encoding='utf-8') as f:
@@ -380,6 +76,7 @@ class MusicGUI:
         self.root.resizable(True, True)
         self.root.minsize(480, 360)
         self.root.protocol("WM_DELETE_WINDOW", self.on_close)
+        self.config = cfg
         # 统一浅色风格
         self.bg_color = "#F7F9FB"
         self.fg_color = "#222"
@@ -392,12 +89,17 @@ class MusicGUI:
         self.button_active_bg = "#3399FF"
         self.root.configure(bg=self.bg_color)
         self.set_style()
-        self.default_hotkeys = {'start': 'F5', 'stop': 'F7'}
+        self.default_hotkeys = {'start': 'F5', 'stop': 'F7', 'overlay_lock': 'F10'}
         self.hotkeys = self.default_hotkeys.copy()
         self.hotkey_vars = {k: tk.StringVar(value=v) for k, v in self.hotkeys.items()}
         self.status_var = tk.StringVar(value="请选择乐谱并点击开始演奏")
         self.elapsed_time_var = tk.StringVar(value="0:00")
         self.total_time_var = tk.StringVar(value="0:00")
+        self.hotkey_status_var = tk.StringVar(value="未注册")
+        self.game_window_var = tk.StringVar(value="未检测")
+        self.foreground_window_var = tk.StringVar(value="未检测")
+        self.admin_status_var = tk.StringVar(value="是" if is_admin() else "否")
+        self.overlay_status_var = tk.StringVar(value="未显示")
         self.music_info_vars = {
             'filename': tk.StringVar(),
             'path': tk.StringVar(),
@@ -406,9 +108,15 @@ class MusicGUI:
             'transcribedBy': tk.StringVar(),
         }
         self.filtered_music_files = []  # 先初始化，防止后续方法引用时报错
+        self.visible_music_files = []
         self.favorites = set()  # 收藏的乐谱文件名集合，可持久化
         self.favorite_file = resource_path('favorites.json')  # 用resource_path，兼容打包
         self.load_favorites()  # 启动时加载收藏
+        self.debug_logs = []
+        self._progress_frac = 0.0
+        self._elapsed_sec = 0.0
+        self._current_note_info = (-1, None, [])
+        self._game_hwnd = None  # 当前已置顶/聚焦的游戏窗口句柄，stop 时解除置顶
         self.create_widgets()
         # 关键：初始化后立即加载乐谱列表并刷新
         self.all_music_files = self.get_all_music_files() or []
@@ -424,6 +132,14 @@ class MusicGUI:
             update_elapsed=self._on_elapsed,
             update_total=self._on_total,
             update_progress=self._on_progress,
+            update_note=self._on_note,
+        )
+        self.overlay = ScoreOverlay(
+            self.root,
+            geometry=self.config.get("overlay_geometry"),
+            locked=self.config.get("overlay_locked", True),
+            on_geometry_changed=self._on_overlay_geometry_changed,
+            log_func=self._debug_log,
         )
         self.music_data = None
         self.notes_by_time = None
@@ -433,13 +149,11 @@ class MusicGUI:
         self.speed = 1.0
         self.simulate = False
         self.miss_prob = 0.03
-        self._progress_frac = 0.0
-        self._game_hwnd = None  # 当前已置顶/聚焦的游戏窗口句柄，stop 时解除置顶
-        self.debug_logs = []
         self.last_music_files = set(self.all_music_files or [])
         self.schedule_music_dir_watch()
         # 启动进度条定时刷新（主线程驱动，读取播放线程写入的 _progress_frac）
         self._refresh_progress_ui()
+        self._refresh_diagnostics()
 
     def set_style(self):
         style = ttk.Style()
@@ -500,6 +214,8 @@ class MusicGUI:
         # 设置Tab
         settings_tab = ttk.Frame(notebook)
         notebook.add(settings_tab, text="说明")
+        diagnostics_tab = ttk.Frame(notebook)
+        notebook.add(diagnostics_tab, text="诊断")
         # 播放Tab内容（三栏布局）
         main_frame = ttk.Frame(play_tab)
         main_frame.pack(fill="both", expand=True, padx=10, pady=10)
@@ -611,6 +327,7 @@ class MusicGUI:
         self.status_label.pack(pady=6, fill="x")
         # 设置Tab内容
         self.create_hotkey_settings(parent=settings_tab)
+        self.create_diagnostics_tab(parent=diagnostics_tab)
 
     def create_hotkey_settings(self, parent=None):
         frame = ttk.LabelFrame(parent or self.root, text="程序说明", padding=14)
@@ -633,6 +350,34 @@ class MusicGUI:
         ttk.Label(frame, textvariable=self.hotkey_vars['start'], font=("微软雅黑", 10, "bold"), foreground=self.accent).grid(row=0, column=1, sticky="w", padx=4, pady=4)
         ttk.Label(frame, text="停止:").grid(row=2, column=0, sticky="e", padx=4, pady=4)
         ttk.Label(frame, textvariable=self.hotkey_vars['stop'], font=("微软雅黑", 10, "bold"), foreground=self.accent).grid(row=2, column=1, sticky="w", padx=4, pady=4)
+        ttk.Label(frame, text="覆盖层移动/锁定:").grid(row=3, column=0, sticky="e", padx=4, pady=4)
+        ttk.Label(frame, textvariable=self.hotkey_vars['overlay_lock'], font=("微软雅黑", 10, "bold"), foreground=self.accent).grid(row=3, column=1, sticky="w", padx=4, pady=4)
+
+    def create_diagnostics_tab(self, parent):
+        frame = ttk.LabelFrame(parent, text="运行状态", padding=14)
+        frame.pack(padx=10, pady=10, fill="x")
+        rows = [
+            ("管理员权限:", self.admin_status_var),
+            ("热键状态:", self.hotkey_status_var),
+            ("游戏窗口:", self.game_window_var),
+            ("前台窗口:", self.foreground_window_var),
+            ("覆盖层:", self.overlay_status_var),
+        ]
+        for row, (label, var) in enumerate(rows):
+            ttk.Label(frame, text=label, width=12, anchor="e").grid(row=row, column=0, sticky="e", padx=4, pady=4)
+            ttk.Label(frame, textvariable=var, anchor="w", wraplength=430).grid(row=row, column=1, sticky="we", padx=4, pady=4)
+        frame.columnconfigure(1, weight=1)
+
+        btn_frame = ttk.Frame(parent)
+        btn_frame.pack(fill="x", padx=10, pady=(0, 8))
+        ttk.Button(btn_frame, text="刷新诊断", command=lambda: self._refresh_diagnostics(schedule=False), style='Accent.TButton').pack(side="left", padx=(0, 8))
+        ttk.Button(btn_frame, text="切换覆盖层锁定 (F10)", command=self.toggle_overlay_lock, style='Accent.TButton').pack(side="left")
+
+        log_frame = ttk.LabelFrame(parent, text="最近按键/警告日志", padding=8)
+        log_frame.pack(padx=10, pady=8, fill="both", expand=True)
+        self.debug_text = tk.Text(log_frame, height=10, wrap="word", font=("Consolas", 9), bg="#FFFFFF", fg="#222", relief="solid", borderwidth=1)
+        self.debug_text.pack(fill="both", expand=True)
+        self.debug_text.configure(state="disabled")
 
     def get_all_music_files(self):
         return [f for f in os.listdir(SHEET_MUSIC_DIR) if f.endswith('.json')]
@@ -648,6 +393,7 @@ class MusicGUI:
         else:
             files = self.filtered_music_files or []
         self.music_listbox.delete(0, tk.END)
+        self.visible_music_files = list(files)
         # 只显示文件名（带.json），不做display_name截断，保证索引一一对应
         for f in files:
             self.music_listbox.insert(tk.END, f)
@@ -668,7 +414,7 @@ class MusicGUI:
     def on_listbox_select(self, event=None):
         sel = self.music_listbox.curselection()
         if sel:
-            filename = self.filtered_music_files[sel[0]]
+            filename = self.visible_music_files[sel[0]]
             self.update_song_info(filename)
             self.status_var.set(f"已选择乐谱: {filename}")
 
@@ -680,8 +426,6 @@ class MusicGUI:
 
     def update_song_info(self, filename):
         # 页面信息区展示选中曲谱详细信息
-        import os
-        import json
         if not filename:
             self.music_info_vars['filename'].set("")
             self.music_info_vars['name'].set("")
@@ -690,42 +434,17 @@ class MusicGUI:
             return
         self.music_info_vars['filename'].set(filename)
         path = os.path.join(SHEET_MUSIC_DIR, filename)  # SHEET_MUSIC_DIR已用resource_path
-        encodings = ['utf-8', 'utf-8-sig', 'gbk', 'utf-16', 'utf-16-le', 'utf-16-be']
-        data = None
-        last_err = None
-        for enc in encodings:
-            try:
-                with open(path, 'r', encoding=enc) as f:
-                    data = json.load(f)
-                break
-            except Exception as e:
-                last_err = e
-                data = None
-        if data is None:
+        try:
+            data = read_json_with_fallback(path)
+            meta = summarize_meta(data)
+        except Exception:
             self.music_info_vars['name'].set('')
             self.music_info_vars['author'].set('')
             self.music_info_vars['transcribedBy'].set('')
             return
-        meta = {}
-        # 兼容多种结构
-        if isinstance(data, dict):
-            meta = data
-        elif isinstance(data, list) and len(data) > 0:
-            # 优先第一个元素
-            if isinstance(data[0], dict):
-                meta = data[0]
-            else:
-                for item in data:
-                    if isinstance(item, dict) and ('songName' in item or 'name' in item):
-                        meta = item
-                        break
-        # 兼容不同字段名
-        name = meta.get('songName') or meta.get('name') or ''
-        author = meta.get('author') or ''
-        transcribed = meta.get('transcribedBy') or meta.get('transcriber') or ''
-        self.music_info_vars['name'].set(name)
-        self.music_info_vars['author'].set(author)
-        self.music_info_vars['transcribedBy'].set(transcribed)
+        self.music_info_vars['name'].set(meta.get('name', ''))
+        self.music_info_vars['author'].set(meta.get('author', ''))
+        self.music_info_vars['transcribedBy'].set(meta.get('transcribedBy', ''))
 
     def start_play(self):
         # 三态约束：从头开始必须处于"未播放"态，否则异常（依据 1.md）
@@ -743,8 +462,14 @@ class MusicGUI:
         self.key_controller.set_debug(self.debug)
         # 从头开始：清零进度显示，避免残留上一次的进度
         self._progress_frac = 0.0
+        self._elapsed_sec = 0.0
+        self._current_note_info = (-1, None, [])
         if getattr(self, 'progress_bar', None) is not None:
             self.progress_bar['value'] = 0
+        title = self.music_info_vars['name'].get() or self.music_info_vars['filename'].get()
+        self.overlay.set_score(self.notes_by_time, self.sorted_times, title=title)
+        self.overlay.show(self._game_hwnd)
+        self._update_overlay_status()
         if not self.player.start(self.notes_by_time, self.sorted_times):
             return
         self.start_btn.config(state="disabled")
@@ -758,8 +483,13 @@ class MusicGUI:
         self._release_game_topmost()
         self.elapsed_time_var.set("0:00")
         self._progress_frac = 0.0
+        self._elapsed_sec = 0.0
+        self._current_note_info = (-1, None, [])
         if getattr(self, 'progress_bar', None) is not None:
             self.progress_bar['value'] = 0
+        if getattr(self, 'overlay', None):
+            self.overlay.hide()
+            self._update_overlay_status()
         self.status_var.set("已停止，点击开始或按F5重新演奏")
         self.start_btn.config(state="normal")
         self.stop_btn.config(state="disabled")
@@ -776,20 +506,36 @@ class MusicGUI:
             self.status_var.set("演奏中... F11 暂停 / F7 停止")
 
     # ---------- 播放内核回调 ----------
+    def _run_on_ui(self, func, *args):
+        try:
+            self.root.after(0, lambda: func(*args))
+        except Exception:
+            pass
+
     def _on_status(self, msg):
-        self.status_var.set(msg)
+        self._run_on_ui(self.status_var.set, msg)
 
     def _on_elapsed(self, sec):
-        m, s = divmod(int(sec), 60)
-        self.elapsed_time_var.set(f"{m}:{s:02d}")
+        self._elapsed_sec = max(0.0, float(sec))
+        def _apply():
+            m, s = divmod(int(sec), 60)
+            self.elapsed_time_var.set(f"{m}:{s:02d}")
+        self._run_on_ui(_apply)
 
     def _on_total(self, sec):
-        m, s = divmod(int(sec), 60)
-        self.total_time_var.set(f"{m}:{s:02d}")
+        def _apply():
+            m, s = divmod(int(sec), 60)
+            self.total_time_var.set(f"{m}:{s:02d}")
+        self._run_on_ui(_apply)
 
     def _on_progress(self, frac):
         # 仅在播放线程内记录进度值，真正的 UI 更新交给主线程的 _refresh_progress_ui。
         self._progress_frac = max(0.0, min(1.0, frac))
+
+    def _on_note(self, idx, t_ms, notes):
+        self._current_note_info = (idx, t_ms, list(notes or []))
+        if idx >= 0:
+            self._record_log(f"[NOTE] #{idx + 1} {t_ms}ms -> {','.join(notes or [])}", echo=False)
 
     def _refresh_progress_ui(self):
         """在 Tk 主线程内定时刷新进度条与百分比文本（线程安全）。
@@ -803,6 +549,14 @@ class MusicGUI:
                 self.progress_bar['value'] = int(frac * 1000)
             if getattr(self, 'progress_percent_var', None) is not None:
                 self.progress_percent_var.set(f"{int(frac * 100)}%")
+            if getattr(self, 'overlay', None) is not None:
+                idx, _t_ms, notes = self._current_note_info
+                self.overlay.update_playback(
+                    progress=frac,
+                    elapsed_sec=self._elapsed_sec,
+                    current_idx=idx,
+                    current_notes=notes,
+                )
         except Exception:
             pass
         # 约 20fps 刷新，兼顾流畅度与开销
@@ -810,139 +564,101 @@ class MusicGUI:
 
     def _debug_log(self, msg):
         # 调试模式日志：打印并保留最近若干条，供后续调试面板使用
-        print(msg)
+        self._record_log(msg, echo=True)
+
+    def _record_log(self, msg, echo=False):
+        if echo:
+            print(msg)
         self.debug_logs.append(msg)
         if len(self.debug_logs) > 200:
             self.debug_logs = self.debug_logs[-200:]
+        self._run_on_ui(self._refresh_log_text)
+
+    def toggle_overlay_lock(self):
+        if not getattr(self, 'overlay', None):
+            return
+        locked = self.overlay.toggle_lock()
+        self.config["overlay_locked"] = locked
+        self._update_overlay_status()
+        self.status_var.set("覆盖层已锁定并点击穿透" if locked else "覆盖层已解锁，可拖动位置")
+
+    def _on_overlay_geometry_changed(self, geometry):
+        self.config["overlay_geometry"] = geometry
+        self._update_overlay_status()
+
+    def _update_overlay_status(self):
+        if not getattr(self, 'overlay', None):
+            self.overlay_status_var.set("未初始化")
+            return
+        visible = "显示" if self.overlay.window.winfo_viewable() else "隐藏"
+        mode = "点击穿透" if self.overlay.locked else "可拖动"
+        self.overlay_status_var.set(f"{visible} / {mode} / {self.overlay.window.geometry()}")
+
+    def _refresh_log_text(self):
+        if not getattr(self, 'debug_text', None):
+            return
+        text = "\n".join(self.debug_logs[-50:])
+        self.debug_text.configure(state="normal")
+        self.debug_text.delete("1.0", tk.END)
+        self.debug_text.insert(tk.END, text)
+        self.debug_text.see(tk.END)
+        self.debug_text.configure(state="disabled")
+
+    def _refresh_diagnostics(self, schedule=True):
+        self.admin_status_var.set("是" if is_admin() else "否")
+        try:
+            hwnd = self._game_hwnd or find_sky_game_window()
+            self.game_window_var.set(describe_window(hwnd) if hwnd else "未检测到")
+        except Exception as e:
+            self.game_window_var.set(f"读取失败: {e}")
+        self.foreground_window_var.set(describe_foreground_window())
+        self._update_overlay_status()
+        self._refresh_log_text()
+        if schedule:
+            self.root.after(1000, self._refresh_diagnostics)
 
     def check_and_set_game_window(self):
-        # 查找进程名为 'Sky' 或 '光遇' 的窗口，优先 'Sky'
-        # 注：进程检测基于进程名，与游戏安装目录（如 Z:\FeverApps\sky）无关
-        current_pid = os.getpid()
-        candidates = []
-
-        def enum_windows_callback(hwnd, result):
-            if win32gui.IsWindowVisible(hwnd) and win32gui.IsWindowEnabled(hwnd):
-                tid, pid = win32process.GetWindowThreadProcessId(hwnd)
-                try:
-                    proc = psutil.Process(pid)
-                    name = proc.name()
-                    title = win32gui.GetWindowText(hwnd)
-                    if not is_sky_game_window_identity(name, title, pid, current_pid):
-                        return
-                    name_lower = (name or "").lower()
-                    title_lower = (title or "").lower()
-                    # 精确进程名优先；title 兜底用于进程名被启动器包装的情况。
-                    score = 2 if name_lower in SKY_PROCESS_NAMES or "光遇" in name else 1
-                    if title_lower == "sky" or "光遇" in title:
-                        score = max(score, 1)
-                    result.append((score, hwnd))
-                except Exception:
-                    pass
-        win32gui.EnumWindows(enum_windows_callback, candidates)
-        hwnd = max(candidates, default=(0, None), key=lambda item: item[0])[1]
+        hwnd = find_sky_game_window()
         if hwnd:
             self._game_hwnd = hwnd
-            self._bring_window_to_front(hwnd)
-            return True
-        else:
-            messagebox.showwarning("未检测到游戏", "未找到进程名为 'Sky' 或 '光遇' 的游戏窗口，请先打开游戏！")
-            return False
-
-    def _bring_window_to_front(self, hwnd):
-        """将游戏窗口恢复并抢到键盘焦点（含 AttachThreadInput 兜底）。
-
-        仅置顶 (TOPMOST) 不够——游戏要的是「键盘焦点」。keyboard / pyautogui 的
-        按键事件只发往当前前台窗口；若焦点仍留在本程序窗口，游戏便收不到按键。
-        这里先用 SetForegroundWindow，失败再用 AttachThreadInput 把本线程输入
-        桥接到游戏线程后再抢前台，最大化把焦点交还给游戏的成功率。
-        """
-        # 若处于最小化状态先恢复
-        try:
-            if win32gui.IsIconic(hwnd):
-                win32gui.ShowWindow(hwnd, win32con.SW_RESTORE)
-        except Exception:
-            pass
-        # 置顶确保可见（演奏期间保持，stop 时解除）
-        try:
-            win32gui.SetWindowPos(hwnd, win32con.HWND_TOPMOST, 0, 0, 0, 0,
-                                  win32con.SWP_NOMOVE | win32con.SWP_NOSIZE)
-        except Exception:
-            pass
-        # 直接尝试抢前台
-        try:
-            win32gui.SetForegroundWindow(hwnd)
-        except Exception:
-            pass
-        # 兜底：前台仍不是游戏窗口时，桥接输入线程再抢一次
-        if win32gui.GetForegroundWindow() != hwnd:
-            foreground = win32gui.GetForegroundWindow()
-            if foreground:
+            self.game_window_var.set(describe_window(hwnd))
+            if not self._bring_window_to_front(hwnd):
                 try:
-                    tid_target = win32process.GetWindowThreadProcessId(hwnd)[0]
-                    tid_fore = win32process.GetWindowThreadProcessId(foreground)[0]
-                    if tid_target and tid_fore and tid_target != tid_fore:
-                        win32process.AttachThreadInput(tid_fore, tid_target, True)
-                        try:
-                            win32gui.SetForegroundWindow(hwnd)
-                            win32gui.SetFocus(hwnd)
-                        finally:
-                            win32process.AttachThreadInput(tid_fore, tid_target, False)
+                    self.root.after(0, lambda: messagebox.showwarning(
+                        "焦点切换失败",
+                        "无法自动将游戏窗口置于前台（可能被系统限制）。\n请手动点击一下游戏窗口，再按 F5 / 开始演奏。"))
                 except Exception:
                     pass
-        # 仍拿不到焦点 → 提示用户手动点一下游戏窗口
-        if win32gui.GetForegroundWindow() != hwnd:
-            try:
-                self.root.after(0, lambda: messagebox.showwarning(
-                    "焦点切换失败",
-                    "无法自动将游戏窗口置于前台（可能被系统限制）。\n请手动点击一下游戏窗口，再按 F5 / 开始演奏。"))
-            except Exception:
-                pass
+            return True
+        messagebox.showwarning("未检测到游戏", "未找到进程名为 'Sky' 或 '光遇' 的游戏窗口，请先打开游戏！")
+        self.game_window_var.set("未检测到")
+        return False
+
+    def _bring_window_to_front(self, hwnd):
+        return bring_window_to_front(hwnd)
 
     def _release_game_topmost(self):
         """演奏结束后解除游戏窗口置顶，恢复正常桌面层级。"""
-        hwnd = getattr(self, '_game_hwnd', None)
-        if hwnd:
-            try:
-                win32gui.SetWindowPos(hwnd, win32con.HWND_NOTOPMOST, 0, 0, 0, 0,
-                                      win32con.SWP_NOMOVE | win32con.SWP_NOSIZE)
-            except Exception:
-                pass
+        release_topmost(getattr(self, '_game_hwnd', None))
 
     def load_music(self):
         sel = self.music_listbox.curselection()
         if not sel:
             messagebox.showwarning("提示", "请先选择乐谱！")
             return False
-        selected = self.filtered_music_files[sel[0]]
+        selected = self.visible_music_files[sel[0]]
         path = os.path.join(SHEET_MUSIC_DIR, selected)  # SHEET_MUSIC_DIR已用resource_path
-        encodings = ['utf-8', 'utf-8-sig', 'gbk', 'utf-16', 'utf-16-le', 'utf-16-be']
-        last_err = None
-        music_json = None
-        for enc in encodings:
-            try:
-                with open(path, 'r', encoding=enc) as f:
-                    music_json = json.load(f)
-                break
-            except Exception as e:
-                last_err = e
-                music_json = None
-        if music_json is None:
-            messagebox.showerror("错误", f"乐谱文件解析失败: {last_err}")
+        try:
+            score = load_score(path, valid_keys=self.key_controller.mapping.keys())
+        except ScoreValidationError as e:
+            messagebox.showerror("乐谱校验失败", str(e))
             return False
-        if isinstance(music_json, list) and 'songNotes' in music_json[0]:
-            song_notes = music_json[0]['songNotes']
-            # 读取bpm字段，若无则默认120
-            self.bpm = music_json[0].get('bpm', 120)
-        else:
-            messagebox.showerror("错误", "乐谱文件格式不正确，未找到songNotes。")
-            return False
-        notes_by_time = defaultdict(list)
-        for note in song_notes:
-            notes_by_time[note['time']].append(note['key'])
-        sorted_times = sorted(notes_by_time.keys())
-        self.notes_by_time = notes_by_time
-        self.sorted_times = sorted_times
+        self.music_data = score["raw"]
+        self.notes_by_time = score["notes_by_time"]
+        self.sorted_times = score["sorted_times"]
+        self.bpm = score["meta"].get('bpm', 120)
+        if score["warnings"]:
+            self._debug_log("[WARN] " + "；".join(score["warnings"][:5]))
         return True
 
     # ---------- 扒谱（音频 → 乐谱） ----------
@@ -1057,6 +773,7 @@ class MusicGUI:
         # 退出软件前确保处于"未播放"态并释放可能按住的按键
         if getattr(self, 'player', None):
             self.player.stop()
+        self._release_game_topmost()
         # 保存窗口大小和位置
         try:
             geo = self.root.geometry()
@@ -1064,7 +781,11 @@ class MusicGUI:
             size = size_pos[0].split('x')
             width, height = int(size[0]), int(size[1])
             x, y = int(size_pos[1]), int(size_pos[2])
-            cfg = {'width': width, 'height': height, 'x': x, 'y': y}
+            cfg = dict(getattr(self, "config", {}) or {})
+            cfg.update({'width': width, 'height': height, 'x': x, 'y': y})
+            if getattr(self, 'overlay', None):
+                cfg["overlay_geometry"] = self.overlay.window.geometry()
+                cfg["overlay_locked"] = self.overlay.locked
             with open(CONFIG_FILE, 'w', encoding='utf-8') as f:
                 json.dump(cfg, f)
         except Exception:
@@ -1089,10 +810,15 @@ class MusicGUI:
             pass
         # 注册开始、播放/暂停、停止热键
         try:
-            keyboard.add_hotkey(self.hotkeys['start'], lambda: self.start_play())
-            keyboard.add_hotkey('F11', lambda: self.toggle_play_pause())
-            keyboard.add_hotkey(self.hotkeys['stop'], lambda: self.stop_play())
+            keyboard.add_hotkey(self.hotkeys['start'], lambda: self._run_on_ui(self.start_play))
+            keyboard.add_hotkey('F11', lambda: self._run_on_ui(self.toggle_play_pause))
+            keyboard.add_hotkey(self.hotkeys['stop'], lambda: self._run_on_ui(self.stop_play))
+            keyboard.add_hotkey(self.hotkeys['overlay_lock'], lambda: self._run_on_ui(self.toggle_overlay_lock))
+            self.hotkey_status_var.set(
+                f"已注册: {self.hotkeys['start']} 开始 / F11 暂停 / {self.hotkeys['stop']} 停止 / {self.hotkeys['overlay_lock']} 覆盖层"
+            )
         except Exception as e:
+            self.hotkey_status_var.set(f"注册失败: {e}")
             messagebox.showwarning("热键注册失败", f"全局热键注册失败，可能需要以管理员身份运行。\n详细信息：{e}")
 
     def on_music_tab_changed(self):
@@ -1104,11 +830,11 @@ class MusicGUI:
         右键菜单：仅保留收藏/取消收藏
         """
         idx = self.music_listbox.nearest(event.y)
-        if idx < 0 or idx >= len(self.filtered_music_files or []):
+        if idx < 0 or idx >= len(self.visible_music_files or []):
             return
         self.music_listbox.selection_clear(0, tk.END)
         self.music_listbox.selection_set(idx)
-        filename = self.filtered_music_files[idx]
+        filename = self.visible_music_files[idx]
         menu = tk.Menu(self.music_listbox, tearoff=0)
         # 只保留收藏/取消收藏
         if filename in self.favorites:

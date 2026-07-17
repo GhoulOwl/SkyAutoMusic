@@ -25,11 +25,9 @@ _stub_module("win32process")
 _stub_module("win32con")
 _stub_module("psutil")
 
-from play_music_gui import (  # noqa: E402
-    KeyController,
-    is_sky_game_window_identity,
-    note_to_key,
-)
+from key_controller import KeyController, note_to_key  # noqa: E402
+from score_overlay import display_key  # noqa: E402
+from window_focus import is_sky_game_window_identity  # noqa: E402
 
 
 class TestKeyController(unittest.TestCase):
@@ -101,6 +99,12 @@ class TestSkyWindowIdentity(unittest.TestCase):
         self.assertTrue(is_sky_game_window_identity("Sky.exe", "", pid=1, current_pid=2))
         self.assertTrue(is_sky_game_window_identity("wrapped.exe", "Sky", pid=1, current_pid=2))
         self.assertTrue(is_sky_game_window_identity("光遇.exe", "", pid=1, current_pid=2))
+
+
+class TestScoreOverlayHelpers(unittest.TestCase):
+    def test_second_keyboard_keys_share_display_slots(self):
+        self.assertEqual(display_key("2Key14"), "1Key14")
+        self.assertEqual(display_key("1Key3"), "1Key3")
 
 
 if __name__ == "__main__":
