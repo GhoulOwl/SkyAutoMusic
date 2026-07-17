@@ -41,6 +41,24 @@ note_to_key = {
     "2Key10": "N", "2Key11": "M", "2Key12": ",", "2Key13": ".", "2Key14": "/"
 }
 
+SKY_PROCESS_NAMES = {"sky.exe", "sky"}
+
+
+def is_sky_game_window_identity(process_name, window_title="", pid=None, current_pid=None):
+    """Return True for the game window, while excluding this app process."""
+    if pid is not None and current_pid is not None and pid == current_pid:
+        return False
+
+    name = (process_name or "").strip()
+    title = (window_title or "").strip()
+    name_lower = name.lower()
+    title_lower = title.lower()
+
+    if name_lower in SKY_PROCESS_NAMES or title_lower == "sky":
+        return True
+    return "光遇" in name or "光遇" in title
+
+
 CONFIG_FILE = resource_path('config.json')
 
 def is_dark_mode():
@@ -82,10 +100,22 @@ class KeyController:
     def _resolve(self, note):
         return self.mapping.get(note)
 
+    def _normalize_key(self, key):
+        """单字母键名统一小写，避免 keyboard / pyautogui 把大写解析成 'Shift+字母'。
+
+        光遇 PC 版乐器对应键盘物理键（小写键名）。若发送 'Y' 这类大写，
+        keyboard.press('Y') 会被理解为「按住 Shift 再按 y」，游戏收不到正确的
+        音符键位 → 表现为「按键未生效」。统一转小写即可正确按到目标键。
+        """
+        if isinstance(key, str) and len(key) == 1 and key.isalpha():
+            return key.lower()
+        return key
+
     def press(self, note):
         key = self._resolve(note)
         if not key:
             return
+        key = self._normalize_key(key)
         if self.debug:
             self.log_func(f"[DEBUG] press  {note} -> {key}")
             return
@@ -101,6 +131,7 @@ class KeyController:
         key = self._resolve(note)
         if not key:
             return
+        key = self._normalize_key(key)
         if self.debug:
             self.log_func(f"[DEBUG] release {note} -> {key}")
             return
@@ -403,9 +434,12 @@ class MusicGUI:
         self.simulate = False
         self.miss_prob = 0.03
         self._progress_frac = 0.0
+        self._game_hwnd = None  # 当前已置顶/聚焦的游戏窗口句柄，stop 时解除置顶
         self.debug_logs = []
         self.last_music_files = set(self.all_music_files or [])
         self.schedule_music_dir_watch()
+        # 启动进度条定时刷新（主线程驱动，读取播放线程写入的 _progress_frac）
+        self._refresh_progress_ui()
 
     def set_style(self):
         style = ttk.Style()
@@ -546,6 +580,21 @@ class MusicGUI:
         ttk.Label(time_inner, textvariable=self.elapsed_time_var, font=("Consolas", 11, "bold"), foreground=self.accent, width=7, anchor="e").pack(side="left")
         ttk.Label(time_inner, text="/", font=("微软雅黑", 10, "bold"), foreground="#888", width=2, anchor="center").pack(side="left", padx=2)
         ttk.Label(time_inner, textvariable=self.total_time_var, font=("Consolas", 11, "bold"), foreground="#888", width=7, anchor="w").pack(side="left")
+        # ====== 弹奏进度条 ======
+        # 复用 set_style 中定义的 Modern.Horizontal.TProgressbar 样式，与主窗口 UI 风格统一。
+        # maximum=1000 提供更平滑的分辨率；实际值由 _refresh_progress_ui 定时从 _progress_frac 读取更新，
+        # 避免在播放线程里直接操作 Tk 组件（线程安全）。
+        progress_frame = ttk.Frame(center_frame, width=300)
+        progress_frame.pack(pady=(0, 8), fill="x")
+        self.progress_bar = ttk.Progressbar(
+            progress_frame, mode="determinate",
+            style='Modern.Horizontal.TProgressbar', maximum=1000, value=0)
+        self.progress_bar.pack(fill="x", padx=18)
+        # 进度百分比文本，居中显示，弱化配色与整体风格协调
+        self.progress_percent_var = tk.StringVar(value="0%")
+        ttk.Label(progress_frame, textvariable=self.progress_percent_var,
+                  font=("Consolas", 9), foreground="#888",
+                  background=self.bg_color, anchor="center").pack(fill="x", pady=(2, 0))
         # 操作按钮组
         btn_frame = ttk.Frame(center_frame, width=220)
         btn_frame.pack(pady=12)
@@ -692,6 +741,10 @@ class MusicGUI:
         self.player.simulate = self.simulate
         self.player.miss_prob = self.miss_prob
         self.key_controller.set_debug(self.debug)
+        # 从头开始：清零进度显示，避免残留上一次的进度
+        self._progress_frac = 0.0
+        if getattr(self, 'progress_bar', None) is not None:
+            self.progress_bar['value'] = 0
         if not self.player.start(self.notes_by_time, self.sorted_times):
             return
         self.start_btn.config(state="disabled")
@@ -701,8 +754,12 @@ class MusicGUI:
     def stop_play(self):
         if self.player:
             self.player.stop()
+        # 解除游戏窗口置顶（若此前被本程序置顶），恢复正常桌面层级
+        self._release_game_topmost()
         self.elapsed_time_var.set("0:00")
         self._progress_frac = 0.0
+        if getattr(self, 'progress_bar', None) is not None:
+            self.progress_bar['value'] = 0
         self.status_var.set("已停止，点击开始或按F5重新演奏")
         self.start_btn.config(state="normal")
         self.stop_btn.config(state="disabled")
@@ -731,7 +788,25 @@ class MusicGUI:
         self.total_time_var.set(f"{m}:{s:02d}")
 
     def _on_progress(self, frac):
+        # 仅在播放线程内记录进度值，真正的 UI 更新交给主线程的 _refresh_progress_ui。
         self._progress_frac = max(0.0, min(1.0, frac))
+
+    def _refresh_progress_ui(self):
+        """在 Tk 主线程内定时刷新进度条与百分比文本（线程安全）。
+
+        播放内核在独立线程里只更新 self._progress_frac；这里以固定间隔读取该值
+        并驱动进度条，避免跨线程直接操作 Tk 组件导致的不稳定。
+        """
+        try:
+            frac = max(0.0, min(1.0, getattr(self, '_progress_frac', 0.0)))
+            if getattr(self, 'progress_bar', None) is not None:
+                self.progress_bar['value'] = int(frac * 1000)
+            if getattr(self, 'progress_percent_var', None) is not None:
+                self.progress_percent_var.set(f"{int(frac * 100)}%")
+        except Exception:
+            pass
+        # 约 20fps 刷新，兼顾流畅度与开销
+        self.root.after(50, self._refresh_progress_ui)
 
     def _debug_log(self, msg):
         # 调试模式日志：打印并保留最近若干条，供后续调试面板使用
@@ -741,37 +816,98 @@ class MusicGUI:
             self.debug_logs = self.debug_logs[-200:]
 
     def check_and_set_game_window(self):
-        # 查找进程名为'Sky'或'光遇'的窗口，优先'Sky'
+        # 查找进程名为 'Sky' 或 '光遇' 的窗口，优先 'Sky'
+        # 注：进程检测基于进程名，与游戏安装目录（如 Z:\FeverApps\sky）无关
+        current_pid = os.getpid()
+        candidates = []
+
         def enum_windows_callback(hwnd, result):
             if win32gui.IsWindowVisible(hwnd) and win32gui.IsWindowEnabled(hwnd):
                 tid, pid = win32process.GetWindowThreadProcessId(hwnd)
                 try:
                     proc = psutil.Process(pid)
                     name = proc.name()
-                    # 进程名可能为Sky.exe、光遇.exe等
-                    if name.lower().startswith('sky'):
-                        result['Sky'] = hwnd
-                    elif '光遇' in name:
-                        result['光遇'] = hwnd
+                    title = win32gui.GetWindowText(hwnd)
+                    if not is_sky_game_window_identity(name, title, pid, current_pid):
+                        return
+                    name_lower = (name or "").lower()
+                    title_lower = (title or "").lower()
+                    # 精确进程名优先；title 兜底用于进程名被启动器包装的情况。
+                    score = 2 if name_lower in SKY_PROCESS_NAMES or "光遇" in name else 1
+                    if title_lower == "sky" or "光遇" in title:
+                        score = max(score, 1)
+                    result.append((score, hwnd))
                 except Exception:
                     pass
-        result = {}
-        win32gui.EnumWindows(enum_windows_callback, result)
-        hwnd = None
-        if 'Sky' in result:
-            hwnd = result['Sky']
-        elif '光遇' in result:
-            hwnd = result['光遇']
+        win32gui.EnumWindows(enum_windows_callback, candidates)
+        hwnd = max(candidates, default=(0, None), key=lambda item: item[0])[1]
         if hwnd:
-            # 置顶窗口
-            win32gui.ShowWindow(hwnd, win32con.SW_RESTORE)
-            win32gui.SetForegroundWindow(hwnd)
-            win32gui.SetWindowPos(hwnd, win32con.HWND_TOPMOST, 0, 0, 0, 0,
-                                  win32con.SWP_NOMOVE | win32con.SWP_NOSIZE)
+            self._game_hwnd = hwnd
+            self._bring_window_to_front(hwnd)
             return True
         else:
             messagebox.showwarning("未检测到游戏", "未找到进程名为 'Sky' 或 '光遇' 的游戏窗口，请先打开游戏！")
             return False
+
+    def _bring_window_to_front(self, hwnd):
+        """将游戏窗口恢复并抢到键盘焦点（含 AttachThreadInput 兜底）。
+
+        仅置顶 (TOPMOST) 不够——游戏要的是「键盘焦点」。keyboard / pyautogui 的
+        按键事件只发往当前前台窗口；若焦点仍留在本程序窗口，游戏便收不到按键。
+        这里先用 SetForegroundWindow，失败再用 AttachThreadInput 把本线程输入
+        桥接到游戏线程后再抢前台，最大化把焦点交还给游戏的成功率。
+        """
+        # 若处于最小化状态先恢复
+        try:
+            if win32gui.IsIconic(hwnd):
+                win32gui.ShowWindow(hwnd, win32con.SW_RESTORE)
+        except Exception:
+            pass
+        # 置顶确保可见（演奏期间保持，stop 时解除）
+        try:
+            win32gui.SetWindowPos(hwnd, win32con.HWND_TOPMOST, 0, 0, 0, 0,
+                                  win32con.SWP_NOMOVE | win32con.SWP_NOSIZE)
+        except Exception:
+            pass
+        # 直接尝试抢前台
+        try:
+            win32gui.SetForegroundWindow(hwnd)
+        except Exception:
+            pass
+        # 兜底：前台仍不是游戏窗口时，桥接输入线程再抢一次
+        if win32gui.GetForegroundWindow() != hwnd:
+            foreground = win32gui.GetForegroundWindow()
+            if foreground:
+                try:
+                    tid_target = win32process.GetWindowThreadProcessId(hwnd)[0]
+                    tid_fore = win32process.GetWindowThreadProcessId(foreground)[0]
+                    if tid_target and tid_fore and tid_target != tid_fore:
+                        win32process.AttachThreadInput(tid_fore, tid_target, True)
+                        try:
+                            win32gui.SetForegroundWindow(hwnd)
+                            win32gui.SetFocus(hwnd)
+                        finally:
+                            win32process.AttachThreadInput(tid_fore, tid_target, False)
+                except Exception:
+                    pass
+        # 仍拿不到焦点 → 提示用户手动点一下游戏窗口
+        if win32gui.GetForegroundWindow() != hwnd:
+            try:
+                self.root.after(0, lambda: messagebox.showwarning(
+                    "焦点切换失败",
+                    "无法自动将游戏窗口置于前台（可能被系统限制）。\n请手动点击一下游戏窗口，再按 F5 / 开始演奏。"))
+            except Exception:
+                pass
+
+    def _release_game_topmost(self):
+        """演奏结束后解除游戏窗口置顶，恢复正常桌面层级。"""
+        hwnd = getattr(self, '_game_hwnd', None)
+        if hwnd:
+            try:
+                win32gui.SetWindowPos(hwnd, win32con.HWND_NOTOPMOST, 0, 0, 0, 0,
+                                      win32con.SWP_NOMOVE | win32con.SWP_NOSIZE)
+            except Exception:
+                pass
 
     def load_music(self):
         sel = self.music_listbox.curselection()
