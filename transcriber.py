@@ -5,12 +5,17 @@
       顶层: [{ "name": str, "bpm": int, "songNotes": [{time: int_ms, key: "1Key0..14"}, ...] }]
 
 策略（用户已确认）:
-- 固定 C 大调映射: i = max(0, min(14, int(round(midi - 60))))
-  - MIDI 60 (C4) → 1Key0
-  - MIDI 74 (D5) → 1Key14
-  - 超范围软限幅（<0 → 0, >14 → 14），保留节奏
-- 保留原曲和弦: librosa.piptrack 在每个 onset 附近取多个稳定音高
-  按音高升序全部写入 songNotes；同 time 多 key 由现有播放器自动并按
+- 智能八度折叠 + 自动移调:
+  - 先收集全部检测到的 MIDI 音，在 [-6,6] 半音内搜索最优移调量 transpose，
+    使无需折叠即落在 [0,14] 内的音符数最大化（平局偏向不移调）
+  - 再做八度折叠: i = midi + transpose - root; <0 则 +12、>=15 则 -12
+  - 超出键盘范围的音按八度折叠进 15 键，保留旋律轮廓与节奏
+- HPSS 谐波/打击分离: onset 检测与音高估计均在 y_harmonic 上进行，
+  聚焦旋律起音、减少打击乐误触发
+- onset 检测: onset_strength envelope + backtrack=True + delta 门限，
+  让 onset 回退到能量上升起点、过滤弱 onset，时间更准
+- 保留原曲和弦: pYIN 提取主 F0，再在谐波 STFT 幅度谱上补足强基频峰
+  （剔除主 F0 谐波），最多保留 MAX_POLYPHONY 个音，按音高升序写入 songNotes
 - 不引入音符时值: 节奏由播放器全局 NOTE_HOLD 决定
 
 向后兼容:
@@ -39,7 +44,10 @@ def is_audio_file(path: str) -> bool:
 class TranscribeStats:
     """单次转写的统计信息，便于 UI 展示和单元测试断言。"""
 
-    __slots__ = ("onset_count", "note_count", "clamped_low", "clamped_high", "duration_sec")
+    __slots__ = (
+        "onset_count", "note_count", "clamped_low", "clamped_high",
+        "duration_sec", "transpose",
+    )
 
     def __init__(self):
         self.onset_count = 0
@@ -47,6 +55,8 @@ class TranscribeStats:
         self.clamped_low = 0
         self.clamped_high = 0
         self.duration_sec = 0.0
+        # 自动移调量（半音），由八度折叠阶段计算；0 表示不移调
+        self.transpose = 0
 
     def to_dict(self) -> Dict[str, Any]:
         return {
@@ -55,6 +65,7 @@ class TranscribeStats:
             "clamped_low": self.clamped_low,
             "clamped_high": self.clamped_high,
             "duration_sec": round(self.duration_sec, 3),
+            "transpose": self.transpose,
         }
 
 
@@ -68,13 +79,16 @@ class Transcriber:
     """
 
     NUM_KEYS = 15
-    DEFAULT_SR = 22050
-    # 每个 onset 之后取多长窗做音高估计（秒）。短窗能避开相邻 onset 干扰。
-    ONSET_PITCH_WINDOW = 0.08
+    # 提升采样率到 44100 以获得更高频率分辨率，改善音高估计精度
+    DEFAULT_SR = 44100
+    # 每个 onset 之后取多长窗做音高估计（秒）。0.13s 兼顾稳定性与相邻 onset 隔离
+    ONSET_PITCH_WINDOW = 0.13
     # 同一 onset 最多写出几个 key（和弦保留上限，避免一拍按十几键）
     MAX_POLYPHONY = 3
-    # 静音/能量门限（piptrack magnitude 归一化后），低于此视为无音
-    PITCH_MAG_THRESHOLD = 0.05
+    # 静音/能量门限（音高幅度归一化后），低于此视为无音
+    PITCH_MAG_THRESHOLD = 0.10
+    # onset_strength 峰值拾取门限：高于局部偏移量才视为有效 onset，过滤弱触发
+    ONSET_DELTA = 0.07
 
     def __init__(self, sr: int = DEFAULT_SR, midi_root: int = 60):
         global _librosa, np
@@ -106,58 +120,91 @@ class Transcriber:
         if len(y) == 0 or float(np.max(np.abs(y))) < 1e-4:
             return [], stats
 
-        # 1) onset 检测
+        # HPSS: 分离谐波与打击乐。onset 检测与音高估计均在 y_harmonic 上进行，
+        # 聚焦旋律起音、减少打击乐误触发
+        y_harmonic, _y_percussive = _librosa.effects.hpss(y)
+        hop_length = 512  # 与 piptrack / pYIN 时间分辨率保持一致
+
+        # 1) onset 检测：onset_strength envelope + backtrack=True + delta 门限
+        #    backtrack 让 onset 回退到能量上升起点；delta 过滤弱 onset
+        onset_env = _librosa.onset.onset_strength(
+            y=y_harmonic, sr=sr, hop_length=hop_length
+        )
         onset_times = _librosa.onset.onset_detect(
-            y=y, sr=sr, units="time", backtrack=False
+            y=y_harmonic, sr=sr, onset_envelope=onset_env,
+            hop_length=hop_length, units="time", backtrack=True,
+            delta=self.ONSET_DELTA,
         )
         if len(onset_times) == 0:
             return [], stats
         stats.onset_count = int(len(onset_times))
 
-        # 2) 整段 piptrack → 取每个 onset 之后窗内的稳定音高
-        pitches, magnitudes = _librosa.piptrack(y=y, sr=sr)
-        # pitches/magnitudes shape: (n_freq_bins, n_frames)
-        n_frames = pitches.shape[1]
-        hop_length = 512  # librosa 默认
-        frame_times = np.arange(n_frames) * hop_length / sr
+        # 2) pYIN 主 F0 + STFT 强基频峰补足和弦（均在 y_harmonic 上）
+        fmin = _librosa.note_to_hz("C2")
+        fmax = _librosa.note_to_hz("C7")
+        f0, voiced_flag, _voiced_probs = _librosa.pyin(
+            y_harmonic, fmin=fmin, fmax=fmax, sr=sr,
+            frame_length=2048, hop_length=hop_length,
+        )
+        stft_mag = np.abs(_librosa.stft(y_harmonic, n_fft=2048, hop_length=hop_length))
+        freqs = _librosa.fft_frequencies(sr=sr, n_fft=2048)
+        # pyin 与 stft 帧数可能差 1，按较小者对齐
+        n_frames = min(int(f0.shape[0]), int(stft_mag.shape[1]))
+        f0 = f0[:n_frames]
+        voiced_flag = voiced_flag[:n_frames]
+        stft_mag = stft_mag[:, :n_frames]
+        frame_times = _librosa.frames_to_time(
+            np.arange(n_frames), sr=sr, hop_length=hop_length
+        )
+
+        # 第一阶段: 收集每个 onset 的候选 midi（尚未映射）
+        window_sec = self.ONSET_PITCH_WINDOW
+        raw_events: List[Tuple[float, float]] = []  # (onset_t, midi)
+        for t in onset_times:
+            frame_pitches = self._collect_pitches_pyin(
+                f0, voiced_flag, stft_mag, freqs,
+                frame_times, float(t), window_sec,
+            )
+            for midi, _mag in frame_pitches:
+                raw_events.append((float(t), midi))
+
+        if not raw_events:
+            return [], stats
+
+        # 第二阶段: 智能八度折叠 + 自动移调
+        transpose = self._compute_transpose([m for _t, m in raw_events])
+        stats.transpose = transpose
 
         notes: List[Dict[str, Any]] = []
-        window_sec = self.ONSET_PITCH_WINDOW
-        for t in onset_times:
-            frame_pitches = self._collect_pitches_in_window(
-                pitches, magnitudes, frame_times, float(t), window_sec
-            )
-            if not frame_pitches:
-                continue
-            # 按能量取最强的 MAX_POLYPHONY 个音，再按音高升序输出（低→高）
-            frame_pitches.sort(key=lambda pm: pm[1], reverse=True)
-            top = frame_pitches[: self.MAX_POLYPHONY]
-            top.sort(key=lambda pm: pm[0])
-            t_ms = int(round(float(t) * 1000))
-            for midi, _mag in top:
-                key, clamped = self._midi_to_key(midi)
-                if clamped < 0:
-                    stats.clamped_low += 1
-                elif clamped > 0:
-                    stats.clamped_high += 1
-                notes.append({"time": t_ms, "key": key})
+        for t, midi in raw_events:
+            key, clamped = self._midi_to_key(midi, transpose)
+            if clamped < 0:
+                stats.clamped_low += 1
+            elif clamped > 0:
+                stats.clamped_high += 1
+            notes.append({"time": int(round(t * 1000)), "key": key})
 
         # 3) 按 time 排序
         notes.sort(key=lambda n: (n["time"], n["key"]))
         stats.note_count = len(notes)
         return notes, stats
 
-    def _collect_pitches_in_window(
+    def _collect_pitches_pyin(
         self,
-        pitches: np.ndarray,
-        magnitudes: np.ndarray,
+        f0: np.ndarray,
+        voiced_flag: np.ndarray,
+        stft_mag: np.ndarray,
+        freqs: np.ndarray,
         frame_times: np.ndarray,
         onset_t: float,
         window_sec: float,
     ) -> List[Tuple[float, float]]:
-        """收集 onset_t 之后 window_sec 内的音高，按半音级聚合后取能量最大的若干个。
+        """pYIN 主 F0 + STFT 强基频峰补足和弦。
 
-        返回 [(midi, mag), ...]，半音级去重（避免同 onset 内多帧重复写同一键）。
+        - 主 F0: onset 窗内 voiced f0 的中位数（最可靠）
+        - 补足音: 窗内平均 STFT 幅度谱的局部峰，剔除主 F0 的整数倍谐波，
+          按能量降序取至 MAX_POLYPHONY-1 个；主 F0 缺失时直接取最强峰补足
+        返回 [(midi, mag), ...]，按音高升序、半音级去重。
         """
         mask = (frame_times >= onset_t) & (frame_times < onset_t + window_sec)
         idxs = np.where(mask)[0]
@@ -167,31 +214,114 @@ class Transcriber:
             j = max(0, min(j, len(frame_times) - 1))
             idxs = np.array([j])
 
-        # 按半音整数聚合：同一 onset 窗内可能多帧检测到同一音高（甚至 ±0.5 半音抖动），取能量最高的代表
-        bins: Dict[int, float] = {}
-        for i in idxs:
-            col_p = pitches[:, i]
-            col_m = magnitudes[:, i]
-            valid = (col_p > 0) & (col_m > self.PITCH_MAG_THRESHOLD)
-            if not np.any(valid):
-                continue
-            for p, m in zip(col_p[valid], col_m[valid]):
-                midi = _librosa.hz_to_midi(p)
-                midi_round = int(round(float(midi)))
-                m_f = float(m)
-                if m_f > bins.get(midi_round, 0.0):
-                    bins[midi_round] = m_f
-        # 输出 (midi, mag)；注意用浮点 midi 但聚合是按整数
-        return [(float(k), v) for k, v in bins.items()]
+        # --- 主 F0: 窗内 voiced f0 中位数 ---
+        window_voiced = f0[idxs][voiced_flag[idxs]]
+        main_f0: Optional[float] = None
+        if len(window_voiced) > 0:
+            main_f0 = float(np.median(window_voiced))
+        main_midi: Optional[float] = None
+        if main_f0 and main_f0 > 0:
+            main_midi = float(_librosa.hz_to_midi(main_f0))
 
-    def _midi_to_key(self, midi: float) -> Tuple[str, int]:
-        """固定 C 大调映射 + 软限幅。返回 (key_name, clamped)，clamped: -1/0/1。"""
-        i = int(round(midi)) - self.midi_root
+        # --- STFT 峰: 窗内平均幅度谱局部极大 ---
+        avg_mag = np.mean(stft_mag[:, idxs], axis=1)
+        max_mag = float(np.max(avg_mag)) if avg_mag.size else 0.0
+        candidates: List[Tuple[float, float]] = []  # (midi, mag_norm)
+        if max_mag > 0:
+            norm_mag = avg_mag / max_mag
+            if norm_mag.shape[0] >= 3:
+                peak_mask = (norm_mag[1:-1] > norm_mag[:-2]) & (
+                    norm_mag[1:-1] > norm_mag[2:]
+                )
+                peak_idxs = np.where(peak_mask)[0] + 1
+            else:
+                peak_idxs = np.array([int(np.argmax(norm_mag))])
+            for i in peak_idxs:
+                m = float(norm_mag[i])
+                if m < self.PITCH_MAG_THRESHOLD:
+                    continue
+                fr = float(freqs[i])
+                if fr <= 0:
+                    continue
+                candidates.append((float(_librosa.hz_to_midi(fr)), m))
+
+        # --- 剔除主 F0 的整数倍谐波 ---
+        if main_f0 and main_f0 > 0:
+            filtered: List[Tuple[float, float]] = []
+            for midi, m in candidates:
+                is_harmonic = False
+                k = 2
+                while k * main_f0 <= float(freqs[-1]):
+                    if abs(midi - float(_librosa.hz_to_midi(k * main_f0))) < 0.5:
+                        is_harmonic = True
+                        break
+                    k += 1
+                if not is_harmonic:
+                    filtered.append((midi, m))
+            candidates = filtered
+
+        # --- 选取额外音: 按能量降序、半音级去重，补足至 MAX_POLYPHONY ---
+        candidates.sort(key=lambda pm: pm[1], reverse=True)
+        seen = set()
+        result: List[Tuple[float, float]] = []
+        if main_midi is not None:
+            result.append((main_midi, 1.0))
+            seen.add(int(round(main_midi)))
+        for midi, m in candidates:
+            s = int(round(midi))
+            if s in seen:
+                continue
+            seen.add(s)
+            result.append((midi, m))
+            if len(result) >= self.MAX_POLYPHONY:
+                break
+        result.sort(key=lambda pm: pm[0])  # 按音高升序
+        return result
+
+    def _compute_transpose(self, midis: List[float]) -> int:
+        """在 [-6, 6] 半音内搜索最优移调量，使无需八度折叠即落在 [0, NUM_KEYS) 内的音符数最大化。
+
+        平局时取绝对值最小者（偏向不移调）。
+        """
+        if not midis:
+            return 0
+        root = self.midi_root
+        n = self.NUM_KEYS
+        int_midis = [int(round(m)) for m in midis]
+        best_t = 0
+        best_score = -1
+        for t in range(-6, 7):
+            score = sum(1 for im in int_midis if 0 <= im + t - root < n)
+            if score > best_score or (
+                score == best_score and abs(t) < abs(best_t)
+            ):
+                best_score = score
+                best_t = t
+        return best_t
+
+    def _midi_to_key(self, midi: float, transpose: int = 0) -> Tuple[str, int]:
+        """C 大调映射 + 自动移调 + 八度折叠。
+
+        返回 (key_name, clamped)，clamped: -1=原音低于键盘范围(上折)/0=原生在范围内/
+        1=原音高于键盘范围(下折)。折叠后理论上必落在 [0, NUM_KEYS)，兜底夹边。
+        """
+        i = int(round(midi)) + transpose - self.midi_root
+        clamped = 0
         if i < 0:
-            return f"1Key0", -1
-        if i >= self.NUM_KEYS:
-            return f"1Key{self.NUM_KEYS - 1}", 1
-        return f"1Key{i}", 0
+            clamped = -1
+        elif i >= self.NUM_KEYS:
+            clamped = 1
+        # 八度折叠：把超出 [0, NUM_KEYS) 的音按 12 半音折进来
+        while i < 0:
+            i += 12
+        while i >= self.NUM_KEYS:
+            i -= 12
+        # 兜底夹边（NUM_KEYS=15 时理论不会触发）
+        if i < 0:
+            i = 0
+        elif i >= self.NUM_KEYS:
+            i = self.NUM_KEYS - 1
+        return f"1Key{i}", clamped
 
     # ---------- 包裹: 落盘 ----------
 

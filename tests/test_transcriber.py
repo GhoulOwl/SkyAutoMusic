@@ -1,7 +1,7 @@
 """Transcriber 纯单元测试，不依赖音频文件。
 
-重点验证固定 C 调软限幅映射逻辑。
-直接调用内部方法 _midi_to_key / is_audio_file。
+重点验证 C 调映射 + 八度折叠 + 自动移调逻辑。
+直接调用内部方法 _midi_to_key / _compute_transpose / is_audio_file。
 """
 import os
 import sys
@@ -18,21 +18,17 @@ def _bare_transcriber() -> Transcriber:
     t = Transcriber.__new__(Transcriber)
     t.NUM_KEYS = 15
     t.midi_root = 60
-    t.sr = 22050
+    t.sr = 44100
     return t
 
 
 class TestMidiToKey(unittest.TestCase):
-    """固定 C 调 + 软限幅：核心映射规则。"""
+    """C 调映射 + 八度折叠：核心映射规则。"""
 
     def setUp(self):
         self.t = _bare_transcriber()
 
-    def test_below_range_clamps_to_0(self):
-        # MIDI 50 (D3) 比 1Key0 还要低 10 个半音，应软限幅到 1Key0
-        key, clamped = self.t._midi_to_key(50)
-        self.assertEqual(key, "1Key0")
-        self.assertEqual(clamped, -1)
+    # --- 原生范围内（不折叠） ---
 
     def test_root_is_1key0(self):
         # MIDI 60 (C4) → 1Key0
@@ -52,12 +48,6 @@ class TestMidiToKey(unittest.TestCase):
         self.assertEqual(key, "1Key14")
         self.assertEqual(clamped, 0)
 
-    def test_above_range_clamps_to_14(self):
-        # MIDI 90 (F#6) → 1Key14
-        key, clamped = self.t._midi_to_key(90)
-        self.assertEqual(key, "1Key14")
-        self.assertEqual(clamped, 1)
-
     def test_rounding(self):
         # MIDI 64.6 → i = 4.6 → round → 5
         key, clamped = self.t._midi_to_key(64.6)
@@ -69,6 +59,72 @@ class TestMidiToKey(unittest.TestCase):
         key, clamped = self.t._midi_to_key(61)
         self.assertEqual(key, "1Key1")
         self.assertEqual(clamped, 0)
+
+    # --- 超出范围：八度折叠 ---
+
+    def test_below_range_folds_up(self):
+        # MIDI 50 (D3) 比 C4 低 10 半音：i=-10 → +12 → 2 → 1Key2（上折）
+        key, clamped = self.t._midi_to_key(50)
+        self.assertEqual(key, "1Key2")
+        self.assertEqual(clamped, -1)
+
+    def test_above_range_folds_down(self):
+        # MIDI 90 (F#6) 比 C4 高 30 半音：i=30 → -12 → 18 → -12 → 6 → 1Key6（下折）
+        key, clamped = self.t._midi_to_key(90)
+        self.assertEqual(key, "1Key6")
+        self.assertEqual(clamped, 1)
+
+    def test_octave_below_maps_to_same_key(self):
+        # MIDI 48 (C3) 比 C4 低一个八度：i=-12 → +12 → 0 → 1Key0
+        key, clamped = self.t._midi_to_key(48)
+        self.assertEqual(key, "1Key0")
+        self.assertEqual(clamped, -1)
+
+    def test_two_octaves_above_folds_down(self):
+        # MIDI 84 (C6) 比 C4 高 24 半音：i=24 → -12 → 12 → 1Key12
+        key, clamped = self.t._midi_to_key(84)
+        self.assertEqual(key, "1Key12")
+        self.assertEqual(clamped, 1)
+
+    # --- 自动移调 ---
+
+    def test_transpose_shifts_mapping(self):
+        # MIDI 50 + transpose=2: i = 50+2-60 = -8 → +12 → 4 → 1Key4（仍需上折）
+        key, clamped = self.t._midi_to_key(50, transpose=2)
+        self.assertEqual(key, "1Key4")
+        self.assertEqual(clamped, -1)
+
+    def test_transpose_brings_into_native_range(self):
+        # MIDI 56 + transpose=4: i = 56+4-60 = 0 → 1Key0，原生范围（不折叠）
+        key, clamped = self.t._midi_to_key(56, transpose=4)
+        self.assertEqual(key, "1Key0")
+        self.assertEqual(clamped, 0)
+
+
+class TestComputeTranspose(unittest.TestCase):
+    """自动移调量搜索：使原生范围内音符数最大化。"""
+
+    def setUp(self):
+        self.t = _bare_transcriber()
+
+    def test_empty_returns_zero(self):
+        self.assertEqual(self.t._compute_transpose([]), 0)
+
+    def test_native_range_prefers_no_transpose(self):
+        # 全部已在 [60,74] 内 → transpose=0 即可，平局偏向不移调
+        self.assertEqual(self.t._compute_transpose([60, 61, 62, 70]), 0)
+
+    def test_low_notes_pull_up(self):
+        # 54/55/56 比 root 低 4-6 半音；仅 transpose=6 能把三者全部拉进原生范围
+        self.assertEqual(self.t._compute_transpose([54, 55, 56]), 6)
+
+    def test_high_notes_push_down(self):
+        # 78/79/80 比 root 高 18-20 半音；仅 transpose=-6 能把三者全部降进原生范围
+        self.assertEqual(self.t._compute_transpose([78, 79, 80]), -6)
+
+    def test_tie_prefers_smaller_abs(self):
+        # 单音 MIDI 60：多个 transpose 都原生，平局取 |t| 最小 → 0
+        self.assertEqual(self.t._compute_transpose([60]), 0)
 
 
 class TestIsAudioFile(unittest.TestCase):
