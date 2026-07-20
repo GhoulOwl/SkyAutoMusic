@@ -2,6 +2,12 @@ pyautogui==0.9.54
 keyboard==0.13.5
 pywin32==306
 psutil==5.9.8
+# ---- 虚拟HID/驱动级键盘（Interception）----
+# 提示：使用驱动级键盘需额外安装内核驱动 interception-driver（见 README）。
+# 安装驱动后，按键注入在驱动层完成，可绕过部分游戏对 SendInput 的屏蔽。
+# 未安装驱动时程序会自动回退到 keyboard / pyautogui，无需卸载本依赖。
+# 注意：interception-python 需要 Python>=3.10。
+interception-python>=1.13
 # ---- 扒谱（音频转乐谱）功能依赖 ----
 # 提示：librosa 会拉 numba、soundfile、audioread 等，安装包体积较大。
 # macOS/Linux 上如需解析 mp3 还需要 ffmpeg；wav/flac/ogg 无需 ffmpeg。

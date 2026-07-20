@@ -18,6 +18,8 @@ from window_focus import (
     is_admin,
     is_sky_game_window_identity,
     release_topmost,
+    relaunch_as_admin_if_needed,
+    switch_to_english_input,
 )
 
 # 资源路径适配函数，兼容PyInstaller打包和开发环境
@@ -117,14 +119,18 @@ class MusicGUI:
         self._elapsed_sec = 0.0
         self._current_note_info = (-1, None, [])
         self._game_hwnd = None  # 当前已置顶/聚焦的游戏窗口句柄，stop 时解除置顶
+        # 统一按键抽象层（调试模式、可切换映射的前置能力）
+        # 输入方式：auto / interception(驱动级) / keyboard，默认优先驱动级
+        # 需在 create_widgets 之前创建，诊断页 UI 会读取其后端列表与状态。
+        self.input_method = self.config.get('input_method', 'auto')
+        self.key_controller = KeyController(
+            mapping=note_to_key, debug=False, log_func=self._debug_log,
+            backend=self.input_method)
         self.create_widgets()
         # 关键：初始化后立即加载乐谱列表并刷新
         self.all_music_files = self.get_all_music_files() or []
         self.filtered_music_files = self.all_music_files.copy()
         self.refresh_music_listbox()
-        # 统一按键抽象层（调试模式、可切换映射的前置能力）
-        self.key_controller = KeyController(
-            mapping=note_to_key, debug=False, log_func=self._debug_log)
         # 播放内核（三态状态机），回调绑定到本类方法
         self.player = MusicPlayer(
             key_controller=self.key_controller,
@@ -133,6 +139,7 @@ class MusicGUI:
             update_total=self._on_total,
             update_progress=self._on_progress,
             update_note=self._on_note,
+            update_finished=self._on_finished,
         )
         self.overlay = ScoreOverlay(
             self.root,
@@ -373,6 +380,30 @@ class MusicGUI:
         ttk.Button(btn_frame, text="刷新诊断", command=lambda: self._refresh_diagnostics(schedule=False), style='Accent.TButton').pack(side="left", padx=(0, 8))
         ttk.Button(btn_frame, text="切换覆盖层锁定 (F10)", command=self.toggle_overlay_lock, style='Accent.TButton').pack(side="left")
 
+        # ====== 键盘输入方式选择（虚拟HID/驱动级键盘） ======
+        input_frame = ttk.LabelFrame(parent, text="键盘输入方式", padding=10)
+        input_frame.pack(padx=10, pady=(0, 8), fill="x")
+        # 名称 <-> 标签 映射，用于下拉框显示与回写
+        self._input_method_options = []
+        self._input_label_to_name = {}
+        for _name, _label in self.key_controller.backend_options():
+            self._input_method_options.append(_label)
+            self._input_label_to_name[_label] = _name
+        self._input_name_to_label = {n: l for l, n in self._input_label_to_name.items()}
+        # 当前生效后端对应的标签作为初始值
+        _cur_label = self._input_name_to_label.get(self.key_controller.get_backend())
+        self.input_method_var = tk.StringVar(value=_cur_label or self._input_method_options[0])
+        ttk.Label(input_frame, text="输入方式:", width=10, anchor="e").grid(row=0, column=0, sticky="e", padx=4, pady=4)
+        self.input_method_combo = ttk.Combobox(
+            input_frame, textvariable=self.input_method_var,
+            values=self._input_method_options, state="readonly", width=28)
+        self.input_method_combo.grid(row=0, column=1, sticky="we", padx=4, pady=4)
+        self.input_method_combo.bind("<<ComboboxSelected>>", self._on_input_method_change)
+        ttk.Button(input_frame, text="校准驱动级键盘", command=self.calibrate_driver_keyboard, style='Accent.TButton').grid(row=0, column=2, padx=4, pady=4)
+        self.input_method_status_var = tk.StringVar(value="")
+        ttk.Label(input_frame, textvariable=self.input_method_status_var, anchor="w", wraplength=430, foreground="#888").grid(row=1, column=0, columnspan=3, sticky="we", padx=4, pady=(2, 0))
+        input_frame.columnconfigure(1, weight=1)
+
         log_frame = ttk.LabelFrame(parent, text="最近按键/警告日志", padding=8)
         log_frame.pack(padx=10, pady=8, fill="both", expand=True)
         self.debug_text = tk.Text(log_frame, height=10, wrap="word", font=("Consolas", 9), bg="#FFFFFF", fg="#222", relief="solid", borderwidth=1)
@@ -453,6 +484,7 @@ class MusicGUI:
             return
         if not self.check_and_set_game_window():
             return
+        self._prepare_game_input()
         if not self.load_music():
             return
         # 把当前可调参数注入播放器
@@ -537,6 +569,25 @@ class MusicGUI:
         if idx >= 0:
             self._record_log(f"[NOTE] #{idx + 1} {t_ms}ms -> {','.join(notes or [])}", echo=False)
 
+    def _on_finished(self):
+        """演奏自然结束时由播放线程触发；转交主线程重置 UI 到"就绪"态。
+
+        这样用户无需先点"停止"即可直接选择下一首并按"开始"。
+        """
+        self._run_on_ui(self._handle_playback_finished)
+
+    def _handle_playback_finished(self):
+        # 仅在确实由"播放中"自然结束时处理，避免与 stop_play 重复重置
+        if str(self.start_btn.cget('state')) != 'disabled':
+            return
+        self._release_game_topmost()
+        if getattr(self, 'overlay', None):
+            self.overlay.hide()
+            self._update_overlay_status()
+        self.start_btn.config(state="normal")
+        self.stop_btn.config(state="disabled")
+        self.status_var.set("演奏结束，点击开始或按F5演奏下一首")
+
     def _refresh_progress_ui(self):
         """在 Tk 主线程内定时刷新进度条与百分比文本（线程安全）。
 
@@ -613,9 +664,67 @@ class MusicGUI:
             self.game_window_var.set(f"读取失败: {e}")
         self.foreground_window_var.set(describe_foreground_window())
         self._update_overlay_status()
+        self._refresh_input_method_status()
         self._refresh_log_text()
         if schedule:
             self.root.after(1000, self._refresh_diagnostics)
+
+    def _refresh_input_method_status(self):
+        """刷新“键盘输入方式”状态提示：当前后端 + 驱动可用性。"""
+        if not getattr(self, 'input_method_status_var', None) or not getattr(self, 'key_controller', None):
+            return
+        kc = self.key_controller
+        driver_ok = kc.is_driver_available()
+        eff_name = kc.effective_backend()
+        eff_label = kc.get_backend_label(eff_name)
+        parts = [f"当前使用: {eff_label}"]
+        if kc.is_auto():
+            parts.append("（自动模式）")
+        if not driver_ok:
+            parts.append("；Interception 驱动未安装，已回退到常规键盘")
+        else:
+            parts.append("；Interception 驱动已就绪")
+        self.input_method_status_var.set("".join(parts))
+
+    def _on_input_method_change(self, event=None):
+        """下拉框切换输入方式，写入控制器并持久化到 config。"""
+        label = self.input_method_var.get()
+        name = self._input_label_to_name.get(label)
+        if not name:
+            return
+        self.input_method = name
+        self.key_controller.set_backend(name)
+        self._debug_log(f"[INFO] 键盘输入方式切换为: {label}")
+        self._refresh_input_method_status()
+
+    def calibrate_driver_keyboard(self):
+        """交互式校准驱动级键盘设备（后台线程，需用户按一次键）。"""
+        if not self.key_controller.is_driver_available():
+            messagebox.showwarning(
+                "驱动未安装",
+                "未检测到 Interception 驱动，无法使用驱动级键盘。\n"
+                "请先安装 interception-driver（见 README 说明）。")
+            return
+        self._debug_log("[INFO] 开始校准驱动级键盘，请在 10 秒内按下任意键以识别设备...")
+
+        def worker():
+            try:
+                self.key_controller.calibrate_driver_keyboard()
+                self._debug_log("[INFO] 驱动级键盘设备校准完成")
+                msg = "校准完成，已识别当前键盘设备。"
+            except Exception as e:
+                self._debug_log(f"[WARN] 驱动级键盘校准失败: {e}")
+                msg = f"校准失败: {e}"
+            try:
+                self.root.after(0, lambda: messagebox.showinfo("校准结果", msg))
+            except Exception:
+                pass
+            self._refresh_input_method_status()
+
+        threading.Thread(target=worker, daemon=True).start()
+        messagebox.showinfo(
+            "请按键校准",
+            "请在接下来的几秒内按下键盘上的任意一个键，\n程序将据此识别你的键盘设备。")
 
     def check_and_set_game_window(self):
         hwnd = find_sky_game_window()
@@ -636,6 +745,13 @@ class MusicGUI:
 
     def _bring_window_to_front(self, hwnd):
         return bring_window_to_front(hwnd)
+
+    def _prepare_game_input(self):
+        hwnd = getattr(self, '_game_hwnd', None)
+        if switch_to_english_input(hwnd):
+            self._debug_log("[INFO] requested en-US keyboard layout")
+        else:
+            self._debug_log("[WARN] could not switch to en-US keyboard layout")
 
     def _release_game_topmost(self):
         """演奏结束后解除游戏窗口置顶，恢复正常桌面层级。"""
@@ -783,6 +899,7 @@ class MusicGUI:
             x, y = int(size_pos[1]), int(size_pos[2])
             cfg = dict(getattr(self, "config", {}) or {})
             cfg.update({'width': width, 'height': height, 'x': x, 'y': y})
+            cfg['input_method'] = getattr(self, 'input_method', 'auto')
             if getattr(self, 'overlay', None):
                 cfg["overlay_geometry"] = self.overlay.window.geometry()
                 cfg["overlay_locked"] = self.overlay.locked
@@ -877,6 +994,8 @@ class MusicGUI:
             pass
 
 if __name__ == "__main__":
+    if relaunch_as_admin_if_needed():
+        sys.exit(0)
     root = tk.Tk()
     style = ttk.Style()
     style.theme_use('clam')

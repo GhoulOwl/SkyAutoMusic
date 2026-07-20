@@ -74,6 +74,89 @@ class TestKeyController(unittest.TestCase):
         self.assertEqual(logs, [])
 
 
+class _FakeBackend:
+    """可控的后端替身：可记录调用、模拟失败或不可用。"""
+
+    def __init__(self, name, available=True, fail=False):
+        self.name = name
+        self.label = name
+        self._available = available
+        self._fail = fail
+        self.calls = []
+
+    @property
+    def available(self):
+        return self._available
+
+    def press(self, key):
+        if self._fail:
+            raise RuntimeError("boom")
+        self.calls.append(("press", key))
+
+    def release(self, key):
+        if self._fail:
+            raise RuntimeError("boom")
+        self.calls.append(("release", key))
+
+
+class TestInputBackends(unittest.TestCase):
+    def _force_driver_unavailable(self, controller):
+        controller._backends["interception"]._available = False
+
+    def test_auto_falls_back_to_keyboard_without_driver(self):
+        controller = KeyController(note_to_key)
+        self._force_driver_unavailable(controller)
+        controller.set_backend("auto")
+        self.assertFalse(controller.is_driver_available())
+        self.assertEqual(controller.effective_backend(), "keyboard")
+        self.assertTrue(controller.is_auto())
+
+    def test_backend_options_include_auto_and_all_backends(self):
+        controller = KeyController(note_to_key)
+        names = [name for name, _ in controller.backend_options()]
+        self.assertEqual(names[0], "auto")
+        for expected in ("interception", "keyboard", "pyautogui"):
+            self.assertIn(expected, names)
+
+    def test_set_invalid_backend_raises(self):
+        controller = KeyController(note_to_key)
+        with self.assertRaises(ValueError):
+            controller.set_backend("nonexistent")
+
+    def test_explicit_interception_falls_back_when_driver_missing(self):
+        controller = KeyController(note_to_key, backend="interception")
+        self._force_driver_unavailable(controller)
+        self.assertFalse(controller.is_auto())
+        # 显式选择 interception 但驱动不可用时，effective 应回退到 keyboard
+        self.assertEqual(controller.effective_backend(), "keyboard")
+
+    def test_press_routes_to_active_keyboard_backend(self):
+        controller = KeyController({"1Key0": "Y"}, backend="keyboard")
+        fake_kb = _FakeBackend("keyboard")
+        controller._backends["keyboard"] = fake_kb
+        controller._backends["pyautogui"] = _FakeBackend("pyautogui")
+        controller.press("1Key0")
+        self.assertEqual(fake_kb.calls, [("press", "y")])
+
+    def test_send_falls_back_to_pyautogui_when_keyboard_fails(self):
+        controller = KeyController({"1Key0": "Y"}, backend="keyboard")
+        controller._backends["keyboard"] = _FakeBackend("keyboard", fail=True)
+        fake_pag = _FakeBackend("pyautogui")
+        controller._backends["pyautogui"] = fake_pag
+        controller.press("1Key0")
+        self.assertEqual(fake_pag.calls, [("press", "y")])
+
+    def test_all_backends_failing_logs_warning(self):
+        logs = []
+        controller = KeyController(
+            {"1Key0": "Y"}, backend="keyboard", log_func=logs.append)
+        self._force_driver_unavailable(controller)
+        controller._backends["keyboard"] = _FakeBackend("keyboard", fail=True)
+        controller._backends["pyautogui"] = _FakeBackend("pyautogui", fail=True)
+        controller.press("1Key0")
+        self.assertTrue(any("按键press失败" in m for m in logs))
+
+
 class TestSkyWindowIdentity(unittest.TestCase):
     def test_current_skyautomusic_process_is_not_game_window(self):
         self.assertFalse(

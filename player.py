@@ -28,6 +28,7 @@ class MusicPlayer:
         update_total=None,
         update_progress=None,
         update_note=None,
+        update_finished=None,
     ):
         self.key_controller = key_controller
         self.update_status = update_status or (lambda msg: None)
@@ -35,6 +36,8 @@ class MusicPlayer:
         self.update_total = update_total or (lambda sec: None)
         self.update_progress = update_progress or (lambda frac: None)
         self.update_note = update_note or (lambda idx, t_ms, notes: None)
+        # 演奏自然结束（非用户停止）时回调，供 UI 重置到"就绪"态
+        self.update_finished = update_finished or (lambda: None)
         self.state = PlaybackState.STOPPED
         self._stop = threading.Event()
         self.notes_by_time = None
@@ -115,6 +118,7 @@ class MusicPlayer:
             if not self._stop.is_set():
                 self.update_progress(1.0)
                 self.update_status("演奏结束！")
+                self.update_finished()
 
     def _playback_loop(self):
         notes_by_time = self.notes_by_time

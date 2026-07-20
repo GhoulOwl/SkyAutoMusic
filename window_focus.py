@@ -1,5 +1,7 @@
 import ctypes
 import os
+import subprocess
+import sys
 
 import psutil
 import win32con
@@ -8,6 +10,9 @@ import win32process
 
 
 SKY_PROCESS_NAMES = {"sky.exe", "sky"}
+EN_US_KEYBOARD_LAYOUT = "00000409"
+KLF_ACTIVATE = 0x00000001
+WM_INPUTLANGCHANGEREQUEST = 0x0050
 
 
 def is_sky_game_window_identity(process_name, window_title="", pid=None, current_pid=None):
@@ -28,6 +33,66 @@ def is_sky_game_window_identity(process_name, window_title="", pid=None, current
 def is_admin():
     try:
         return bool(ctypes.windll.shell32.IsUserAnAdmin())
+    except Exception:
+        return False
+
+
+def relaunch_as_admin_if_needed():
+    """Relaunch this process through UAC when running without admin rights."""
+    if os.name != "nt" or is_admin():
+        return False
+
+    try:
+        if getattr(sys, "frozen", False):
+            executable = sys.executable
+            params = subprocess.list2cmdline(sys.argv[1:])
+        else:
+            executable = sys.executable
+            params = subprocess.list2cmdline(sys.argv)
+        result = ctypes.windll.shell32.ShellExecuteW(
+            None,
+            "runas",
+            executable,
+            params,
+            os.getcwd(),
+            1,
+        )
+        return int(result) > 32
+    except Exception:
+        return False
+
+
+def switch_to_english_input(hwnd=None):
+    """Best-effort switch to the en-US keyboard layout for this app and a window."""
+    if os.name != "nt":
+        return False
+
+    try:
+        user32 = ctypes.windll.user32
+        user32.LoadKeyboardLayoutW.argtypes = [ctypes.c_wchar_p, ctypes.c_uint]
+        user32.LoadKeyboardLayoutW.restype = ctypes.c_void_p
+        user32.ActivateKeyboardLayout.argtypes = [ctypes.c_void_p, ctypes.c_uint]
+        user32.ActivateKeyboardLayout.restype = ctypes.c_void_p
+        user32.PostMessageW.argtypes = [
+            ctypes.c_void_p,
+            ctypes.c_uint,
+            ctypes.c_size_t,
+            ctypes.c_void_p,
+        ]
+        user32.PostMessageW.restype = ctypes.c_bool
+
+        layout = user32.LoadKeyboardLayoutW(EN_US_KEYBOARD_LAYOUT, KLF_ACTIVATE)
+        if not layout:
+            return False
+        user32.ActivateKeyboardLayout(layout, 0)
+        if hwnd:
+            user32.PostMessageW(
+                ctypes.c_void_p(hwnd),
+                WM_INPUTLANGCHANGEREQUEST,
+                0,
+                layout,
+            )
+        return True
     except Exception:
         return False
 

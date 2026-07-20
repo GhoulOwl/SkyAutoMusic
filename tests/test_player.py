@@ -48,6 +48,41 @@ class TestMusicPlayer(unittest.TestCase):
         self.assertIn((1, 1, ("1Key1", "1Key2")), seen_notes)
         self.assertTrue(any("演奏结束" in s for s in statuses))
 
+    def test_finished_callback_fires_on_natural_end(self):
+        keys = FakeKeyController()
+        finished = []
+        notes_by_time = defaultdict(list, {0: ["1Key0"]})
+        player = MusicPlayer(
+            keys,
+            update_finished=lambda: finished.append(True),
+        )
+        player.START_DELAY = 0
+        player.NOTE_HOLD = 0
+
+        self.assertTrue(player.start(notes_by_time, [0]))
+        player.thread.join(timeout=1)
+
+        self.assertEqual(player.state, PlaybackState.STOPPED)
+        self.assertEqual(finished, [True])
+
+    def test_finished_callback_not_fired_on_user_stop(self):
+        keys = FakeKeyController()
+        finished = []
+        notes_by_time = defaultdict(list, {0: ["1Key0"], 1000: ["1Key1"]})
+        player = MusicPlayer(
+            keys,
+            update_finished=lambda: finished.append(True),
+        )
+        player.START_DELAY = 0
+        player.NOTE_HOLD = 0
+
+        self.assertTrue(player.start(notes_by_time, [0, 1000]))
+        player.stop()
+        player.thread.join(timeout=1)
+
+        self.assertEqual(player.state, PlaybackState.STOPPED)
+        self.assertEqual(finished, [])
+
 
 if __name__ == "__main__":
     unittest.main()
