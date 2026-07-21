@@ -778,6 +778,20 @@ class MusicGUI:
         return True
 
     # ---------- 扒谱（音频 → 乐谱） ----------
+    def _build_transcribe_config(self):
+        from transcriber import TranscribeConfig
+
+        return TranscribeConfig(
+            muscriptor_model=self.config.get("muscriptor_model", "large"),
+            muscriptor_device=self.config.get("muscriptor_device", "auto"),
+            profile=self.config.get("transcription_profile", "melody"),
+            out_of_range_policy=self.config.get("out_of_range_policy", "adaptive"),
+            debug_outputs=bool(self.config.get("transcription_debug_outputs", False)),
+            muscriptor_batch_size=self.config.get("muscriptor_batch_size"),
+            muscriptor_beam_size=self.config.get("muscriptor_beam_size", 1),
+            muscriptor_cfg_coef=self.config.get("muscriptor_cfg_coef", 1.0),
+        )
+
     def open_generate_dialog(self):
         """打开文件选择对话框，启动后台线程批量转写音频为乐谱 JSON。
 
@@ -786,13 +800,14 @@ class MusicGUI:
         from tkinter import filedialog
         from transcriber import Transcriber, is_audio_file
 
-        # 检查依赖（numpy/librosa）—— Transcriber 会在 __init__ 内做懒导入 + 错误抛出
+        # 检查 MuScriptor 依赖；Transcriber 会在 __init__ 内做懒导入和错误抛出。
         try:
-            transcriber = Transcriber()
+            transcriber = Transcriber(self._build_transcribe_config())
         except Exception as e:
             messagebox.showerror(
                 "依赖缺失",
-                f"无法启动扒谱功能：\n{e}\n\n请先运行: pip install librosa numpy soundfile",
+                f"无法启动扒谱功能：\n{e}\n\n请先运行: uv pip install --torch-backend=cu128 -r requirements.txt\n"
+                "首次运行前还需要接受 Hugging Face 模型条款并登录: uvx hf auth login",
             )
             return
 
@@ -823,6 +838,7 @@ class MusicGUI:
             info_var.set("正在取消…")
 
         ttk.Button(win, text="取消", command=on_cancel).pack(pady=(4, 8))
+        run_state = {"results": [], "fatal_error": None}
 
         def progress_cb(filename, frac, status):
             # 转到 Tk 主线程
@@ -845,13 +861,13 @@ class MusicGUI:
                 # 用本地 list 防止被 Cancel 修改（iterable 一次性）
                 files_list = list(files)
                 # 用户取消：transcriber.run 不支持逐文件中断，最简做法：等本批跑完，UI 层关进度窗口
-                transcriber.run(
+                run_state["results"] = transcriber.run(
                     files_list,
                     output_dir=SHEET_MUSIC_DIR,
                     progress_cb=progress_cb,
                 )
             except Exception as e:
-                win.after(0, lambda: messagebox.showerror("转写失败", str(e)))
+                run_state["fatal_error"] = str(e)
             finally:
                 def _finish():
                     # 通知主线程刷新列表（schedule_music_dir_watch 每秒会扫一次，但这里立刻刷更直观）
@@ -862,22 +878,42 @@ class MusicGUI:
                         self.last_music_files = set(self.all_music_files)
                     except Exception:
                         pass
-                    # 计算本次成功数
-                    ok_n = 0
-                    for fp in files:
-                        out = os.path.join(SHEET_MUSIC_DIR,
-                                           os.path.splitext(os.path.basename(fp))[0] + ".json")
-                        if os.path.exists(out):
-                            ok_n += 1
+                    results = list(run_state.get("results") or [])
+                    if results:
+                        ok_n = sum(1 for item in results if item.get("ok"))
+                    else:
+                        ok_n = 0
+                        for fp in files:
+                            out = os.path.join(SHEET_MUSIC_DIR,
+                                               os.path.splitext(os.path.basename(fp))[0] + ".json")
+                            if os.path.exists(out):
+                                ok_n += 1
                     try:
                         win.destroy()
                     except Exception:
                         pass
-                    messagebox.showinfo(
-                        "生成完成",
-                        f"已生成 {ok_n}/{len(files)} 份乐谱到 Sheet Music/ 文件夹。\n"
-                        f"点击列表中对应文件即可开始演奏。",
-                    )
+                    fatal_error = run_state.get("fatal_error")
+                    if fatal_error:
+                        messagebox.showerror("转写失败", str(fatal_error))
+                        return
+                    failures = [item for item in results if not item.get("ok")]
+                    if failures:
+                        detail = "\n".join(
+                            f"- {item.get('song_name') or os.path.basename(item.get('input', ''))}: {item.get('error')}"
+                            for item in failures[:5]
+                        )
+                        if len(failures) > 5:
+                            detail += f"\n... 还有 {len(failures) - 5} 个失败文件"
+                        messagebox.showerror(
+                            "生成失败",
+                            f"已生成 {ok_n}/{len(files)} 份乐谱。\n\n失败详情：\n{detail}",
+                        )
+                    else:
+                        messagebox.showinfo(
+                            "生成完成",
+                            f"已生成 {ok_n}/{len(files)} 份乐谱到 Sheet Music/ 文件夹。\n"
+                            f"点击列表中对应文件即可开始演奏。",
+                        )
                 try:
                     win.after(0, _finish)
                 except Exception:

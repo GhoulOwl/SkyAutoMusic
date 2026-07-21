@@ -9,9 +9,8 @@ psutil==5.9.8
 # 注意：interception-python 需要 Python>=3.10。
 interception-python>=1.13
 # ---- 扒谱（音频转乐谱）功能依赖 ----
-# 提示：librosa 会拉 numba、soundfile、audioread 等，安装包体积较大。
-# macOS/Linux 上如需解析 mp3 还需要 ffmpeg；wav/flac/ogg 无需 ffmpeg。
-numpy>=1.21
-scipy>=1.7
-soundfile>=0.12
-librosa>=0.10
+# 提示：扒谱使用 MuScriptor；Windows + NVIDIA 推荐用
+# uv pip install --torch-backend=cu128 -r requirements.txt
+# 首次运行需接受 Hugging Face 模型条款并登录：uvx hf auth login
+soundfile>=0.14
+muscriptor==0.2.1
