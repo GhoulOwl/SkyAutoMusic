@@ -47,6 +47,7 @@ class SkyMelodyArranger:
         self.last_candidates: List[SkyNote] = []
         self.last_arranged: List[SkyNote] = []
         self.last_report: Dict[str, object] = {}
+        self._instrument_avg_conf: Dict[str, float] = {}
 
     def arrange(
         self,
@@ -64,7 +65,11 @@ class SkyMelodyArranger:
             return [], stats
 
         filtered = self._filter_events(raw_events)
-        clustered = self._cluster_events(filtered)
+        if self.config.arranger_keep_chords:
+            # 维度4：和弦模式保留同时刻的多个声部，跳过会把它们折叠成单音的聚类。
+            clustered = filtered
+        else:
+            clustered = self._cluster_events(filtered)
         phrases = self._split_phrases(clustered)
 
         arranged: List[SkyNote] = []
@@ -77,13 +82,15 @@ class SkyMelodyArranger:
             self.last_candidates.extend(
                 self._preview_note(event, transpose) for event in phrase
             )
-            phrase_notes, phrase_report = self._arrange_phrase(
-                phrase,
-                transpose=transpose,
-                phrase_index=phrase_index,
+
+        if self.config.arranger_keep_chords:
+            arranged, phrase_reports = self._arrange_chords(
+                phrases, phrase_transposes
             )
-            arranged.extend(phrase_notes)
-            phrase_reports.append(phrase_report)
+        else:
+            arranged, phrase_reports = self._arrange_melody(
+                phrases, phrase_transposes
+            )
 
         arranged.sort(key=lambda n: (int(n.time), SkyKeyMapper.key_to_index(n.key), n.key))
         self.last_arranged = arranged
@@ -107,7 +114,93 @@ class SkyMelodyArranger:
     def last_report_bytes(self) -> bytes:
         return json.dumps(self.last_report, ensure_ascii=False, indent=2).encode("utf-8")
 
+    def _arrange_melody(
+        self,
+        phrases: List[List[_MelodyEvent]],
+        phrase_transposes: List[int],
+    ) -> Tuple[List[SkyNote], List[Dict[str, object]]]:
+        arranged: List[SkyNote] = []
+        phrase_reports: List[Dict[str, object]] = []
+        for phrase_index, phrase in enumerate(phrases):
+            transpose = phrase_transposes[phrase_index]
+            phrase_notes, phrase_report = self._arrange_phrase(
+                phrase,
+                transpose=transpose,
+                phrase_index=phrase_index,
+            )
+            arranged.extend(phrase_notes)
+            phrase_reports.append(phrase_report)
+        return arranged, phrase_reports
+
+    def _arrange_chords(
+        self,
+        phrases: List[List[_MelodyEvent]],
+        phrase_transposes: List[int],
+    ) -> Tuple[List[SkyNote], List[Dict[str, object]]]:
+        """维度4：保留同时间的多个声部，输出可被 Sky 多键同按演奏的和弦。
+
+        For each simultaneous time slot keep the top ``max_chord_voices`` events
+        (by content-aware score), de-duplicated by Sky key. Unlike the melody
+        DP this never deletes a simultaneous voice, so harmonic content is
+        preserved.
+        """
+        arranged: List[SkyNote] = []
+        phrase_reports: List[Dict[str, object]] = []
+        for phrase_index, phrase in enumerate(phrases):
+            transpose = phrase_transposes[phrase_index]
+            by_time: Dict[int, List[_MelodyEvent]] = {}
+            for ev in phrase:
+                by_time.setdefault(int(ev.time_ms), []).append(ev)
+
+            notes: List[SkyNote] = []
+            for t in sorted(by_time):
+                group = sorted(
+                    by_time[t],
+                    key=lambda e: -self._event_score(
+                        e, self._instrument_priority(e.instrument)
+                    ),
+                )
+                used_keys: set = set()
+                picked = 0
+                for ev in group:
+                    if picked >= self.config.max_chord_voices:
+                        break
+                    key, _clamped = self.mapper.midi_to_key(
+                        ev.midi, transpose=transpose
+                    )
+                    if key in used_keys:
+                        continue
+                    used_keys.add(key)
+                    notes.append(self._preview_note(ev, transpose))
+                    picked += 1
+            arranged.extend(notes)
+            phrase_reports.append(
+                {
+                    "phrase_index": phrase_index,
+                    "start_ms": int(phrase[0].time_ms) if phrase else 0,
+                    "end_ms": int(phrase[-1].time_ms) if phrase else 0,
+                    "transpose": transpose,
+                    "candidate_count": len(phrase),
+                    "selected_count": len(notes),
+                    "deleted_count": max(0, len(phrase) - len(notes)),
+                    "cost": 0.0,
+                }
+            )
+        return arranged, phrase_reports
+
     def _filter_events(self, events: List[PitchEvent]) -> List[_MelodyEvent]:
+        # 维度4（内容感知）：先统计每个乐器被 F0 校验后的平均置信度，
+        # 让真正承载主旋律的乐器在评分中胜出，而非死板按名字表。
+        conf_sum: Dict[str, float] = {}
+        conf_cnt: Dict[str, int] = {}
+        for event in events:
+            inst = str(event.instrument or "unknown")
+            conf_sum[inst] = conf_sum.get(inst, 0.0) + float(event.confidence)
+            conf_cnt[inst] = conf_cnt.get(inst, 0) + 1
+        self._instrument_avg_conf = {
+            inst: conf_sum[inst] / conf_cnt[inst] for inst in conf_sum
+        }
+
         kept: List[_MelodyEvent] = []
         for event in events:
             instrument = str(event.instrument or "unknown")
@@ -315,9 +408,13 @@ class SkyMelodyArranger:
         return 18.0 + float(event.confidence) * 10.0 + priority * 0.12 + duration_bonus
 
     def _event_score(self, event: PitchEvent, priority: float) -> float:
+        # 维度4：将乐器平均置信度折叠进评分（0.5~1.0 区间），使被 F0 校验
+        # 确认度更高的乐器在旋律/和弦选择中更有优势。
+        avg_conf = self._instrument_avg_conf.get(event.instrument, 1.0)
+        effective = priority * (0.5 + 0.5 * avg_conf)
         duration = min(max(0, int(event.duration_ms)), 1200) / 1200.0 * 12.0
         midrange = max(0.0, 14.0 - abs(float(event.midi) - 72.0) * 0.45)
-        return float(event.confidence) * 100.0 + priority * 1.4 + duration + midrange
+        return float(event.confidence) * 100.0 + effective * 1.4 + duration + midrange
 
     def _finish_report(
         self,

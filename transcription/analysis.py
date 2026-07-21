@@ -10,6 +10,8 @@ from collections import Counter
 from typing import Any, Dict, List, Optional, Tuple
 
 from .models import PitchEvent, TranscribeConfig, TranscribeStats
+from .preprocess import AudioPreprocessor
+from .fusion import fuse_events
 
 
 class AnalyzerUnavailableError(RuntimeError):
@@ -82,7 +84,10 @@ class MuScriptorAnalyzer:
         debug_rows: List[Dict[str, Any]] = []
         dropped = 0
 
-        kwargs = self._transcribe_kwargs(audio_path)
+        # 维度1：音频预处理（降噪/分离/归一化），产出清洗后的音频供引擎与 F0 使用。
+        clean_audio = AudioPreprocessor(self.config).run(audio_path)
+
+        kwargs = self._transcribe_kwargs(clean_audio)
         with _quiet_muscriptor_logs():
             event_stream = self.model.transcribe(**kwargs)
             for event in event_stream:
@@ -103,6 +108,13 @@ class MuScriptorAnalyzer:
                         events.append(pitch_event)
                     continue
                 dropped += 1
+
+        # 维度2/3/5：并行 F0 重建置信度、八度校正、缺口补检与起始点校验。
+        if os.path.exists(clean_audio):
+            try:
+                events = fuse_events(events, clean_audio, self.config)
+            except Exception as exc:  # 融合失败不应破坏扒谱主流程
+                warnings.warn(f"event fusion skipped: {exc}")
 
         events.sort(key=lambda event: (event.time_ms, event.midi, event.instrument))
         if debug_rows:
@@ -184,6 +196,7 @@ class MuScriptorAnalyzer:
             source="muscriptor",
             duration_ms=end_ms - start_ms,
             instrument=instrument,
+            confidence_source="muscriptor",
         )
 
     @staticmethod

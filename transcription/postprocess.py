@@ -29,17 +29,20 @@ class NotePostProcessor:
         dropped += count
         work, count = self._dedupe_repeated_keys(work, self.config.dedupe_key_ms)
         dropped += count
-        work, count = self._apply_profile(work)
+
+        # 维度5：用初步 BPM 计算自适应 gap（避免快旋律被固定窗口抽稀）。
+        preliminary_bpm = self._estimate_bpm(work)
+        work, count = self._apply_profile(work, preliminary_bpm)
         dropped += count
 
         estimated_bpm = self._estimate_bpm(work)
         if self.config.quantize and estimated_bpm:
-            work = self._quantize(work, estimated_bpm)
+            work = self._quantize(work, estimated_bpm, self.config.quantize_strength)
             work, count = self._merge_exact_times(work)
             dropped += count
             work, count = self._dedupe_repeated_keys(work, self.config.dedupe_key_ms)
             dropped += count
-            work, count = self._apply_profile(work)
+            work, count = self._apply_profile(work, estimated_bpm)
             dropped += count
 
         work.sort(key=lambda n: (n.time, SkyKeyMapper.key_to_index(n.key), n.key))
@@ -81,6 +84,7 @@ class NotePostProcessor:
                     confidence=note.confidence,
                     duration_ms=note.duration_ms,
                     instrument=note.instrument,
+                    confidence_source=note.confidence_source,
                 )
                 existing = best_by_key.get(note.key)
                 if existing is None or candidate.confidence > existing.confidence:
@@ -172,7 +176,7 @@ class NotePostProcessor:
         _distance, _factor, bpm = min(candidates)
         return int(round(bpm))
 
-    def _quantize(self, notes: List[SkyNote], bpm: int) -> List[SkyNote]:
+    def _quantize(self, notes: List[SkyNote], bpm: int, strength: float = 1.0) -> List[SkyNote]:
         if not notes or bpm <= 0:
             return list(notes)
         beat_ms = 60000.0 / float(bpm)
@@ -180,18 +184,22 @@ class NotePostProcessor:
         if grid_ms <= 0:
             return list(notes)
         base = min(int(n.time) for n in notes)
+        strength = max(0.0, min(1.0, float(strength)))
         quantized: List[SkyNote] = []
         for note in notes:
             offset = int(note.time) - base
             q_time = int(round(round(offset / grid_ms) * grid_ms + base))
+            # 维度5：按 quantize_strength 部分吸附，避免强量化把全曲时间推偏。
+            snapped = int(note.time + (q_time - int(note.time)) * strength)
             quantized.append(
                 SkyNote(
-                    time=max(0, q_time),
+                    time=max(0, snapped),
                     key=note.key,
                     midi=note.midi,
                     confidence=note.confidence,
                     duration_ms=note.duration_ms,
                     instrument=note.instrument,
+                    confidence_source=note.confidence_source,
                 )
             )
         quantized.sort(key=lambda n: (n.time, n.key, -n.confidence))
@@ -218,12 +226,30 @@ class NotePostProcessor:
             kept.append(note)
         return kept, dropped
 
-    def _apply_profile(self, notes: List[SkyNote]) -> Tuple[List[SkyNote], int]:
-        if self.config.profile == "melody":
+    def _apply_profile(
+        self, notes: List[SkyNote], bpm: Optional[int] = None
+    ) -> Tuple[List[SkyNote], int]:
+        if self.config.profile == "melody" and not self.config.arranger_keep_chords:
             work, dropped = self._select_melody_line(notes)
-            work, count = self._thin_dense_melody(work, self.config.min_event_gap_ms)
+            gap = (
+                self._adaptive_gap(bpm)
+                if self.config.adaptive_gap
+                else self.config.min_event_gap_ms
+            )
+            work, count = self._thin_dense_melody(work, gap)
             return work, dropped + count
+        # 和弦 / 多声部：用复音上限封顶，不再做单旋律抽稀。
+        if self.config.arranger_keep_chords:
+            cap = max(self.config.max_polyphony, self.config.max_chord_voices)
+            return self._cap_polyphony(notes, cap)
         return self._cap_polyphony(notes, self.config.max_polyphony)
+
+    def _adaptive_gap(self, bpm: Optional[int]) -> int:
+        """维度3/5：gap 取真实节拍的十六分音符，避免固定阈值误删快旋律。"""
+        if bpm:
+            grid = 60000.0 / float(bpm) / 4.0
+            return max(self.config.min_event_gap_ms, int(round(grid)))
+        return self.config.min_event_gap_ms
 
     def _select_melody_line(self, notes: List[SkyNote]) -> Tuple[List[SkyNote], int]:
         grouped: Dict[int, List[SkyNote]] = defaultdict(list)

@@ -14,6 +14,16 @@ class PitchEvent:
     source: str = "muscriptor"
     duration_ms: int = 0
     instrument: str = ""
+    confidence_source: str = "muscriptor"  # muscriptor | f0 | gap
+
+    def to_sky_note_kwargs(self) -> Dict[str, Any]:
+        return {
+            "midi": self.midi,
+            "confidence": self.confidence,
+            "duration_ms": self.duration_ms,
+            "instrument": self.instrument,
+            "confidence_source": self.confidence_source,
+        }
 
 
 @dataclass
@@ -26,6 +36,7 @@ class SkyNote:
     confidence: float = 1.0
     duration_ms: int = 0
     instrument: str = ""
+    confidence_source: str = "muscriptor"
 
     def to_song_note(self) -> Dict[str, Any]:
         return {"time": int(self.time), "key": self.key}
@@ -46,11 +57,12 @@ class TranscribeConfig:
     onset_pitch_window: float = 0.13
     pitch_mag_threshold: float = 0.10
     onset_delta: float = 0.07
-    merge_onset_ms: int = 55
+    merge_onset_ms: int = 25
     dedupe_key_ms: int = 120
     min_confidence: float = 0.35
-    min_note_duration_ms: int = 90
-    min_event_gap_ms: int = 100
+    min_note_duration_ms: int = 50
+    min_event_gap_ms: int = 0
+    adaptive_gap: bool = True
     drop_out_of_range: bool = False
     out_of_range_policy: str = "adaptive"
     arranger_enabled: bool = True
@@ -59,6 +71,8 @@ class TranscribeConfig:
     arranger_phrase_gap_ms: int = 900
     arranger_min_note_gap_ms: int = 120
     arranger_keep_chords: bool = False
+    max_chord_voices: int = 3
+    quantize_strength: float = 0.3
     muscriptor_model: str = "large"
     muscriptor_device: str = "auto"
     muscriptor_instruments: Optional[List[str]] = None
@@ -66,6 +80,22 @@ class TranscribeConfig:
     muscriptor_beam_size: int = 1
     muscriptor_cfg_coef: float = 1.0
     muscriptor_prelude_forcing: bool = True
+    # ---- 维度1：音频预处理 ----
+    preprocess_enabled: bool = True
+    preprocess_separate: str = "hpss"  # none | hpss | demucs
+    preprocess_denoise: bool = False
+    preprocess_hp_hz: float = 70.0
+    preprocess_target_sr: int = 44100
+    preprocess_lufs: float = -14.0
+    # ---- 维度2/3：并行 F0 基频跟踪与起始点检测 ----
+    f0_enabled: bool = True
+    f0_method: str = "crepe"  # crepe | pyin
+    f0_step_ms: float = 10.0
+    f0_voicing_threshold: float = 0.5
+    onset_enabled: bool = True
+    # ---- 维度5：后处理修补 ----
+    repair_octave: bool = True
+    repair_gaps: bool = True
 
     def __post_init__(self) -> None:
         self.engine = str(self.engine or "muscriptor").lower()
@@ -116,6 +146,29 @@ class TranscribeConfig:
         )
         self.muscriptor_beam_size = max(1, int(self.muscriptor_beam_size))
         self.muscriptor_cfg_coef = float(self.muscriptor_cfg_coef)
+        # ---- 五维重构新增字段校验 ----
+        self.preprocess_enabled = bool(self.preprocess_enabled)
+        self.preprocess_separate = str(self.preprocess_separate or "hpss").strip().lower()
+        if self.preprocess_separate not in {"none", "hpss", "demucs"}:
+            raise ValueError(
+                f"Unknown preprocess_separate mode: {self.preprocess_separate}"
+            )
+        self.preprocess_denoise = bool(self.preprocess_denoise)
+        self.preprocess_hp_hz = max(0.0, float(self.preprocess_hp_hz))
+        self.preprocess_target_sr = max(4000, int(self.preprocess_target_sr))
+        self.preprocess_lufs = float(self.preprocess_lufs)
+        self.f0_enabled = bool(self.f0_enabled)
+        self.f0_method = str(self.f0_method or "crepe").strip().lower()
+        if self.f0_method not in {"crepe", "pyin"}:
+            raise ValueError(f"Unknown f0_method: {self.f0_method}")
+        self.f0_step_ms = max(1.0, float(self.f0_step_ms))
+        self.f0_voicing_threshold = max(0.0, min(1.0, float(self.f0_voicing_threshold)))
+        self.onset_enabled = bool(self.onset_enabled)
+        self.adaptive_gap = bool(self.adaptive_gap)
+        self.max_chord_voices = max(1, int(self.max_chord_voices))
+        self.quantize_strength = max(0.0, min(1.0, float(self.quantize_strength)))
+        self.repair_octave = bool(self.repair_octave)
+        self.repair_gaps = bool(self.repair_gaps)
 
 
 @dataclass

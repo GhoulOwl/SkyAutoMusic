@@ -14,3 +14,12 @@ interception-python>=1.13
 # 首次运行需接受 Hugging Face 模型条款并登录：uvx hf auth login
 soundfile>=0.14
 muscriptor==0.2.1
+# ---- 五维优化依赖（预处理 / 并行F0 / 起始点检测，均为可选增强）----
+# 缺失时管道会自动降级：confidence 退回模型原始值，主流程不受影响。
+librosa>=0.10
+scipy>=1.10
+numpy>=1.24
+# crepe（CNN 基频）与 demucs（人声/乐器分离）按需安装：
+#   pip install crepe        # 启用 f0_method=crepe 时需要
+#   pip install demucs       # 启用 preprocess_separate=demucs 时需要
+#（pyin 后端无需额外安装，仅需 librosa）

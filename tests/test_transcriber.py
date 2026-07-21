@@ -178,6 +178,7 @@ class TestPostProcessing(unittest.TestCase):
         config = TranscribeConfig(
             profile="chord",
             quantize=True,
+            quantize_strength=1.0,
             merge_onset_ms=0,
             dedupe_key_ms=0,
             max_polyphony=4,
@@ -763,6 +764,176 @@ class TestWriteMidi(unittest.TestCase):
         self.assertGreaterEqual(first_off, 0)
         self.assertGreaterEqual(second_on, 0)
         self.assertLess(first_off, second_on)
+
+
+class TestFiveDimensionEnhancements(unittest.TestCase):
+    """Regression tests for the five-dimension transcription refactor."""
+
+    def test_preprocessor_disabled_returns_original(self):
+        from transcription.preprocess import AudioPreprocessor
+
+        cfg = TranscribeConfig(preprocess_enabled=False)
+        self.assertEqual(AudioPreprocessor(cfg).run("some.wav"), "some.wav")
+
+    def test_preprocessor_missing_file_returns_original(self):
+        from transcription.preprocess import AudioPreprocessor
+
+        cfg = TranscribeConfig(preprocess_enabled=True)
+        # Missing file must not raise; the original path is returned untouched.
+        self.assertEqual(
+            AudioPreprocessor(cfg).run("does_not_exist.wav"), "does_not_exist.wav"
+        )
+
+    def test_f0_agreement_high_for_matching_pitch(self):
+        from transcription.fusion import _f0_agreement
+
+        f0 = [(0, 64.0, 1.0, True), (10, 64.0, 1.0, True), (20, 65.0, 1.0, True)]
+        self.assertGreaterEqual(_f0_agreement(f0, 0, 30, 64.0), 0.9)
+
+    def test_f0_agreement_low_for_mismatched_pitch(self):
+        from transcription.fusion import _f0_agreement
+
+        f0 = [(0, 40.0, 1.0, True), (10, 41.0, 1.0, True)]
+        self.assertLessEqual(_f0_agreement(f0, 0, 20, 72.0), 0.4)
+
+    def test_repair_octave_folds_large_errors(self):
+        from transcription.fusion import _repair_octave
+
+        # F0 median ~64, event an octave up at 76 -> fold to 64.
+        self.assertEqual(_repair_octave(76.0, [64.0, 64.0, 65.0]), 64.0)
+        # Small error (66 vs 64) stays.
+        self.assertEqual(_repair_octave(66.0, [64.0, 64.0, 65.0]), 66.0)
+
+    def test_fill_gaps_adds_missing_notes(self):
+        from transcription.fusion import _fill_gaps
+        from transcription.models import PitchEvent
+
+        f0 = [(t, 60.0, 1.0, True) for t in range(0, 200, 10)]
+        out = _fill_gaps([], f0, TranscribeConfig(min_note_duration_ms=50))
+        self.assertEqual(len(out), 1)
+        self.assertEqual(out[0].confidence_source, "gap")
+        self.assertEqual(out[0].midi, 60)
+
+    def test_arranger_keeps_chords(self):
+        from transcription.arranger import SkyMelodyArranger
+        from transcription.models import PitchEvent, TranscribeStats
+
+        events = [
+            PitchEvent(0, 60, 1.0, duration_ms=200, instrument="voice"),
+            PitchEvent(0, 64, 1.0, duration_ms=200, instrument="organ"),
+            PitchEvent(0, 67, 1.0, duration_ms=200, instrument="synth_pad"),
+            PitchEvent(250, 62, 1.0, duration_ms=200, instrument="voice"),
+        ]
+        config = TranscribeConfig(
+            quantize=False,
+            arranger_keep_chords=True,
+            max_chord_voices=3,
+            arranger_cluster_ms=0,
+            arranger_phrase_gap_ms=900,
+            arranger_min_note_gap_ms=120,
+        )
+        stats = TranscribeStats(raw_event_count=len(events))
+        notes, _stats = SkyMelodyArranger(config).arrange(events, stats)
+        t0 = [n for n in notes if n.time == 0]
+        self.assertEqual(len(t0), 3)
+        self.assertEqual({int(n.midi) for n in t0}, {60, 64, 67})
+        self.assertEqual(len([n for n in notes if n.time == 250]), 1)
+
+    def test_adaptive_gap_uses_bpm(self):
+        from transcription.postprocess import NotePostProcessor
+
+        cfg = TranscribeConfig(
+            profile="melody", quantize=False, adaptive_gap=True, min_event_gap_ms=0
+        )
+        proc = NotePostProcessor(cfg)
+        # 120 bpm -> sixteenth grid = 125 ms.
+        self.assertEqual(proc._adaptive_gap(120), 125)
+        # Unknown bpm -> fall back to configured floor.
+        self.assertEqual(proc._adaptive_gap(None), 0)
+
+    def test_quantize_strength_interpolates(self):
+        from transcription.postprocess import NotePostProcessor
+
+        proc = NotePostProcessor(TranscribeConfig())
+        notes = [
+            SkyNote(300, "1Key0", 60, 1.0),
+            SkyNote(406, "1Key1", 62, 1.0),
+        ]
+        strong = proc._quantize(notes, 120, 1.0)
+        weak = proc._quantize(notes, 120, 0.3)
+        # bpm 120 -> grid 125, base 300 -> 406 snaps to 425 (strong).
+        self.assertEqual([n.time for n in strong], [300, 425])
+        # weak only moves part way.
+        self.assertEqual([n.time for n in weak], [300, 411])
+
+    def test_f0_tracker_detects_sine(self):
+        try:
+            import librosa  # noqa: F401
+            import numpy as np  # noqa: F401
+            import soundfile as sf  # noqa: F401
+        except Exception:
+            self.skipTest("librosa/numpy/soundfile not available")
+        import os
+        import tempfile
+
+        from transcription.pitch import F0Tracker
+
+        sr = 44100
+        t = np.linspace(0, 1.0, sr, endpoint=False)
+        y = np.sin(2 * np.pi * 440.0 * t).astype(np.float32)
+        fd, path = tempfile.mkstemp(suffix=".wav")
+        os.close(fd)
+        try:
+            sf.write(path, y, sr)
+            frames = F0Tracker(TranscribeConfig(f0_method="pyin")).track(path, sr=sr)
+            voiced = [m for (_t, m, _c, v) in frames if v and m is not None]
+            self.assertTrue(voiced, "no voiced frames detected")
+            self.assertTrue(all(abs(m - 69.0) <= 2.0 for m in voiced))
+        finally:
+            os.remove(path)
+
+    def test_fusion_assigns_f0_confidence(self):
+        try:
+            import librosa  # noqa: F401
+            import numpy as np  # noqa: F401
+            import soundfile as sf  # noqa: F401
+        except Exception:
+            self.skipTest("librosa/numpy/soundfile not available")
+        import os
+        import tempfile
+
+        from transcription.fusion import fuse_events
+        from transcription.models import PitchEvent
+
+        sr = 44100
+        t = np.linspace(0, 1.0, sr, endpoint=False)
+        y = np.sin(2 * np.pi * 440.0 * t).astype(np.float32)
+        fd, path = tempfile.mkstemp(suffix=".wav")
+        os.close(fd)
+        try:
+            sf.write(path, y, sr)
+            events = [
+                PitchEvent(100, 69, 1.0, duration_ms=800, instrument="voice"),
+                PitchEvent(100, 76, 1.0, duration_ms=800, instrument="voice"),
+            ]
+            out = fuse_events(
+                events,
+                path,
+                TranscribeConfig(
+                    f0_method="pyin",
+                    f0_voicing_threshold=0.3,
+                    repair_gaps=False,
+                ),
+            )
+            conf_match = next(e for e in out if abs(e.midi - 69) < 0.5).confidence
+            conf_oct = next(e for e in out if abs(e.midi - 76) < 0.5).confidence
+            self.assertGreater(conf_match, 0.8)
+            self.assertLess(conf_oct, conf_match)
+            self.assertEqual(
+                next(e for e in out if abs(e.midi - 69) < 0.5).confidence_source, "f0"
+            )
+        finally:
+            os.remove(path)
 
 
 if __name__ == "__main__":
