@@ -1,12 +1,13 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field, replace
-from typing import Any, Callable, Dict, List, Literal, Optional
+from typing import Any, Callable, Dict, List, Literal, Optional, Tuple
 
 
 TranscriptionMode = Literal["midi", "monophonic", "polyphonic"]
 Sensitivity = Literal["low", "normal", "high"]
 QuantizeMode = Literal["off", "1/8", "1/16"]
+SourcePlatform = Literal["local", "netease"]
 ProgressCallback = Callable[[str, float, str], None]
 
 
@@ -16,6 +17,16 @@ class TranscriptionError(RuntimeError):
 
 class CancelledError(TranscriptionError):
     """用户主动取消转写。"""
+
+
+@dataclass(frozen=True)
+class SourceMetadata:
+    platform: SourcePlatform = "local"
+    title: str = ""
+    artists: Tuple[str, ...] = ()
+    source_id: str = ""
+    webpage_url: str = ""
+    display_name: str = ""
 
 
 @dataclass(frozen=True)
@@ -88,4 +99,5 @@ class TranscriptionResult:
     octave_shift: int = 0
     beat_times_ms: List[int] = field(default_factory=list, repr=False)
     options: TranscriptionOptions = field(default_factory=TranscriptionOptions, repr=False)
+    source: Optional[SourceMetadata] = None
 

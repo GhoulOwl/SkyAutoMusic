@@ -1,8 +1,11 @@
 from __future__ import annotations
 
 import os
+import shutil
+import tempfile
 import threading
 import tkinter as tk
+from dataclasses import replace
 from tkinter import filedialog, messagebox, ttk
 from typing import Callable, Dict, List, Optional, Sequence
 
@@ -10,13 +13,23 @@ from .arranger import NOTE_NAMES
 from .backends import is_midi_file
 from .models import (
     CancelledError,
+    SourceMetadata,
     TranscriptionOptions,
     TranscriptionResult,
+)
+from .netease import NetEaseClient, NetEaseSearchPage, NetEaseTrack
+from .netease_auth import (
+    CookieValidationResult,
+    NetEaseCookieStore,
+    parse_netscape_cookies,
+    serialize_netscape_cookies,
+    validate_cookie_account,
 )
 from .pipeline import (
     export_song_json,
     next_available_path,
     rearrange_draft,
+    suggested_output_stem,
     transcribe_draft,
 )
 from .preview import PreviewPlayer
@@ -39,25 +52,44 @@ class TranscriptionDialog:
         files: Sequence[str],
         output_dir: str,
         accent: str = "#4F8CFF",
-        on_saved: Optional[Callable[[], None]] = None,
+        on_saved: Optional[Callable[[str], None]] = None,
+        auth_file: Optional[str] = None,
+        netease_client: Optional[NetEaseClient] = None,
     ):
         self.parent = parent
         self.files = list(files)
         self.output_dir = output_dir
         self.accent = accent
-        self.on_saved = on_saved or (lambda: None)
+        self.on_saved = on_saved or (lambda _path: None)
         self.results: Dict[str, TranscriptionResult] = {}
         self.errors: Dict[str, str] = {}
         self.saved_paths: Dict[str, str] = {}
+        self.source_labels: Dict[str, str] = {
+            path: os.path.basename(path) for path in self.files
+        }
+        self.online_paths = set()
         self.cancel_event = threading.Event()
         self.preview_player = PreviewPlayer()
         self.busy = False
         self.closed = False
+        self._workers_lock = threading.Lock()
+        self._worker_count = 0
+        self._temp_root = tempfile.TemporaryDirectory(prefix="sky-netease-drafts-")
+        auth_path = auth_file or os.path.join(
+            os.path.dirname(os.path.abspath(output_dir)), "netease_auth.json"
+        )
+        self.cookie_store = NetEaseCookieStore(auth_path)
+        self.netease_client = netease_client or NetEaseClient()
+        self.search_generation = 0
+        self.search_page = 0
+        self.search_limit = 20
+        self.search_total = 0
+        self.search_tracks: Dict[str, NetEaseTrack] = {}
 
         self.win = tk.Toplevel(parent)
         self.win.title("生成乐谱")
-        self.win.geometry("850x680")
-        self.win.minsize(720, 580)
+        self.win.geometry("960x820")
+        self.win.minsize(800, 680)
         self.win.transient(parent)
         self.win.protocol("WM_DELETE_WINDOW", self.close)
 
@@ -71,11 +103,21 @@ class TranscriptionDialog:
         self.detail_var = tk.StringVar(value="")
         self.stats_var = tk.StringVar(value="尚未生成草稿")
         self.progress_var = tk.DoubleVar(value=0.0)
+        self.local_summary_var = tk.StringVar(value="尚未选择本地文件")
+        self.netease_cookie_status_var = tk.StringVar(value="未保存网易云 Cookie")
+        self.netease_query_var = tk.StringVar()
+        self.netease_page_var = tk.StringVar(value="第 1 页")
+        self.netease_result_var = tk.StringVar(value="请输入歌曲名或歌手名")
 
         self._build_widgets()
-        self.win.after(100, self.generate_all)
+        self._load_cookie_status()
+        if self.files:
+            self.local_summary_var.set(f"已选择 {len(self.files)} 个本地文件")
+            self.win.after(100, self.generate_all)
 
     def _build_widgets(self) -> None:
+        self._build_source_tabs()
+
         options = ttk.LabelFrame(self.win, text="转写与编配参数", padding=10)
         options.pack(fill="x", padx=12, pady=(12, 6))
 
@@ -215,6 +257,565 @@ class TranscriptionDialog:
         self.cancel_btn.pack(side="right", padx=(6, 0))
         ttk.Button(actions, text="关闭", command=self.close).pack(side="right")
 
+    def _build_source_tabs(self) -> None:
+        sources = ttk.Notebook(self.win)
+        sources.pack(fill="x", padx=12, pady=(12, 6))
+        local_tab = ttk.Frame(sources, padding=8)
+        online_tab = ttk.Frame(sources, padding=8)
+        sources.add(local_tab, text="本地文件")
+        sources.add(online_tab, text="网易云在线")
+
+        local_actions = ttk.Frame(local_tab)
+        local_actions.pack(fill="x")
+        self.local_choose_btn = ttk.Button(
+            local_actions,
+            text="选择音频 / MIDI",
+            command=self.choose_local_files,
+        )
+        self.local_choose_btn.pack(side="left")
+        self.local_generate_btn = ttk.Button(
+            local_actions,
+            text="生成本地草稿",
+            command=self.generate_all,
+            state="normal" if self.files else "disabled",
+        )
+        self.local_generate_btn.pack(side="left", padx=8)
+        ttk.Label(
+            local_actions,
+            textvariable=self.local_summary_var,
+            foreground="#666",
+        ).pack(side="left", padx=8)
+
+        cookie_row = ttk.Frame(online_tab)
+        cookie_row.pack(fill="x", pady=(0, 6))
+        ttk.Label(cookie_row, text="网易云 Cookie：").pack(side="left")
+        ttk.Label(
+            cookie_row,
+            textvariable=self.netease_cookie_status_var,
+            foreground="#666",
+        ).pack(side="left", fill="x", expand=True)
+        self.cookie_edit_btn = ttk.Button(
+            cookie_row, text="编辑", command=self.open_cookie_editor
+        )
+        self.cookie_edit_btn.pack(side="right", padx=(6, 0))
+        self.cookie_clear_btn = ttk.Button(
+            cookie_row, text="清除", command=self.clear_cookie
+        )
+        self.cookie_clear_btn.pack(side="right", padx=(6, 0))
+        self.cookie_validate_btn = ttk.Button(
+            cookie_row, text="重新验证", command=self.validate_saved_cookie
+        )
+        self.cookie_validate_btn.pack(side="right", padx=(6, 0))
+
+        search_row = ttk.Frame(online_tab)
+        search_row.pack(fill="x", pady=(0, 6))
+        self.netease_search_entry = ttk.Entry(
+            search_row, textvariable=self.netease_query_var
+        )
+        self.netease_search_entry.pack(side="left", fill="x", expand=True)
+        self.netease_search_entry.bind("<Return>", lambda _event: self.search_netease(0))
+        self.netease_search_btn = ttk.Button(
+            search_row, text="搜索", command=lambda: self.search_netease(0)
+        )
+        self.netease_search_btn.pack(side="left", padx=(8, 0))
+
+        result_frame = ttk.Frame(online_tab)
+        result_frame.pack(fill="both", expand=True)
+        columns = ("title", "artists", "album", "duration")
+        self.netease_tree = ttk.Treeview(
+            result_frame,
+            columns=columns,
+            show="headings",
+            height=6,
+            selectmode="browse",
+        )
+        headings = {
+            "title": ("歌曲", 240),
+            "artists": ("歌手", 180),
+            "album": ("专辑", 210),
+            "duration": ("时长", 65),
+        }
+        for column, (text, width) in headings.items():
+            self.netease_tree.heading(column, text=text)
+            self.netease_tree.column(
+                column,
+                width=width,
+                minwidth=50,
+                stretch=column != "duration",
+                anchor="center" if column == "duration" else "w",
+            )
+        result_scroll = ttk.Scrollbar(
+            result_frame, orient="vertical", command=self.netease_tree.yview
+        )
+        self.netease_tree.configure(yscrollcommand=result_scroll.set)
+        self.netease_tree.grid(row=0, column=0, sticky="nsew")
+        result_scroll.grid(row=0, column=1, sticky="ns")
+        result_frame.columnconfigure(0, weight=1)
+        result_frame.rowconfigure(0, weight=1)
+        self.netease_tree.bind("<<TreeviewSelect>>", self._on_netease_selection)
+        self.netease_tree.bind("<Double-1>", lambda _event: self.generate_online_draft())
+
+        online_actions = ttk.Frame(online_tab)
+        online_actions.pack(fill="x", pady=(6, 0))
+        ttk.Label(
+            online_actions,
+            textvariable=self.netease_result_var,
+            foreground="#666",
+        ).pack(side="left", fill="x", expand=True)
+        self.netease_prev_btn = ttk.Button(
+            online_actions,
+            text="上一页",
+            command=self.search_previous_page,
+            state="disabled",
+        )
+        self.netease_prev_btn.pack(side="left", padx=4)
+        ttk.Label(online_actions, textvariable=self.netease_page_var).pack(side="left")
+        self.netease_next_btn = ttk.Button(
+            online_actions,
+            text="下一页",
+            command=self.search_next_page,
+            state="disabled",
+        )
+        self.netease_next_btn.pack(side="left", padx=4)
+        self.netease_generate_btn = ttk.Button(
+            online_actions,
+            text="生成在线草稿",
+            command=self.generate_online_draft,
+            state="disabled",
+        )
+        self.netease_generate_btn.pack(side="right", padx=(8, 0))
+
+    def _start_worker(self, target: Callable, *args) -> None:
+        with self._workers_lock:
+            self._worker_count += 1
+
+        def runner() -> None:
+            try:
+                target(*args)
+            finally:
+                cleanup = False
+                with self._workers_lock:
+                    self._worker_count -= 1
+                    cleanup = self.closed and self._worker_count == 0
+                if cleanup:
+                    self._cleanup_temp_root()
+
+        threading.Thread(target=runner, daemon=True).start()
+
+    def _cleanup_temp_root(self) -> None:
+        temp_root = getattr(self, "_temp_root", None)
+        if temp_root is None:
+            return
+        self._temp_root = None
+        try:
+            temp_root.cleanup()
+        except Exception:
+            pass
+
+    def choose_local_files(self) -> None:
+        if self.busy:
+            return
+        files = filedialog.askopenfilenames(
+            parent=self.win,
+            title="选择要转写的音频或 MIDI 文件",
+            filetypes=[
+                ("支持的音乐文件", "*.mp3 *.wav *.flac *.ogg *.m4a *.aac *.mid *.midi"),
+                ("音频文件", "*.mp3 *.wav *.flac *.ogg *.m4a *.aac"),
+                ("MIDI 文件", "*.mid *.midi"),
+                ("全部", "*.*"),
+            ],
+        )
+        added = 0
+        for path in files:
+            if path in self.files:
+                continue
+            self.files.append(path)
+            self.source_labels[path] = os.path.basename(path)
+            self.file_list.insert(tk.END, f"… {os.path.basename(path)}")
+            added += 1
+        if added:
+            local_count = sum(1 for path in self.files if path not in self.online_paths)
+            self.local_summary_var.set(f"已选择 {local_count} 个本地文件")
+            self.local_generate_btn.config(state="normal")
+
+    def _load_cookie_status(self) -> None:
+        try:
+            text = self.cookie_store.load_text()
+            if not text:
+                self.netease_cookie_status_var.set("未保存网易云 Cookie")
+                return
+            status = self.cookie_store.load_validation()
+            self.netease_cookie_status_var.set(status.message)
+        except Exception as exc:
+            self.netease_cookie_status_var.set(f"Cookie 无法使用：{exc}")
+
+    def _load_saved_cookies(self):
+        text = self.cookie_store.load_text()
+        return parse_netscape_cookies(text) if text else []
+
+    def open_cookie_editor(self) -> None:
+        editor = tk.Toplevel(self.win)
+        editor.title("网易云 cookies.txt")
+        editor.geometry("760x520")
+        editor.minsize(620, 420)
+        editor.transient(self.win)
+        ttk.Label(
+            editor,
+            text=(
+                "粘贴 Netscape cookies.txt 的完整内容。程序只保留网易云域名 Cookie，"
+                "并使用当前 Windows 用户的 DPAPI 加密保存。"
+            ),
+            wraplength=720,
+            justify="left",
+        ).pack(fill="x", padx=12, pady=(12, 6))
+        text_widget = tk.Text(editor, wrap="none", font=("Consolas", 9), undo=True)
+        text_widget.pack(fill="both", expand=True, padx=12, pady=6)
+        try:
+            existing = self.cookie_store.load_text() or ""
+        except Exception as exc:
+            existing = ""
+            messagebox.showwarning("Cookie 读取失败", str(exc), parent=editor)
+        if existing:
+            text_widget.insert("1.0", existing)
+
+        status_var = tk.StringVar(value="等待检查")
+        ttk.Label(editor, textvariable=status_var, foreground="#666").pack(
+            fill="x", padx=12, pady=(0, 4)
+        )
+        actions = ttk.Frame(editor)
+        actions.pack(fill="x", padx=12, pady=(4, 12))
+        save_btn = ttk.Button(actions, text="保存", state="disabled")
+        save_btn.pack(side="right")
+        ttk.Button(actions, text="取消", command=editor.destroy).pack(
+            side="right", padx=(0, 8)
+        )
+        state = {
+            "generation": 0,
+            "after": None,
+            "canonical": None,
+            "validation": None,
+        }
+
+        def apply_validation(
+            generation: int,
+            canonical: str,
+            validation: CookieValidationResult,
+        ) -> None:
+            if not editor.winfo_exists() or generation != state["generation"]:
+                return
+            state["canonical"] = canonical
+            state["validation"] = validation
+            status_var.set(validation.message)
+            save_btn.config(
+                state="normal" if validation.state in ("valid", "unverified") else "disabled"
+            )
+
+        def validate_worker(generation: int, canonical: str, cookies) -> None:
+            validation = validate_cookie_account(cookies)
+            self._after(apply_validation, generation, canonical, validation)
+
+        def run_validation() -> None:
+            state["after"] = None
+            state["generation"] += 1
+            generation = state["generation"]
+            raw = text_widget.get("1.0", "end-1c")
+            state["canonical"] = None
+            state["validation"] = None
+            save_btn.config(state="disabled")
+            try:
+                cookies = parse_netscape_cookies(raw)
+                canonical = serialize_netscape_cookies(cookies)
+            except Exception as exc:
+                status_var.set(str(exc))
+                return
+            status_var.set("本地格式检查通过，正在验证网易云登录状态…")
+            self._start_worker(validate_worker, generation, canonical, cookies)
+
+        def schedule_validation(_event=None) -> None:
+            if _event is not None:
+                if not text_widget.edit_modified():
+                    return
+                text_widget.edit_modified(False)
+            pending = state.get("after")
+            if pending:
+                try:
+                    editor.after_cancel(pending)
+                except Exception:
+                    pass
+            state["after"] = editor.after(600, run_validation)
+
+        def save_cookie() -> None:
+            canonical = state.get("canonical")
+            validation = state.get("validation")
+            if not canonical or validation is None:
+                return
+            try:
+                self.cookie_store.save(canonical, validation)
+            except Exception as exc:
+                messagebox.showerror("Cookie 保存失败", str(exc), parent=editor)
+                return
+            self.netease_cookie_status_var.set(validation.message)
+            editor.destroy()
+
+        save_btn.config(command=save_cookie)
+        text_widget.bind("<<Modified>>", schedule_validation)
+        text_widget.edit_modified(False)
+        schedule_validation()
+
+    def validate_saved_cookie(self) -> None:
+        try:
+            cookies = self._load_saved_cookies()
+        except Exception as exc:
+            self.netease_cookie_status_var.set(f"Cookie 读取失败：{exc}")
+            return
+        if not cookies:
+            self.netease_cookie_status_var.set("未保存网易云 Cookie")
+            return
+        self.netease_cookie_status_var.set("正在验证网易云登录状态…")
+
+        def worker() -> None:
+            result = validate_cookie_account(cookies)
+            self._after(self._finish_saved_cookie_validation, result)
+
+        self._start_worker(worker)
+
+    def _finish_saved_cookie_validation(self, result: CookieValidationResult) -> None:
+        self.netease_cookie_status_var.set(result.message)
+        if result.state == "invalid":
+            return
+        try:
+            text = self.cookie_store.load_text()
+            if text:
+                self.cookie_store.save(text, result)
+        except Exception:
+            pass
+
+    def clear_cookie(self) -> None:
+        if not messagebox.askyesno(
+            "清除网易云 Cookie",
+            "确定删除本机加密保存的网易云 Cookie 吗？",
+            parent=self.win,
+        ):
+            return
+        try:
+            self.cookie_store.clear()
+            self.netease_cookie_status_var.set("未保存网易云 Cookie")
+        except Exception as exc:
+            messagebox.showerror("清除失败", str(exc), parent=self.win)
+
+    def search_netease(self, page: int = 0) -> None:
+        if self.busy:
+            return
+        query = self.netease_query_var.get().strip()
+        if not query:
+            self.netease_result_var.set("请输入歌曲名或歌手名")
+            return
+        page = max(0, int(page))
+        self.search_generation += 1
+        generation = self.search_generation
+        self.netease_result_var.set("正在搜索网易云…")
+        self.netease_search_btn.config(state="disabled")
+        self.netease_prev_btn.config(state="disabled")
+        self.netease_next_btn.config(state="disabled")
+        self.netease_generate_btn.config(state="disabled")
+        try:
+            cookies = self._load_saved_cookies()
+        except Exception:
+            cookies = []
+            self.netease_cookie_status_var.set("Cookie 无法读取，本次按未登录搜索")
+
+        def worker() -> None:
+            try:
+                result = self.netease_client.search(
+                    query,
+                    offset=page * self.search_limit,
+                    limit=self.search_limit,
+                    cookies=cookies,
+                )
+                error = None
+            except Exception as exc:
+                result = None
+                error = str(exc)
+            self._after(self._apply_search_result, generation, page, result, error)
+
+        self._start_worker(worker)
+
+    def _apply_search_result(
+        self,
+        generation: int,
+        page: int,
+        result: Optional[NetEaseSearchPage],
+        error: Optional[str],
+    ) -> None:
+        if generation != self.search_generation:
+            return
+        self.netease_search_btn.config(state="disabled" if self.busy else "normal")
+        if error or result is None:
+            self.netease_result_var.set(error or "网易云搜索失败")
+            self._set_busy(self.busy)
+            return
+        self.search_page = page
+        self.search_total = result.total
+        self.search_tracks = {track.song_id: track for track in result.items}
+        self.netease_tree.delete(*self.netease_tree.get_children())
+        for track in result.items:
+            seconds = max(0, track.duration_ms // 1000)
+            duration = f"{seconds // 60}:{seconds % 60:02d}"
+            self.netease_tree.insert(
+                "",
+                "end",
+                iid=track.song_id,
+                values=(track.title, track.artist_text, track.album, duration),
+            )
+        page_count = max(1, (result.total + result.limit - 1) // result.limit)
+        self.netease_page_var.set(f"第 {page + 1} / {page_count} 页")
+        self.netease_result_var.set(f"找到 {result.total} 首，当前显示 {len(result.items)} 首")
+        self.netease_prev_btn.config(state="normal" if page > 0 else "disabled")
+        has_next = result.offset + len(result.items) < result.total
+        self.netease_next_btn.config(state="normal" if has_next else "disabled")
+        self.netease_generate_btn.config(state="disabled")
+        self._set_busy(self.busy)
+
+    def search_previous_page(self) -> None:
+        if self.search_page > 0:
+            self.search_netease(self.search_page - 1)
+
+    def search_next_page(self) -> None:
+        self.search_netease(self.search_page + 1)
+
+    def _selected_netease_track(self) -> Optional[NetEaseTrack]:
+        selected = self.netease_tree.selection()
+        if not selected:
+            return None
+        return self.search_tracks.get(str(selected[0]))
+
+    def _on_netease_selection(self, _event=None) -> None:
+        self.netease_generate_btn.config(
+            state="normal" if self._selected_netease_track() and not self.busy else "disabled"
+        )
+
+    def generate_online_draft(self) -> None:
+        if self.busy:
+            return
+        track = self._selected_netease_track()
+        if track is None:
+            self.netease_result_var.set("请先选择一首搜索结果")
+            return
+        self.cancel_event = threading.Event()
+        options = self._options()
+        self._set_busy(True)
+        self.progress_var.set(0.0)
+        self.status_var.set(f"正在准备在线扒谱：{track.display_name}")
+        temp_root = self._temp_root
+        if temp_root is None:
+            self._finish_online_job(None, track, None, "临时目录已关闭")
+            return
+        job_dir = tempfile.mkdtemp(prefix=f"{track.song_id}-", dir=temp_root.name)
+        self._start_worker(self._online_worker, track, job_dir, options)
+
+    def _online_worker(
+        self,
+        track: NetEaseTrack,
+        job_dir: str,
+        options: TranscriptionOptions,
+    ) -> None:
+        audio_path = None
+        success = False
+        try:
+            def download_progress(stage: str, fraction: float, message: str) -> None:
+                stage_start, stage_weight = {
+                    "resolve": (0.00, 0.05),
+                    "download": (0.05, 0.25),
+                    "convert": (0.30, 0.10),
+                }.get(stage, (0.0, 0.4))
+                self._after(
+                    self._apply_progress,
+                    stage_start + stage_weight * fraction,
+                    message,
+                    track.display_name,
+                )
+
+            with self.cookie_store.materialize_cookiefile() as cookiefile:
+                audio_path = self.netease_client.resolve_and_download(
+                    track,
+                    cookiefile=cookiefile,
+                    temp_dir=job_dir,
+                    cancel_event=self.cancel_event,
+                    progress_cb=download_progress,
+                )
+
+            def transcribe_progress(stage: str, fraction: float, message: str) -> None:
+                stage_start, stage_weight = {
+                    "decode": (0.40, 0.05),
+                    "transcribe": (0.45, 0.45),
+                    "arrange": (0.90, 0.10),
+                }.get(stage, (0.40, 0.60))
+                self._after(
+                    self._apply_progress,
+                    stage_start + stage_weight * fraction,
+                    message,
+                    track.display_name,
+                )
+
+            result = transcribe_draft(
+                audio_path,
+                options,
+                self.cancel_event,
+                transcribe_progress,
+            )
+            result = replace(
+                result,
+                source_file=track.display_name,
+                source=SourceMetadata(
+                    platform="netease",
+                    title=track.title,
+                    artists=track.artists,
+                    source_id=track.song_id,
+                    webpage_url=track.webpage_url,
+                    display_name=track.display_name,
+                ),
+            )
+            success = True
+            self._after(self._finish_online_job, audio_path, track, result, None)
+        except CancelledError:
+            self._after(self._finish_online_job, None, track, None, "已取消在线扒谱")
+        except Exception as exc:
+            self._after(self._finish_online_job, None, track, None, str(exc))
+        finally:
+            if not success:
+                try:
+                    shutil.rmtree(job_dir)
+                except OSError:
+                    pass
+
+    def _finish_online_job(
+        self,
+        audio_path: Optional[str],
+        track: NetEaseTrack,
+        result: Optional[TranscriptionResult],
+        error: Optional[str],
+    ) -> None:
+        if result is not None and audio_path:
+            self.files.append(audio_path)
+            self.online_paths.add(audio_path)
+            self.source_labels[audio_path] = track.display_name
+            self.file_list.insert(tk.END, f"… {track.display_name}")
+            self._record_result(audio_path, result, None)
+            index = len(self.files) - 1
+            self.file_list.selection_clear(0, tk.END)
+            self.file_list.selection_set(index)
+            self.file_list.activate(index)
+            self.file_list.see(index)
+            self._show_path(audio_path)
+            self.progress_var.set(1.0)
+            self.status_var.set("在线草稿已生成，可调参、试听并确认保存")
+        else:
+            self.status_var.set(error or "在线扒谱失败")
+            if error and error != "已取消在线扒谱":
+                messagebox.showerror("在线扒谱失败", error, parent=self.win)
+        self.detail_var.set("")
+        self._set_busy(False)
+
     def _options(self) -> TranscriptionOptions:
         octave_text = self.octave_var.get()
         source_key = None if self.key_var.get() == "自动" else self.key_var.get()
@@ -236,19 +837,48 @@ class TranscriptionDialog:
         self.save_btn.config(state=state if self._current_result() else "disabled")
         self.save_all_btn.config(state=state if self.results else "disabled")
         self.cancel_btn.config(state="normal" if busy else "disabled")
+        self.local_choose_btn.config(state=state)
+        local_pending = any(
+            path not in self.results and path not in self.online_paths for path in self.files
+        )
+        self.local_generate_btn.config(
+            state="normal" if not busy and local_pending else "disabled"
+        )
+        self.netease_search_btn.config(state=state)
+        self.cookie_edit_btn.config(state=state)
+        self.cookie_validate_btn.config(state=state)
+        self.cookie_clear_btn.config(state=state)
+        self.netease_generate_btn.config(
+            state="normal"
+            if not busy and self._selected_netease_track() is not None
+            else "disabled"
+        )
+        if busy:
+            self.netease_prev_btn.config(state="disabled")
+            self.netease_next_btn.config(state="disabled")
+        elif self.search_tracks:
+            self.netease_prev_btn.config(
+                state="normal" if self.search_page > 0 else "disabled"
+            )
+            has_next = (self.search_page + 1) * self.search_limit < self.search_total
+            self.netease_next_btn.config(state="normal" if has_next else "disabled")
 
     def generate_all(self) -> None:
         if self.busy:
+            return
+        paths = [
+            path
+            for path in self.files
+            if path not in self.online_paths and path not in self.results
+        ]
+        if not paths:
+            self.status_var.set("没有待生成的本地文件")
             return
         self.cancel_event = threading.Event()
         options = self._options()
         self._set_busy(True)
         self.status_var.set("正在生成草稿…")
-        threading.Thread(
-            target=self._generate_worker,
-            args=(list(self.files), options),
-            daemon=True,
-        ).start()
+        self._start_worker(self._generate_worker, paths, options)
 
     def _generate_worker(
         self,
@@ -313,7 +943,8 @@ class TranscriptionDialog:
             self.file_list.delete(index)
             self.file_list.insert(
                 index,
-                f"✓ {os.path.basename(path)} · {len(result.song_notes)} 音",
+                f"✓ {self.source_labels.get(path, os.path.basename(path))} · "
+                f"{len(result.song_notes)} 音",
             )
             if not self.file_list.curselection():
                 self.file_list.selection_set(index)
@@ -322,7 +953,9 @@ class TranscriptionDialog:
         else:
             self.errors[path] = error or "未知错误"
             self.file_list.delete(index)
-            self.file_list.insert(index, f"✗ {os.path.basename(path)}")
+            self.file_list.insert(
+                index, f"✗ {self.source_labels.get(path, os.path.basename(path))}"
+            )
 
     def _finish_batch(self, cancelled: bool) -> None:
         self.progress_var.set(1.0 if not cancelled else self.progress_var.get())
@@ -434,7 +1067,7 @@ class TranscriptionDialog:
                     self._apply_progress,
                     fraction,
                     message,
-                    os.path.basename(path),
+                    self.source_labels.get(path, os.path.basename(path)),
                 )
 
             try:
@@ -460,7 +1093,7 @@ class TranscriptionDialog:
             except Exception as exc:
                 self._after(self._finish_regenerate, str(exc))
 
-        threading.Thread(target=worker, daemon=True).start()
+        self._start_worker(worker)
 
     def _finish_regenerate(self, error: Optional[str]) -> None:
         self._set_busy(False)
@@ -492,7 +1125,7 @@ class TranscriptionDialog:
         result = self._current_result()
         if not path or result is None:
             return
-        stem = os.path.splitext(os.path.basename(path))[0]
+        stem = suggested_output_stem(result)
         suggested = next_available_path(self.output_dir, stem)
         destination = filedialog.asksaveasfilename(
             parent=self.win,
@@ -514,10 +1147,14 @@ class TranscriptionDialog:
             export_song_json(
                 result,
                 destination,
-                os.path.splitext(os.path.basename(destination))[0],
+                result.source.title
+                if result.source is not None
+                and result.source.platform == "netease"
+                and result.source.title
+                else os.path.splitext(os.path.basename(destination))[0],
             )
             self.saved_paths[path] = destination
-            self.on_saved()
+            self.on_saved(destination)
             self.status_var.set(f"已保存：{os.path.basename(destination)}")
         except Exception as exc:
             messagebox.showerror("保存失败", str(exc), parent=self.win)
@@ -531,16 +1168,23 @@ class TranscriptionDialog:
             result = self.results.get(path)
             if result is None:
                 continue
-            stem = os.path.splitext(os.path.basename(path))[0]
+            stem = suggested_output_stem(result)
             destination = next_available_path(self.output_dir, stem)
             try:
-                export_song_json(result, destination, stem)
+                song_name = (
+                    result.source.title
+                    if result.source is not None
+                    and result.source.platform == "netease"
+                    and result.source.title
+                    else stem
+                )
+                export_song_json(result, destination, song_name)
                 self.saved_paths[path] = destination
                 saved.append(destination)
             except Exception as exc:
                 failures.append(f"{os.path.basename(path)}：{exc}")
         if saved:
-            self.on_saved()
+            self.on_saved(saved[-1])
         if failures:
             messagebox.showerror(
                 "部分保存失败", "\n".join(failures[:8]), parent=self.win
@@ -566,3 +1210,7 @@ class TranscriptionDialog:
             self.win.destroy()
         except Exception:
             pass
+        with self._workers_lock:
+            cleanup = self._worker_count == 0
+        if cleanup:
+            self._cleanup_temp_root()

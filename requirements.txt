@@ -18,3 +18,8 @@ librosa==0.11.0
 pretty_midi==0.2.11.post0
 onnxruntime==1.21.1
 basic-pitch==0.4.0
+# ---- 网易云在线扒谱 ----
+# yt-dlp 解析网易云单曲直链；imageio-ffmpeg 自带 Windows FFmpeg，
+# 将 MP3/FLAC/AAC/M4A 统一转换为扒谱用 WAV。
+yt-dlp==2026.7.4
+imageio-ffmpeg==0.6.0

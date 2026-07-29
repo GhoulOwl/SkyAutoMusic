@@ -10,6 +10,7 @@ decorator==5.3.1
 flatbuffers==25.12.19
 humanfriendly==10.0
 idna==3.18
+imageio-ffmpeg==0.6.0
 importlib-resources==7.1.0
 interception-python==1.13.6
 joblib==1.5.3
@@ -53,3 +54,4 @@ sympy==1.14.0
 threadpoolctl==3.6.0
 typing-extensions==4.16.0
 urllib3==2.7.0
+yt-dlp==2026.7.4

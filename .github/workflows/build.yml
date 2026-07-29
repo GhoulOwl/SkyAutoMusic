@@ -56,6 +56,7 @@ jobs:
           python tests/generate_transcriber_fixture.py transcriber-smoke.wav
           $process = Start-Process -FilePath "dist/SkyAutoMusic.exe" `
             -ArgumentList "--transcriber-self-test", (Resolve-Path "transcriber-smoke.wav").Path `
+            -WindowStyle Hidden `
             -Wait -PassThru
           if ($process.ExitCode -ne 0) {
             throw "Packaged transcriber self-test failed with exit code $($process.ExitCode)"

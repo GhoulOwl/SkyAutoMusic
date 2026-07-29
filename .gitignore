@@ -22,4 +22,5 @@ __pycache__/
 .pytype/
 .dub/
 .pio/
+netease_auth.json
 

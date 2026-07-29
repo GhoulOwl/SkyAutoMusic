@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import tempfile
 import threading
 from dataclasses import replace
@@ -18,6 +19,7 @@ from .backends import (
 from .models import (
     CancelledError,
     ProgressCallback,
+    SourceMetadata,
     TranscriptionError,
     TranscriptionOptions,
     TranscriptionResult,
@@ -96,6 +98,11 @@ def transcribe_draft(
         octave_shift=octave_shift,
         beat_times_ms=list(backend.beat_times_ms),
         options=effective_options,
+        source=SourceMetadata(
+            platform="local",
+            title=os.path.splitext(os.path.basename(path))[0],
+            display_name=os.path.basename(path),
+        ),
     )
 
 
@@ -133,6 +140,7 @@ def rearrange_draft(
         octave_shift=octave_shift,
         beat_times_ms=list(result.beat_times_ms),
         options=options,
+        source=result.source,
     )
 
 
@@ -146,8 +154,12 @@ def export_song_json(
     output_path = os.path.abspath(output_path)
     output_dir = os.path.dirname(output_path)
     os.makedirs(output_dir, exist_ok=True)
+    source = result.source
     if not song_name:
-        song_name = os.path.splitext(os.path.basename(output_path))[0]
+        if source is not None and source.platform == "netease" and source.title:
+            song_name = source.title
+        else:
+            song_name = os.path.splitext(os.path.basename(output_path))[0]
     song = {
         "name": song_name,
         "transcribedBy": "SkyAutoMusic",
@@ -165,6 +177,16 @@ def export_song_json(
         },
         "_transcribe_stats": result.stats,
     }
+    if source is not None:
+        song["_transcribe"]["sourcePlatform"] = source.platform
+        if source.source_id:
+            song["_transcribe"]["sourceId"] = source.source_id
+        if source.webpage_url:
+            song["_transcribe"]["sourceUrl"] = source.webpage_url
+        if source.display_name:
+            song["_transcribe"]["sourceFile"] = source.display_name
+        if source.platform == "netease" and source.artists:
+            song["author"] = " / ".join(source.artists)
 
     temporary_path = None
     try:
@@ -201,4 +223,37 @@ def next_available_path(directory: str, stem: str, suffix: str = ".json") -> str
         if not os.path.exists(candidate):
             return candidate
         index += 1
+
+
+_INVALID_FILENAME_CHARS = re.compile(r'[<>:"/\\|?*\x00-\x1f]')
+_WINDOWS_RESERVED_NAMES = {
+    "CON",
+    "PRN",
+    "AUX",
+    "NUL",
+    *(f"COM{index}" for index in range(1, 10)),
+    *(f"LPT{index}" for index in range(1, 10)),
+}
+
+
+def sanitize_filename_stem(value: str, fallback: str = "网易云歌曲") -> str:
+    stem = _INVALID_FILENAME_CHARS.sub("_", str(value or ""))
+    stem = re.sub(r"\s+", " ", stem).strip().rstrip(". ")
+    if not stem:
+        stem = fallback
+    if stem.upper() in _WINDOWS_RESERVED_NAMES:
+        stem = "_" + stem
+    return stem[:180].rstrip(". ") or fallback
+
+
+def suggested_output_stem(result: TranscriptionResult) -> str:
+    source = result.source
+    if source is not None and source.platform == "netease":
+        title = source.title or "网易云歌曲"
+        artist = " / ".join(source.artists)
+        artist_part = f" - {artist}" if artist else ""
+        id_part = f" [网易云{source.source_id}]" if source.source_id else ""
+        return sanitize_filename_stem(f"{title}{artist_part}{id_part}")
+    source_name = source.display_name if source and source.display_name else result.source_file
+    return sanitize_filename_stem(os.path.splitext(os.path.basename(source_name))[0])
 
