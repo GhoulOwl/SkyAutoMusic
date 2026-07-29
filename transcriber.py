@@ -1,283 +1,279 @@
-"""音频 → 乐谱 JSON 转写器。
+"""向后兼容的扒谱入口。
 
-输入: mp3 / wav / flac / ogg
-输出: 与现有 997 份乐谱完全兼容的 JSON
-      顶层: [{ "name": str, "bpm": int, "songNotes": [{time: int_ms, key: "1Key0..14"}, ...] }]
-
-策略（用户已确认）:
-- 固定 C 大调映射: i = max(0, min(14, int(round(midi - 60))))
-  - MIDI 60 (C4) → 1Key0
-  - MIDI 74 (D5) → 1Key14
-  - 超范围软限幅（<0 → 0, >14 → 14），保留节奏
-- 保留原曲和弦: librosa.piptrack 在每个 onset 附近取多个稳定音高
-  按音高升序全部写入 songNotes；同 time 多 key 由现有播放器自动并按
-- 不引入音符时值: 节奏由播放器全局 NOTE_HOLD 决定
-
-向后兼容:
-- JSON 顶层用数组（与 Lycoris.json 等 997 份乐谱完全一致）
-- 字段名沿用 Lycoris 的 `name`，并补 `bpm=120`（load_music 读不到时默认 120）
-- 可选 `_transcribe_stats` 仅供 GUI 展示，load_music 不会读取
+新实现位于 :mod:`transcription`。本模块保留旧版 ``Transcriber``、``run``、
+``write_song_json`` 与 ``_midi_to_key`` 接口，避免 GUI 和外部调用失效。
 """
 from __future__ import annotations
 
-import json
 import os
-from typing import Callable, Dict, Iterable, List, Optional, Tuple, Any
+import threading
+from typing import Any, Callable, Dict, Iterable, List, Optional, Tuple
 
-# numpy/scipy 仅在真正转写时用到，单元测试只测纯映射逻辑，所以放在函数内懒导入
-np = None  # type: ignore
-_librosa = None  # type: ignore
-
-
-AUDIO_EXTS = {".mp3", ".wav", ".flac", ".ogg", ".m4a", ".aac"}
-
-
-def is_audio_file(path: str) -> bool:
-    return os.path.splitext(path)[1].lower() in AUDIO_EXTS
+from transcription.arranger import SKY_MIDI, fold_to_sky_range, nearest_sky_pitch
+from transcription.backends import (
+    AUDIO_EXTS,
+    MIDI_EXTS,
+    DEFAULT_SR,
+    is_audio_file,
+    is_midi_file,
+    is_supported_input,
+)
+from transcription.models import (
+    CancelledError,
+    TranscriptionOptions,
+    TranscriptionResult,
+)
+from transcription.pipeline import export_song_json, transcribe_draft
 
 
 class TranscribeStats:
-    """单次转写的统计信息，便于 UI 展示和单元测试断言。"""
+    """兼容旧版属性访问的统计对象。"""
 
-    __slots__ = ("onset_count", "note_count", "clamped_low", "clamped_high", "duration_sec")
+    __slots__ = (
+        "onset_count",
+        "note_count",
+        "clamped_low",
+        "clamped_high",
+        "duration_sec",
+        "_extra",
+    )
 
-    def __init__(self):
-        self.onset_count = 0
-        self.note_count = 0
-        self.clamped_low = 0
-        self.clamped_high = 0
-        self.duration_sec = 0.0
+    def __init__(self, values: Optional[Dict[str, Any]] = None):
+        values = dict(values or {})
+        self.onset_count = int(values.get("raw_event_count", values.get("onset_count", 0)))
+        self.note_count = int(values.get("arranged_note_count", values.get("note_count", 0)))
+        self.clamped_low = int(values.get("clamped_low", 0))
+        self.clamped_high = int(values.get("clamped_high", 0))
+        self.duration_sec = float(values.get("duration_sec", 0.0))
+        self._extra = values
 
     def to_dict(self) -> Dict[str, Any]:
-        return {
+        result = dict(self._extra)
+        result.update({
             "onset_count": self.onset_count,
             "note_count": self.note_count,
             "clamped_low": self.clamped_low,
             "clamped_high": self.clamped_high,
             "duration_sec": round(self.duration_sec, 3),
-        }
+        })
+        return result
 
 
 class Transcriber:
-    """音频 → 乐谱 note 列表。
-
-    设计目标:
-    - transcribe() 输入输出纯粹，方便单元测试
-    - run() 包裹 transcribe + JSON 落盘 + 进度回调，方便 GUI 集成
-    - 不引入 librosa 之外的重量级依赖
-    """
-
     NUM_KEYS = 15
-    DEFAULT_SR = 22050
-    # 每个 onset 之后取多长窗做音高估计（秒）。短窗能避开相邻 onset 干扰。
-    ONSET_PITCH_WINDOW = 0.08
-    # 同一 onset 最多写出几个 key（和弦保留上限，避免一拍按十几键）
-    MAX_POLYPHONY = 3
-    # 静音/能量门限（piptrack magnitude 归一化后），低于此视为无音
-    PITCH_MAG_THRESHOLD = 0.05
+    DEFAULT_SR = DEFAULT_SR
 
-    def __init__(self, sr: int = DEFAULT_SR, midi_root: int = 60):
-        global _librosa, np
-        if _librosa is None:
-            try:
-                import librosa as _l
-                import numpy as _np
-                _librosa = _l
-                np = _np
-            except ImportError as e:
-                raise RuntimeError(
-                    "librosa / numpy 未安装，无法转写。请先运行: pip install librosa numpy soundfile"
-                ) from e
-        self.sr = sr
-        self.midi_root = midi_root  # C4 = 60
-
-    # ---------- 核心: audio_path -> note list ----------
-
-    def transcribe(self, audio_path: str) -> Tuple[List[Dict[str, Any]], TranscribeStats]:
-        """返回 (notes, stats)。
-
-        notes: 已按 time 升序、每条 {time: int_ms, key: "1Key0..14"}。
-        stats: onset 数、note 数、上下限被夹掉的次数、音频时长。
-        """
-        y, sr = _librosa.load(audio_path, sr=self.sr, mono=True)
-        stats = TranscribeStats()
-        stats.duration_sec = float(len(y) / sr) if sr else 0.0
-
-        if len(y) == 0 or float(np.max(np.abs(y))) < 1e-4:
-            return [], stats
-
-        # 1) onset 检测
-        onset_times = _librosa.onset.onset_detect(
-            y=y, sr=sr, units="time", backtrack=False
-        )
-        if len(onset_times) == 0:
-            return [], stats
-        stats.onset_count = int(len(onset_times))
-
-        # 2) 整段 piptrack → 取每个 onset 之后窗内的稳定音高
-        pitches, magnitudes = _librosa.piptrack(y=y, sr=sr)
-        # pitches/magnitudes shape: (n_freq_bins, n_frames)
-        n_frames = pitches.shape[1]
-        hop_length = 512  # librosa 默认
-        frame_times = np.arange(n_frames) * hop_length / sr
-
-        notes: List[Dict[str, Any]] = []
-        window_sec = self.ONSET_PITCH_WINDOW
-        for t in onset_times:
-            frame_pitches = self._collect_pitches_in_window(
-                pitches, magnitudes, frame_times, float(t), window_sec
-            )
-            if not frame_pitches:
-                continue
-            # 按能量取最强的 MAX_POLYPHONY 个音，再按音高升序输出（低→高）
-            frame_pitches.sort(key=lambda pm: pm[1], reverse=True)
-            top = frame_pitches[: self.MAX_POLYPHONY]
-            top.sort(key=lambda pm: pm[0])
-            t_ms = int(round(float(t) * 1000))
-            for midi, _mag in top:
-                key, clamped = self._midi_to_key(midi)
-                if clamped < 0:
-                    stats.clamped_low += 1
-                elif clamped > 0:
-                    stats.clamped_high += 1
-                notes.append({"time": t_ms, "key": key})
-
-        # 3) 按 time 排序
-        notes.sort(key=lambda n: (n["time"], n["key"]))
-        stats.note_count = len(notes)
-        return notes, stats
-
-    def _collect_pitches_in_window(
+    def __init__(
         self,
-        pitches: np.ndarray,
-        magnitudes: np.ndarray,
-        frame_times: np.ndarray,
-        onset_t: float,
-        window_sec: float,
-    ) -> List[Tuple[float, float]]:
-        """收集 onset_t 之后 window_sec 内的音高，按半音级聚合后取能量最大的若干个。
+        sr: int = DEFAULT_SR,
+        midi_root: int = 60,
+        options: Optional[TranscriptionOptions] = None,
+    ):
+        # sr/midi_root 为兼容旧构造参数保留；新流水线使用固定 22050Hz 与 C4-C6 映射。
+        self.sr = int(sr)
+        self.midi_root = int(midi_root)
+        self.options = options or TranscriptionOptions()
+        self.last_result: Optional[TranscriptionResult] = None
 
-        返回 [(midi, mag), ...]，半音级去重（避免同 onset 内多帧重复写同一键）。
-        """
-        mask = (frame_times >= onset_t) & (frame_times < onset_t + window_sec)
-        idxs = np.where(mask)[0]
-        if len(idxs) == 0:
-            # onset 极接近结尾时也兜一个 frame
-            j = int(np.searchsorted(frame_times, onset_t))
-            j = max(0, min(j, len(frame_times) - 1))
-            idxs = np.array([j])
-
-        # 按半音整数聚合：同一 onset 窗内可能多帧检测到同一音高（甚至 ±0.5 半音抖动），取能量最高的代表
-        bins: Dict[int, float] = {}
-        for i in idxs:
-            col_p = pitches[:, i]
-            col_m = magnitudes[:, i]
-            valid = (col_p > 0) & (col_m > self.PITCH_MAG_THRESHOLD)
-            if not np.any(valid):
-                continue
-            for p, m in zip(col_p[valid], col_m[valid]):
-                midi = _librosa.hz_to_midi(p)
-                midi_round = int(round(float(midi)))
-                m_f = float(m)
-                if m_f > bins.get(midi_round, 0.0):
-                    bins[midi_round] = m_f
-        # 输出 (midi, mag)；注意用浮点 midi 但聚合是按整数
-        return [(float(k), v) for k, v in bins.items()]
+    def transcribe(
+        self,
+        input_path: str,
+        options: Optional[TranscriptionOptions] = None,
+        cancel_event: Optional[threading.Event] = None,
+        progress_cb: Optional[Callable[[str, float, str], None]] = None,
+    ) -> Tuple[List[Dict[str, Any]], TranscribeStats]:
+        result = transcribe_draft(
+            input_path,
+            options=options or self.options,
+            cancel_event=cancel_event,
+            progress_cb=progress_cb,
+        )
+        self.last_result = result
+        return list(result.song_notes), TranscribeStats(result.stats)
 
     def _midi_to_key(self, midi: float) -> Tuple[str, int]:
-        """固定 C 大调映射 + 软限幅。返回 (key_name, clamped)，clamped: -1/0/1。"""
-        i = int(round(midi)) - self.midi_root
-        if i < 0:
-            return f"1Key0", -1
-        if i >= self.NUM_KEYS:
-            return f"1Key{self.NUM_KEYS - 1}", 1
-        return f"1Key{i}", 0
+        """将 MIDI 音高映射到 C4-C6 自然音键位。
 
-    # ---------- 包裹: 落盘 ----------
+        越界音先按八度折叠，升降音取最近自然音。返回值第二项仍沿用旧含义：
+        原始音低于范围为 -1，高于范围为 1，范围内为 0。
+        """
+        rounded = int(round(float(midi)))
+        range_state = -1 if rounded < SKY_MIDI[0] else (1 if rounded > SKY_MIDI[-1] else 0)
+        folded, _ = fold_to_sky_range(rounded)
+        sky_pitch, _ = nearest_sky_pitch(folded)
+        return f"1Key{SKY_MIDI.index(sky_pitch)}", range_state
 
     def transcribe_to_song(
         self,
-        audio_path: str,
+        input_path: str,
         song_name: Optional[str] = None,
-        bpm: int = 120,
+        bpm: Optional[int] = None,
+        options: Optional[TranscriptionOptions] = None,
+        cancel_event: Optional[threading.Event] = None,
     ) -> Dict[str, Any]:
-        notes, stats = self.transcribe(audio_path)
-        if song_name is None:
-            song_name = os.path.splitext(os.path.basename(audio_path))[0]
+        result = transcribe_draft(
+            input_path,
+            options=options or self.options,
+            cancel_event=cancel_event,
+        )
+        self.last_result = result
+        name = song_name or os.path.splitext(os.path.basename(input_path))[0]
         return {
-            "name": song_name,
-            "bpm": int(bpm),
-            "songNotes": notes,
-            "_transcribe_stats": stats.to_dict(),  # 仅供 UI 展示；load_music 会忽略
+            "name": name,
+            "transcribedBy": "SkyAutoMusic",
+            "bpm": int(round(bpm if bpm is not None else result.bpm)),
+            "songNotes": list(result.song_notes),
+            "_transcribe": {
+                "schemaVersion": 1,
+                "engine": result.engine,
+                "sourceFile": result.source_file,
+                "detectedKey": result.detected_key,
+                "semitoneShift": result.semitone_shift,
+                "octaveShift": result.octave_shift,
+                "quantize": result.options.quantize,
+                "maxPolyphony": result.options.max_polyphony,
+            },
+            "_transcribe_stats": dict(result.stats),
         }
 
     def write_song_json(
         self,
-        audio_path: str,
+        input_path: str,
         output_dir: str,
         song_name: Optional[str] = None,
-        bpm: int = 120,
+        bpm: Optional[int] = None,
+        options: Optional[TranscriptionOptions] = None,
+        cancel_event: Optional[threading.Event] = None,
     ) -> Tuple[str, Dict[str, Any]]:
-        song = self.transcribe_to_song(audio_path, song_name=song_name, bpm=bpm)
-        os.makedirs(output_dir, exist_ok=True)
-        out_name = (song_name or os.path.splitext(os.path.basename(audio_path))[0]) + ".json"
-        out_path = os.path.join(output_dir, out_name)
-        # 顶层用数组（与 Lycoris.json 等所有 997 份乐谱一致）
-        with open(out_path, "w", encoding="utf-8") as f:
-            json.dump([song], f, ensure_ascii=False)
-        return out_path, song
+        result = transcribe_draft(
+            input_path,
+            options=options or self.options,
+            cancel_event=cancel_event,
+        )
+        if bpm is not None:
+            result.bpm = float(bpm)
+        self.last_result = result
+        name = song_name or os.path.splitext(os.path.basename(input_path))[0]
+        output_path = os.path.join(output_dir, name + ".json")
+        export_song_json(result, output_path, name)
+        song = self.transcribe_to_song_dict(result, name)
+        return output_path, song
 
-    # ---------- 多文件批处理（GUI 入口） ----------
+    @staticmethod
+    def transcribe_to_song_dict(
+        result: TranscriptionResult,
+        song_name: str,
+    ) -> Dict[str, Any]:
+        return {
+            "name": song_name,
+            "transcribedBy": "SkyAutoMusic",
+            "bpm": int(round(result.bpm or 120.0)),
+            "songNotes": list(result.song_notes),
+            "_transcribe": {
+                "schemaVersion": 1,
+                "engine": result.engine,
+                "sourceFile": result.source_file,
+                "detectedKey": result.detected_key,
+                "semitoneShift": result.semitone_shift,
+                "octaveShift": result.octave_shift,
+                "quantize": result.options.quantize,
+                "maxPolyphony": result.options.max_polyphony,
+            },
+            "_transcribe_stats": dict(result.stats),
+        }
 
     def run(
         self,
         files: Iterable[str],
         output_dir: str,
         progress_cb: Optional[Callable[[str, float, str], None]] = None,
-        bpm: int = 120,
+        bpm: Optional[int] = None,
+        options: Optional[TranscriptionOptions] = None,
+        cancel_event: Optional[threading.Event] = None,
     ) -> List[Dict[str, Any]]:
-        """逐文件转写。
-
-        progress_cb(filename, fraction, status_text) 由 GUI 提供，用于驱动进度条。
-        返回每条结果: {input, output, ok, error, stats, song_name}
-        """
-        files = [f for f in files if is_audio_file(f)]
+        inputs = [path for path in files if is_supported_input(path)]
+        total = len(inputs)
         results: List[Dict[str, Any]] = []
-        total = len(files)
-        if total == 0:
+        if not inputs:
             if progress_cb:
-                progress_cb("", 1.0, "未选择任何音频文件")
+                progress_cb("", 1.0, "未选择任何音频或 MIDI 文件")
             return results
-        for i, fp in enumerate(files):
-            song_name = os.path.splitext(os.path.basename(fp))[0]
-            if progress_cb:
-                progress_cb(
-                    fp,
-                    i / total,
-                    f"({i + 1}/{total}) 正在转写: {song_name}",
-                )
+
+        for index, path in enumerate(inputs):
+            if cancel_event is not None and cancel_event.is_set():
+                break
+            song_name = os.path.splitext(os.path.basename(path))[0]
+
+            def pipeline_progress(stage: str, fraction: float, message: str) -> None:
+                if progress_cb:
+                    stage_start, stage_weight = {
+                        "decode": (0.00, 0.10),
+                        "transcribe": (0.10, 0.75),
+                        "arrange": (0.85, 0.15),
+                    }.get(stage, (0.0, 1.0))
+                    file_fraction = stage_start + stage_weight * max(
+                        0.0, min(1.0, fraction)
+                    )
+                    overall = (index + file_fraction) / total
+                    progress_cb(path, overall, f"({index + 1}/{total}) {message}")
+
             try:
-                out_path, song = self.write_song_json(
-                    fp, output_dir, song_name=song_name, bpm=bpm
+                result = transcribe_draft(
+                    path,
+                    options=options or self.options,
+                    cancel_event=cancel_event,
+                    progress_cb=pipeline_progress,
                 )
+                if bpm is not None:
+                    result.bpm = float(bpm)
+                output_path = os.path.join(output_dir, song_name + ".json")
+                export_song_json(result, output_path, song_name)
+                self.last_result = result
                 results.append({
-                    "input": fp,
-                    "output": out_path,
+                    "input": path,
+                    "output": output_path,
                     "ok": True,
+                    "cancelled": False,
                     "error": None,
-                    "stats": song.get("_transcribe_stats"),
+                    "stats": dict(result.stats),
                     "song_name": song_name,
                 })
-            except Exception as e:
+            except CancelledError as exc:
                 results.append({
-                    "input": fp,
+                    "input": path,
                     "output": None,
                     "ok": False,
-                    "error": str(e),
+                    "cancelled": True,
+                    "error": str(exc),
                     "stats": None,
                     "song_name": song_name,
                 })
+                break
+            except Exception as exc:
+                results.append({
+                    "input": path,
+                    "output": None,
+                    "ok": False,
+                    "cancelled": False,
+                    "error": str(exc),
+                    "stats": None,
+                    "song_name": song_name,
+                })
+
         if progress_cb:
-            ok = sum(1 for r in results if r["ok"])
-            progress_cb("", 1.0, f"完成 {ok}/{total}")
+            ok_count = sum(1 for item in results if item["ok"])
+            progress_cb("", 1.0, f"完成 {ok_count}/{total}")
         return results
+
+
+__all__ = [
+    "AUDIO_EXTS",
+    "MIDI_EXTS",
+    "CancelledError",
+    "TranscribeStats",
+    "Transcriber",
+    "TranscriptionOptions",
+    "is_audio_file",
+    "is_midi_file",
+    "is_supported_input",
+]

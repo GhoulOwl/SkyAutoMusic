@@ -1,4 +1,7 @@
-import tkinter as tk
+try:
+    import tkinter as tk
+except ImportError:  # 允许无 Tk 的测试环境导入纯辅助函数 display_key
+    tk = None
 
 import win32con
 import win32gui
@@ -19,6 +22,8 @@ class ScoreOverlay:
     """Semi-transparent click-through score overlay for the game window."""
 
     def __init__(self, root, geometry=None, locked=True, on_geometry_changed=None, log_func=None):
+        if tk is None:
+            raise RuntimeError("当前 Python 环境未安装 Tk，无法创建乐谱覆盖层")
         self.root = root
         self.locked = bool(locked)
         self.on_geometry_changed = on_geometry_changed or (lambda geometry: None)

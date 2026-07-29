@@ -20,6 +20,8 @@ SkyAutoMusic 是一款用于自动演奏《Sky光遇》等游戏内乐器的Pyth
 - 半透明乐谱覆盖层：显示播放进度、音符密度与当前按键，F10 可解锁拖动位置
 - 诊断页：查看热键、游戏窗口、前台窗口、管理员权限、键盘输入方式与最近按键日志
 - 窗口大小和位置自动保存，下次启动自动恢复
+- 音频/MIDI 扒谱：支持 pYIN 单旋律、Basic Pitch ONNX 复音、自动转调和15键编配
+- 扒谱草稿可查看15键时间线、调整调性/八度/量化/复音数并本地合成试听
 - 适配Windows平台
 
 ## 安装依赖
@@ -28,6 +30,15 @@ SkyAutoMusic 是一款用于自动演奏《Sky光遇》等游戏内乐器的Pyth
 ```bash
 pip install pyautogui keyboard psutil pywin32 interception-python
 ```
+
+完整安装（包含扒谱）请使用 Python 3.10：
+
+```bash
+pip install -r requirements.txt
+```
+
+发布版固定使用 Python 3.10，并通过 `requirements-lock.txt` 安装锁定依赖，使
+Basic Pitch 使用 ONNX Runtime；不打包 TensorFlow。
 
 ### 启用虚拟 HID / 驱动级键盘（可选，推荐）
 默认输入方式为"自动"，会优先尝试驱动级键盘；若未安装 Interception 驱动则自动回退到常规键盘（`keyboard` / `pyautogui`），不影响使用。
@@ -58,6 +69,10 @@ pip install pyautogui keyboard psutil pywin32 interception-python
 5. 右键曲谱可收藏/取消收藏，分页切换显示全部或收藏曲谱。
 6. 程序会自动检测Sky/光遇窗口并置顶，未检测到会提示。
 7. 窗口大小和位置、收藏数据等会自动保存，无需手动配置。
+8. 点击“生成乐谱”可选择音频或 MIDI：
+   - 音频默认使用 Basic Pitch 复音高质量模式，也可切换 pYIN 单旋律快速模式。
+   - MIDI 自动直接导入，并忽略鼓轨。
+   - 生成结果先保存在内存草稿中；试听、调参后点击“保存当前”或“保存全部”才会写入乐谱文件夹。
 
 ## 构建与发布（EXE）
 
@@ -72,10 +87,11 @@ pip install pyautogui keyboard psutil pywin32 interception-python
 
 ### 方式二：本地用 PyInstaller 构建
 ```bash
-pip install -r requirements.txt pyinstaller
+pip install -r requirements.txt pyinstaller==6.21.0
 pyinstaller --noconfirm --onefile --windowed --name SkyAutoMusic ^
   --hidden-import keyboard --hidden-import win32timezone ^
   --hidden-import interception --collect-all interception ^
+  --collect-all basic_pitch --collect-all onnxruntime ^
   play_music_gui.py
 ```
 生成的 `dist/SkyAutoMusic.exe` 即为可执行文件。

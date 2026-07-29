@@ -21,13 +21,17 @@ jobs:
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
-          python-version: '3.11'
+          python-version: '3.10'
 
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
-          pip install -r requirements.txt
-          pip install pyinstaller
+          pip install -r requirements-lock.txt
+          pip install pyinstaller==6.21.0
+
+      - name: Verify ONNX transcription runtime
+        run: |
+          python -c "import importlib.util; assert importlib.util.find_spec('onnxruntime'), 'onnxruntime missing'; assert importlib.util.find_spec('tensorflow') is None, 'TensorFlow must not be bundled'"
 
       - name: Run unit tests
         run: python -B -m unittest discover -s tests -v
@@ -37,7 +41,22 @@ jobs:
           pyinstaller --noconfirm --onefile --windowed --name SkyAutoMusic `
             --hidden-import keyboard `
             --hidden-import win32timezone `
+            --hidden-import interception `
+            --collect-all basic_pitch `
+            --collect-all onnxruntime `
+            --collect-all interception `
             play_music_gui.py
+
+      - name: Smoke-test packaged transcriber
+        shell: pwsh
+        run: |
+          python tests/generate_transcriber_fixture.py transcriber-smoke.wav
+          $process = Start-Process -FilePath "dist/SkyAutoMusic.exe" `
+            -ArgumentList "--transcriber-self-test", (Resolve-Path "transcriber-smoke.wav").Path `
+            -Wait -PassThru
+          if ($process.ExitCode -ne 0) {
+            throw "Packaged transcriber self-test failed with exit code $($process.ExitCode)"
+          }
 
       - name: Create Release
         uses: softprops/action-gh-release@v2
