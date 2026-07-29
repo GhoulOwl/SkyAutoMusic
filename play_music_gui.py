@@ -244,8 +244,15 @@ class MusicGUI:
         # 播放Tab内容（响应式双栏布局）
         main_frame = ttk.Frame(play_tab)
         main_frame.pack(fill="both", expand=True, padx=14, pady=14)
-        main_frame.columnconfigure(0, weight=2, minsize=250)
-        main_frame.columnconfigure(1, weight=3, minsize=330)
+        # Keep the two columns in a fixed ratio. Without a shared uniform
+        # group, a long selected title changes the right column's requested
+        # width and makes the score list visibly jump.
+        main_frame.columnconfigure(
+            0, weight=2, minsize=250, uniform="main_columns"
+        )
+        main_frame.columnconfigure(
+            1, weight=3, minsize=330, uniform="main_columns"
+        )
         main_frame.rowconfigure(0, weight=1)
         # ====== 右侧主控区 ======
         center_frame = ttk.Frame(main_frame)

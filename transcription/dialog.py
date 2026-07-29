@@ -6,7 +6,7 @@ import tempfile
 import threading
 import tkinter as tk
 from dataclasses import replace
-from tkinter import filedialog, messagebox, ttk
+from tkinter import filedialog, font as tkfont, messagebox, ttk
 from typing import Callable, Dict, List, Optional, Sequence
 
 from .arranger import NOTE_NAMES
@@ -88,8 +88,6 @@ class TranscriptionDialog:
 
         self.win = tk.Toplevel(parent)
         self.win.title("生成乐谱")
-        self.win.geometry("960x820")
-        self.win.minsize(800, 680)
         self.win.transient(parent)
         self.win.protocol("WM_DELETE_WINDOW", self.close)
 
@@ -110,10 +108,60 @@ class TranscriptionDialog:
         self.netease_result_var = tk.StringVar(value="请输入歌曲名或歌手名")
 
         self._build_widgets()
+        self._fit_toplevel(
+            self.win,
+            preferred_width=1000,
+            preferred_height=860,
+            minimum_width=800,
+            minimum_height=680,
+        )
         self._load_cookie_status()
         if self.files:
             self.local_summary_var.set(f"已选择 {len(self.files)} 个本地文件")
             self.win.after(100, self.generate_all)
+
+    @staticmethod
+    def _fit_toplevel(
+        window: tk.Toplevel,
+        *,
+        preferred_width: int,
+        preferred_height: int,
+        minimum_width: int,
+        minimum_height: int,
+    ) -> None:
+        """Choose a useful initial size without placing controls below the screen."""
+        window.update_idletasks()
+        screen_width = max(1, window.winfo_screenwidth())
+        screen_height = max(1, window.winfo_screenheight())
+        margin_x = min(80, max(20, screen_width // 20))
+        margin_y = min(100, max(40, screen_height // 12))
+        available_width = max(1, screen_width - margin_x)
+        available_height = max(1, screen_height - margin_y)
+
+        width = min(
+            max(preferred_width, window.winfo_reqwidth()),
+            available_width,
+        )
+        height = min(
+            max(preferred_height, window.winfo_reqheight()),
+            available_height,
+        )
+        window.minsize(
+            min(minimum_width, available_width),
+            min(minimum_height, available_height),
+        )
+
+        master = window.master
+        try:
+            master.update_idletasks()
+            x = master.winfo_rootx() + max(0, (master.winfo_width() - width) // 2)
+            y = master.winfo_rooty() + max(0, (master.winfo_height() - height) // 2)
+        except (AttributeError, tk.TclError):
+            x = (screen_width - width) // 2
+            y = (screen_height - height) // 2
+        x = max(0, min(x, screen_width - width))
+        y = max(0, min(y, screen_height - height))
+        window.geometry(f"{width}x{height}+{x}+{y}")
 
     def _build_widgets(self) -> None:
         self._build_source_tabs()
@@ -232,7 +280,13 @@ class TranscriptionDialog:
         ).pack(fill="x", anchor="w")
 
         actions = ttk.Frame(self.win)
-        actions.pack(fill="x", padx=12, pady=(6, 12))
+        actions.pack(
+            side="bottom",
+            fill="x",
+            padx=12,
+            pady=(6, 12),
+            before=content,
+        )
         self.regenerate_btn = ttk.Button(
             actions, text="重新生成当前", command=self.regenerate_current, state="disabled"
         )
@@ -262,6 +316,8 @@ class TranscriptionDialog:
         sources.pack(fill="x", padx=12, pady=(12, 6))
         local_tab = ttk.Frame(sources, padding=8)
         online_tab = ttk.Frame(sources, padding=8)
+        online_tab.columnconfigure(0, weight=1)
+        online_tab.rowconfigure(2, weight=1)
         sources.add(local_tab, text="本地文件")
         sources.add(online_tab, text="网易云在线")
 
@@ -287,7 +343,7 @@ class TranscriptionDialog:
         ).pack(side="left", padx=8)
 
         cookie_row = ttk.Frame(online_tab)
-        cookie_row.pack(fill="x", pady=(0, 6))
+        cookie_row.grid(row=0, column=0, sticky="ew", pady=(0, 6))
         ttk.Label(cookie_row, text="网易云 Cookie：").pack(side="left")
         ttk.Label(
             cookie_row,
@@ -308,7 +364,7 @@ class TranscriptionDialog:
         self.cookie_validate_btn.pack(side="right", padx=(6, 0))
 
         search_row = ttk.Frame(online_tab)
-        search_row.pack(fill="x", pady=(0, 6))
+        search_row.grid(row=1, column=0, sticky="ew", pady=(0, 6))
         self.netease_search_entry = ttk.Entry(
             search_row, textvariable=self.netease_query_var
         )
@@ -320,13 +376,20 @@ class TranscriptionDialog:
         self.netease_search_btn.pack(side="left", padx=(8, 0))
 
         result_frame = ttk.Frame(online_tab)
-        result_frame.pack(fill="both", expand=True)
+        result_frame.grid(row=2, column=0, sticky="nsew")
         columns = ("title", "artists", "album", "duration")
+        tree_style = ttk.Style(self.win)
+        tree_row_height = max(
+            24,
+            tkfont.nametofont("TkDefaultFont").metrics("linespace") + 6,
+        )
+        tree_style.configure("NetEase.Treeview", rowheight=tree_row_height)
         self.netease_tree = ttk.Treeview(
             result_frame,
             columns=columns,
             show="headings",
-            height=6,
+            style="NetEase.Treeview",
+            height=7,
             selectmode="browse",
         )
         headings = {
@@ -356,7 +419,7 @@ class TranscriptionDialog:
         self.netease_tree.bind("<Double-1>", lambda _event: self.generate_online_draft())
 
         online_actions = ttk.Frame(online_tab)
-        online_actions.pack(fill="x", pady=(6, 0))
+        online_actions.grid(row=3, column=0, sticky="ew", pady=(8, 0))
         ttk.Label(
             online_actions,
             textvariable=self.netease_result_var,
@@ -384,6 +447,34 @@ class TranscriptionDialog:
             state="disabled",
         )
         self.netease_generate_btn.pack(side="right", padx=(8, 0))
+
+        def stabilize_online_layout() -> None:
+            try:
+                exists = sources.winfo_exists()
+            except tk.TclError:
+                return
+            if not exists:
+                return
+            sources.update_idletasks()
+            # The result row gets sacrificial space below Treeview's requested
+            # height.  Windows themed Tk can otherwise round the Notebook
+            # client area down at 125%/150% DPI and take pixels from the final
+            # visible row or the pagination bar.
+            online_tab.rowconfigure(
+                2,
+                minsize=self.netease_tree.winfo_reqheight() + tree_row_height,
+            )
+            online_tab.update_idletasks()
+            sources.configure(
+                height=max(
+                    local_tab.winfo_reqheight(),
+                    online_tab.winfo_reqheight(),
+                )
+                + 8
+            )
+
+        stabilize_online_layout()
+        self.win.after_idle(stabilize_online_layout)
 
     def _start_worker(self, target: Callable, *args) -> None:
         with self._workers_lock:
@@ -456,20 +547,53 @@ class TranscriptionDialog:
     def open_cookie_editor(self) -> None:
         editor = tk.Toplevel(self.win)
         editor.title("网易云 cookies.txt")
-        editor.geometry("760x520")
-        editor.minsize(620, 420)
         editor.transient(self.win)
-        ttk.Label(
+        editor.columnconfigure(0, weight=1)
+        editor.rowconfigure(1, weight=1)
+
+        intro_label = ttk.Label(
             editor,
             text=(
                 "粘贴 Netscape cookies.txt 的完整内容。程序只保留网易云域名 Cookie，"
                 "并使用当前 Windows 用户的 DPAPI 加密保存。"
             ),
-            wraplength=720,
             justify="left",
-        ).pack(fill="x", padx=12, pady=(12, 6))
-        text_widget = tk.Text(editor, wrap="none", font=("Consolas", 9), undo=True)
-        text_widget.pack(fill="both", expand=True, padx=12, pady=6)
+        )
+        intro_label.grid(row=0, column=0, sticky="ew", padx=12, pady=(12, 6))
+        intro_label.bind(
+            "<Configure>",
+            lambda event: intro_label.configure(wraplength=max(120, event.width)),
+        )
+
+        text_frame = ttk.Frame(editor)
+        text_frame.grid(row=1, column=0, sticky="nsew", padx=12, pady=6)
+        text_frame.columnconfigure(0, weight=1)
+        text_frame.rowconfigure(0, weight=1)
+        text_widget = tk.Text(
+            text_frame,
+            wrap="none",
+            font=("Consolas", 9),
+            undo=True,
+            width=80,
+            height=18,
+        )
+        text_widget.grid(row=0, column=0, sticky="nsew")
+        text_vscroll = ttk.Scrollbar(
+            text_frame,
+            orient="vertical",
+            command=text_widget.yview,
+        )
+        text_vscroll.grid(row=0, column=1, sticky="ns")
+        text_hscroll = ttk.Scrollbar(
+            text_frame,
+            orient="horizontal",
+            command=text_widget.xview,
+        )
+        text_hscroll.grid(row=1, column=0, sticky="ew")
+        text_widget.configure(
+            yscrollcommand=text_vscroll.set,
+            xscrollcommand=text_hscroll.set,
+        )
         try:
             existing = self.cookie_store.load_text() or ""
         except Exception as exc:
@@ -479,11 +603,19 @@ class TranscriptionDialog:
             text_widget.insert("1.0", existing)
 
         status_var = tk.StringVar(value="等待检查")
-        ttk.Label(editor, textvariable=status_var, foreground="#666").pack(
-            fill="x", padx=12, pady=(0, 4)
+        status_label = ttk.Label(
+            editor,
+            textvariable=status_var,
+            foreground="#666",
+            justify="left",
+        )
+        status_label.grid(row=2, column=0, sticky="ew", padx=12, pady=(0, 4))
+        status_label.bind(
+            "<Configure>",
+            lambda event: status_label.configure(wraplength=max(120, event.width)),
         )
         actions = ttk.Frame(editor)
-        actions.pack(fill="x", padx=12, pady=(4, 12))
+        actions.grid(row=3, column=0, sticky="ew", padx=12, pady=(4, 12))
         save_btn = ttk.Button(actions, text="保存", state="disabled")
         save_btn.pack(side="right")
         ttk.Button(actions, text="取消", command=editor.destroy).pack(
@@ -560,6 +692,13 @@ class TranscriptionDialog:
         save_btn.config(command=save_cookie)
         text_widget.bind("<<Modified>>", schedule_validation)
         text_widget.edit_modified(False)
+        self._fit_toplevel(
+            editor,
+            preferred_width=820,
+            preferred_height=620,
+            minimum_width=640,
+            minimum_height=480,
+        )
         schedule_validation()
 
     def validate_saved_cookie(self) -> None:
