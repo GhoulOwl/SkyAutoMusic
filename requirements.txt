@@ -9,9 +9,12 @@ psutil==5.9.8
 # 注意：interception-python 需要 Python>=3.10。
 interception-python>=1.13
 # ---- 扒谱（音频转乐谱）功能依赖 ----
-# 提示：librosa 会拉 numba、soundfile、audioread 等，安装包体积较大。
-# macOS/Linux 上如需解析 mp3 还需要 ffmpeg；wav/flac/ogg 无需 ffmpeg。
-numpy>=1.21
-scipy>=1.7
-soundfile>=0.12
-librosa>=0.10
+# Windows 发布固定使用 Python 3.10，使 basic-pitch 选择 ONNX Runtime 而非 TensorFlow。
+# 固定经 Windows/Python 3.10 构建使用的直接依赖版本，避免二进制 ABI 漂移。
+numpy==1.26.4
+scipy==1.13.1
+soundfile==0.13.1
+librosa==0.11.0
+pretty_midi==0.2.11.post0
+onnxruntime==1.21.1
+basic-pitch==0.4.0

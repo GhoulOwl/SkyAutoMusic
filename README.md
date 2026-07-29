@@ -22,6 +22,9 @@ SkyAutoMusic 是一款用于自动演奏《Sky光遇》等游戏内乐器的Pyth
 - 半透明乐谱覆盖层：显示播放进度、音符密度与当前按键，F10 可解锁拖动位置
 - 诊断页：查看热键、游戏窗口、前台窗口、管理员权限、键盘输入方式与最近按键日志
 - 窗口大小和位置自动保存，下次启动自动恢复
+- 音频/MIDI 扒谱：支持 pYIN 单旋律、Basic Pitch ONNX 复音、自动转调和15键编配
+- 扒谱草稿可查看15键时间线、调整调性/八度/量化/复音数并本地合成试听
+- 网易云在线扒谱：支持关键词搜索、分页结果、加密 Cookie、yt-dlp 下载及自动生成可审核草稿
 - 适配Windows平台
 
 ## 安装依赖
@@ -30,6 +33,15 @@ SkyAutoMusic 是一款用于自动演奏《Sky光遇》等游戏内乐器的Pyth
 ```bash
 pip install pyautogui keyboard psutil pywin32 interception-python
 ```
+
+完整安装（包含扒谱）请使用 Python 3.10：
+
+```bash
+pip install -r requirements.txt
+```
+
+发布版固定使用 Python 3.10，并通过 `requirements-lock.txt` 安装锁定依赖，使
+Basic Pitch 使用 ONNX Runtime；不打包 TensorFlow。
 
 ### 启用虚拟 HID / 驱动级键盘（可选，推荐）
 默认输入方式为"自动"，会优先尝试驱动级键盘；若未安装 Interception 驱动则自动回退到常规键盘（`keyboard` / `pyautogui`），不影响使用。
@@ -61,6 +73,11 @@ pip install pyautogui keyboard psutil pywin32 interception-python
 5. 右键曲谱可收藏/取消收藏，分页切换显示全部或收藏曲谱。
 6. 程序会自动检测Sky/光遇窗口并置顶，未检测到会提示。
 7. 窗口大小和位置、收藏数据等会自动保存，无需手动配置。
+8. 点击“生成乐谱”进入扒谱窗口：
+   - “本地文件”页可选择音频或 MIDI；音频默认使用 Basic Pitch 复音高质量模式，也可切换 pYIN 单旋律快速模式，MIDI 会忽略鼓轨。
+   - “网易云在线”页可搜索歌曲并翻页；选择结果后点击“生成在线草稿”，程序会通过 yt-dlp 下载并用内置 FFmpeg 转成临时 WAV。
+   - 生成结果先保存在内存草稿中；试听、调参后点击“保存当前”或“保存全部”才会写入乐谱文件夹。
+   - 会员或登录歌曲可点击 Cookie 区的“编辑”，粘贴 Netscape 格式 `cookies.txt` 完整内容。程序仅保留网易云域名 Cookie，并使用 Windows DPAPI 按当前用户加密保存到 `netease_auth.json`。
 
 ## 构建与发布（EXE）
 
@@ -75,11 +92,13 @@ pip install pyautogui keyboard psutil pywin32 interception-python
 
 ### 方式二：本地用 PyInstaller 构建
 ```bash
-pip install -r requirements.txt pyinstaller
+pip install -r requirements.txt pyinstaller==6.21.0
 pyinstaller --noconfirm --onefile --windowed --name SkyAutoMusic ^
   --hidden-import keyboard --hidden-import win32timezone ^
   --hidden-import interception --collect-all interception ^
   --add-data "assets/audio/sky/Piano;assets/audio/sky/Piano" ^
+  --collect-all basic_pitch --collect-all onnxruntime ^
+  --collect-all yt_dlp --collect-all imageio_ffmpeg ^
   play_music_gui.py
 ```
 生成的 `dist/SkyAutoMusic.exe` 即为可执行文件。
@@ -118,6 +137,7 @@ pyinstaller --noconfirm --onefile --windowed --name SkyAutoMusic ^
 - **诊断页**：可查看热键注册结果、游戏窗口识别、当前前台窗口、管理员权限、键盘输入方式与最近按键日志，方便排查"按键没有打到游戏里"的问题。
 - **窗口与配置**：窗口大小、位置、收藏、输入方式等均自动保存，无需手动配置。
 - **资源路径适配**：所有资源文件（config.json、favorites.json、Sheet Music）均自动适配开发和打包环境，无需修改路径。
+- **在线音频兼容**：发布版内置 `imageio-ffmpeg`，会增加约 31 MB 依赖体积，但无需用户另行安装 FFmpeg。
 
 ## 常见问题
 - **找不到乐谱/收藏/配置文件？**
@@ -134,11 +154,17 @@ pyinstaller --noconfirm --onefile --windowed --name SkyAutoMusic ^
   - 未安装驱动时会自动回退到常规键盘。如需驱动级输入，请按 README 安装 Interception 驱动并重启。
 - **按键映射不符？**
   - 请在代码中修改`note_to_key`字典。
+- **网易云 Cookie 一直显示无效？**
+  - 确认已在浏览器登录网易云，并导出 Netscape `cookies.txt`；文件首行应为 `# Netscape HTTP Cookie File`，且包含未过期的 `MUSIC_U`。
+  - Cookie 由 Windows DPAPI 绑定到当前 Windows 用户，复制到另一台电脑或另一个系统账号后需要重新保存。
+- **网易云歌曲无法扒谱？**
+  - 无 Cookie 时只能获取公开可播放歌曲；Cookie 只能使用账号自身已有权限，不能绕过会员、版权、下架或地区限制。
+  - 网易云接口和 yt-dlp 提取器可能随网站更新而变化，请先升级到项目锁定或更新后的 yt-dlp 版本。
 - **其它问题**
   - 如遇异常可反馈至作者主页或交流群。
 
 ## 免责声明
-本工具仅供学习与娱乐，请勿用于破坏游戏公平性。
+本工具仅供学习与娱乐，请勿用于破坏游戏公平性。在线扒谱仅应处理你有权访问和使用的音频；本程序不会绕过会员、版权或地区限制。
 
 ---
 

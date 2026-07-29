@@ -124,6 +124,7 @@ class MusicGUI:
         self._active_mode = None  # None / game / preview_loading / preview
         self._preview_loading = False
         self._preview_generation = 0
+        self._transcription_dialog = None
         # 统一按键抽象层（调试模式、可切换映射的前置能力）
         # 输入方式：auto / interception(驱动级) / keyboard，默认优先驱动级
         # 需在 create_widgets 之前创建，诊断页 UI 会读取其后端列表与状态。
@@ -1003,111 +1004,41 @@ class MusicGUI:
 
     # ---------- 扒谱（音频 → 乐谱） ----------
     def open_generate_dialog(self):
-        """打开文件选择对话框，启动后台线程批量转写音频为乐谱 JSON。
+        """打开本地文件 / 网易云在线扒谱窗口。"""
+        from transcription.dialog import TranscriptionDialog
 
-        软限幅到 0/14，保留原曲和弦（不人为叠音）。完成后写入 Sheet Music/ 并刷新列表。
-        """
-        from tkinter import filedialog
-        from transcriber import Transcriber, is_audio_file
-
-        # 检查依赖（numpy/librosa）—— Transcriber 会在 __init__ 内做懒导入 + 错误抛出
-        try:
-            transcriber = Transcriber()
-        except Exception as e:
-            messagebox.showerror(
-                "依赖缺失",
-                f"无法启动扒谱功能：\n{e}\n\n请先运行: pip install librosa numpy soundfile",
-            )
+        existing = getattr(self, "_transcription_dialog", None)
+        if existing is not None and not existing.closed:
+            existing.win.deiconify()
+            existing.win.lift()
+            existing.win.focus_force()
             return
-
-        files = filedialog.askopenfilenames(
-            title="选择要转写的音频文件",
-            filetypes=[("音频文件", "*.mp3 *.wav *.flac *.ogg *.m4a *.aac"), ("全部", "*.*")],
+        self._transcription_dialog = TranscriptionDialog(
+            self.root,
+            (),
+            SHEET_MUSIC_DIR,
+            accent=self.accent,
+            on_saved=self._refresh_music_after_generation,
+            auth_file=resource_path("netease_auth.json"),
         )
-        if not files:
-            return
 
-        # 进度窗口
-        win = tk.Toplevel(self.root)
-        win.title("生成乐谱")
-        win.geometry("520x220")
-        win.transient(self.root)
-        win.grab_set()
-        ttk.Label(win, text="正在转写音频 → 乐谱 JSON ...", font=("微软雅黑", 10, "bold"), foreground=self.accent).pack(pady=(14, 6))
-        info_var = tk.StringVar(value="准备中…")
-        ttk.Label(win, textvariable=info_var, font=("微软雅黑", 9)).pack(pady=(0, 6), padx=10, anchor="w")
-        bar = ttk.Progressbar(win, mode="determinate", style='Modern.Horizontal.TProgressbar', maximum=1000, value=0)
-        bar.pack(fill="x", padx=14, pady=(2, 6))
-        detail_var = tk.StringVar(value="")
-        ttk.Label(win, textvariable=detail_var, font=("微软雅黑", 8), foreground="#888").pack(pady=(0, 8), padx=10, anchor="w")
-        cancel_flag = {"cancel": False}
-
-        def on_cancel():
-            cancel_flag["cancel"] = True
-            info_var.set("正在取消…")
-
-        ttk.Button(win, text="取消", command=on_cancel).pack(pady=(4, 8))
-
-        def progress_cb(filename, frac, status):
-            # 转到 Tk 主线程
-            def _apply():
-                if cancel_flag["cancel"]:
-                    return
-                bar["value"] = int(max(0.0, min(1.0, frac)) * 1000)
-                info_var.set(status)
-                if filename:
-                    detail_var.set(os.path.basename(filename))
-                else:
-                    detail_var.set("")
-            try:
-                win.after(0, _apply)
-            except Exception:
-                pass
-
-        def worker():
-            try:
-                # 用本地 list 防止被 Cancel 修改（iterable 一次性）
-                files_list = list(files)
-                # 用户取消：transcriber.run 不支持逐文件中断，最简做法：等本批跑完，UI 层关进度窗口
-                transcriber.run(
-                    files_list,
-                    output_dir=SHEET_MUSIC_DIR,
-                    progress_cb=progress_cb,
-                )
-            except Exception as e:
-                win.after(0, lambda: messagebox.showerror("转写失败", str(e)))
-            finally:
-                def _finish():
-                    # 通知主线程刷新列表（schedule_music_dir_watch 每秒会扫一次，但这里立刻刷更直观）
-                    try:
-                        self.all_music_files = self.get_all_music_files() or []
-                        self.filtered_music_files = self.all_music_files.copy()
-                        self.on_search()
-                        self.last_music_files = set(self.all_music_files)
-                    except Exception:
-                        pass
-                    # 计算本次成功数
-                    ok_n = 0
-                    for fp in files:
-                        out = os.path.join(SHEET_MUSIC_DIR,
-                                           os.path.splitext(os.path.basename(fp))[0] + ".json")
-                        if os.path.exists(out):
-                            ok_n += 1
-                    try:
-                        win.destroy()
-                    except Exception:
-                        pass
-                    messagebox.showinfo(
-                        "生成完成",
-                        f"已生成 {ok_n}/{len(files)} 份乐谱到 Sheet Music/ 文件夹。\n"
-                        f"点击列表中对应文件即可开始演奏。",
-                    )
-                try:
-                    win.after(0, _finish)
-                except Exception:
-                    pass
-
-        threading.Thread(target=worker, daemon=True).start()
+    def _refresh_music_after_generation(self, output_path=None):
+        """保存草稿后立即刷新乐谱列表。"""
+        selected_filename = os.path.basename(output_path) if output_path else None
+        self.all_music_files = self.get_all_music_files() or []
+        self.filtered_music_files = self.all_music_files.copy()
+        self.search_var.set("")
+        self.current_music_tab.set("全部曲谱")
+        self.refresh_music_listbox()
+        self.last_music_files = set(self.all_music_files)
+        if selected_filename in self.visible_music_files:
+            index = self.visible_music_files.index(selected_filename)
+            self.music_listbox.selection_clear(0, tk.END)
+            self.music_listbox.selection_set(index)
+            self.music_listbox.activate(index)
+            self.music_listbox.see(index)
+            self.update_song_info(selected_filename)
+            self.status_var.set(f"已生成并选择乐谱: {selected_filename}")
 
     def on_close(self):
         # 退出软件前确保处于"未播放"态并释放可能按住的按键
@@ -1117,6 +1048,9 @@ class MusicGUI:
             self.preview_player.stop()
         if getattr(self, "audio_preview", None):
             self.audio_preview.close()
+        dialog = getattr(self, "_transcription_dialog", None)
+        if dialog is not None:
+            dialog.close()
         self._release_game_topmost()
         # 保存窗口大小和位置
         try:
@@ -1224,7 +1158,42 @@ class MusicGUI:
         except Exception:
             pass
 
+def run_transcriber_self_test(audio_path):
+    """供 Windows 打包流水线验证 ONNX 模型、解码和 JSON 兼容性。"""
+    import tempfile
+    from transcription import TranscriptionOptions, export_song_json, transcribe_draft
+    from transcription.netease import validate_netease_runtime
+
+    validate_netease_runtime()
+
+    result = transcribe_draft(
+        audio_path,
+        TranscriptionOptions(
+            mode="polyphonic",
+            source_key="C major",
+            octave_shift=0,
+            max_polyphony=3,
+        ),
+    )
+    with tempfile.TemporaryDirectory(prefix="sky-self-test-") as temp_dir:
+        output_path = os.path.join(temp_dir, "self-test.json")
+        export_song_json(result, output_path, "self-test")
+        load_score(output_path, valid_keys=note_to_key.keys())
+    return True
+
+
 if __name__ == "__main__":
+    if "--transcriber-self-test" in sys.argv:
+        try:
+            arg_index = sys.argv.index("--transcriber-self-test")
+            input_path = sys.argv[arg_index + 1]
+            run_transcriber_self_test(input_path)
+            sys.exit(0)
+        except Exception as exc:
+            try:
+                print(f"transcriber self-test failed: {exc}", file=sys.stderr)
+            finally:
+                sys.exit(1)
     if relaunch_as_admin_if_needed():
         sys.exit(0)
     root = tk.Tk()
