@@ -15,6 +15,8 @@ SkyAutoMusic 是一款用于自动演奏《Sky光遇》等游戏内乐器的Pyth
 - 收藏曲谱、分页切换（全部/收藏）
 - 乐谱信息悬停显示与走马灯效果
 - 右侧主控区展示详细乐谱信息（歌名、作者、制谱人、文件名）
+- 曲谱列表支持纵向和横向滚动、搜索结果计数与选中状态保持
+- JSON 曲谱可使用内置 Sky 钢琴音色本地试听，不会向游戏发送按键
 - 按乐谱 `time` 绝对时间戳播放，长曲节奏更稳定
 - **虚拟 HID / 驱动级键盘**：基于 Interception 内核驱动在驱动层注入按键，可绕过部分游戏对 SendInput 的屏蔽；未安装驱动时自动回退到常规键盘
 - 半透明乐谱覆盖层：显示播放进度、音符密度与当前按键，F10 可解锁拖动位置
@@ -51,8 +53,9 @@ pip install pyautogui keyboard psutil pywin32 interception-python
    ```bash
    python play_music_gui.py
    ```
-3. 在界面中选择乐谱，点击"开始演奏"或使用热键（默认F5/F7）控制。
-   - F11：暂停/继续。
+3. 在界面中选择乐谱，点击"游戏演奏"将按键发送到游戏，或点击"本地试听"直接预览 JSON 曲谱。
+   - F5：开始游戏演奏；F7：停止当前演奏或试听。
+   - F11：暂停/继续当前演奏或试听。
    - F10：切换乐谱覆盖层的点击穿透锁定；解锁后可拖动覆盖层位置。
 4. 可在"说明"页查看作者主页、交流群等信息。
 5. 右键曲谱可收藏/取消收藏，分页切换显示全部或收藏曲谱。
@@ -61,7 +64,7 @@ pip install pyautogui keyboard psutil pywin32 interception-python
 
 ## 构建与发布（EXE）
 
-本工具提供两种方式获取 Windows 可执行文件（exe）。**乐谱与配置文件均不打包进 exe，需自行放置**（见下方说明）。
+本工具提供两种方式获取 Windows 可执行文件（exe）。内置钢琴音色会打包进 exe；**乐谱与配置文件不打包，需自行放置**（见下方说明）。
 
 ### 方式一：GitHub Actions 自动构建（推荐）
 1. 进入仓库的 **Actions** 页面，选择 `Build EXE & Release` 工作流。
@@ -76,6 +79,7 @@ pip install -r requirements.txt pyinstaller
 pyinstaller --noconfirm --onefile --windowed --name SkyAutoMusic ^
   --hidden-import keyboard --hidden-import win32timezone ^
   --hidden-import interception --collect-all interception ^
+  --add-data "assets/audio/sky/Piano;assets/audio/sky/Piano" ^
   play_music_gui.py
 ```
 生成的 `dist/SkyAutoMusic.exe` 即为可执行文件。
@@ -106,6 +110,7 @@ pyinstaller --noconfirm --onefile --windowed --name SkyAutoMusic ^
 
 ## 特色功能说明
 - **收藏与分页**：右键曲谱可收藏，分页按钮切换显示全部/收藏曲谱。
+- **本地试听**：使用 `assets/audio/sky/Piano/0.mp3` 至 `14.mp3` 预览 JSON 曲谱；`1KeyN` 与 `2KeyN` 均映射到 `N.mp3`，缺失音色会从 Sky Music 自动下载并缓存。
 - **乐谱信息展示**：右侧主控区高亮显示歌名、作者、制谱人、文件名。
 - **稳定节奏播放**：播放器按乐谱 `time` 毫秒时间戳进行绝对时间调度，不按 BPM 重算节奏；BPM 字段主要作为乐谱元信息保留。
 - **虚拟 HID / 驱动级键盘**：在诊断页"键盘输入方式"可选择"自动 / 虚拟HID驱动级键盘 / 常规键盘"。驱动级模式通过 Interception 内核驱动在驱动层注入按键，兼容性更好；点击"校准驱动级键盘"可重新识别键盘设备。

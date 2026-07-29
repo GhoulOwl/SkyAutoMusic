@@ -37,6 +37,7 @@ jobs:
           pyinstaller --noconfirm --onefile --windowed --name SkyAutoMusic `
             --hidden-import keyboard `
             --hidden-import win32timezone `
+            --add-data "assets/audio/sky/Piano;assets/audio/sky/Piano" `
             play_music_gui.py
 
       - name: Create Release

@@ -5,6 +5,7 @@
 .workbuddy/
 __pycache__/
 .venv/
+.venv*/
 .gitlab/
 .idea/
 .vscode/
@@ -21,5 +22,4 @@ __pycache__/
 .pytype/
 .dub/
 .pio/
-.vscode/
 
