@@ -66,9 +66,9 @@ class AudioPreprocessor:
         elif self.config.preprocess_separate == "demucs":
             y = self._demucs(audio_path, sr, y)
 
-        # 3) 响度归一化（峰值）
+        # 3) 响度归一化（峰值归一到 0.95）
         if y.size and np.max(np.abs(y)) > 0:
-            y = librosa.util.normalize(y, norm=np.inf, amp=0.95)
+            y = librosa.util.normalize(y, norm=np.inf, axis=0) * 0.95
 
         # 4) 可选噪声门
         if self.config.preprocess_denoise:
@@ -107,7 +107,7 @@ class AudioPreprocessor:
             wav = np.asarray(wav)
             ref = wav.mean(0)
             ref_tensor = (
-                librosa.util.normalize(ref, norm=np.inf, amp=1.0).reshape(1, -1)
+                librosa.util.normalize(ref, norm=np.inf, axis=0).reshape(1, -1)
                 if False
                 else None
             )
