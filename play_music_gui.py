@@ -9,7 +9,8 @@ import webbrowser
 from audio_preview import AudioPreviewController
 from key_controller import KeyController, note_to_key
 from player import MusicPlayer, PlaybackState
-from score_loader import ScoreValidationError, load_score, read_json_with_fallback, summarize_meta
+from playlist_store import PlaybackSession, PlaylistStore
+from score_loader import ScoreValidationError, load_score, summarize_meta
 from score_overlay import ScoreOverlay
 from window_focus import (
     bring_window_to_front,
@@ -92,7 +93,14 @@ class MusicGUI:
         self.button_active_bg = "#3399FF"
         self.root.configure(bg=self.bg_color)
         self.set_style()
-        self.default_hotkeys = {'start': 'F5', 'stop': 'F7', 'overlay_lock': 'F10'}
+        self.default_hotkeys = {
+            'start': 'F5',
+            'previous': 'F6',
+            'stop': 'F7',
+            'next': 'F8',
+            'overlay_lock': 'F10',
+            'toggle_pause': 'F11',
+        }
         self.hotkeys = self.default_hotkeys.copy()
         self.hotkey_vars = {k: tk.StringVar(value=v) for k, v in self.hotkeys.items()}
         self.status_var = tk.StringVar(value="请选择乐谱并点击开始演奏")
@@ -110,20 +118,31 @@ class MusicGUI:
             'name': tk.StringVar(),
             'author': tk.StringVar(),
             'transcribedBy': tk.StringVar(),
+            'duration': tk.StringVar(value="--"),
+            'bpm': tk.StringVar(value="--"),
+            'noteCount': tk.StringVar(value="--"),
         }
         self.filtered_music_files = []  # 先初始化，防止后续方法引用时报错
         self.visible_music_files = []
         self.favorites = set()  # 收藏的乐谱文件名集合，可持久化
         self.favorite_file = resource_path('favorites.json')  # 用resource_path，兼容打包
         self.load_favorites()  # 启动时加载收藏
+        self.playlist_store = PlaylistStore(resource_path("playlist.json"))
+        self.playlist_store.load(self.get_all_music_files())
         self.debug_logs = []
         self._progress_frac = 0.0
         self._elapsed_sec = 0.0
         self._current_note_info = (-1, None, [])
         self._game_hwnd = None  # 当前已置顶/聚焦的游戏窗口句柄，stop 时解除置顶
-        self._active_mode = None  # None / game / preview_loading / preview
+        self._active_mode = None  # None / game / preview_loading / preview / transition
         self._preview_loading = False
         self._preview_generation = 0
+        self._transition_generation = 0
+        self._playback_session = None
+        self._playing_filename = None
+        self._pending_selection_filename = None
+        self._pending_selection_changed = False
+        self._programmatic_selection = False
         self._transcription_dialog = None
         # 统一按键抽象层（调试模式、可切换映射的前置能力）
         # 输入方式：auto / interception(驱动级) / keyboard，默认优先驱动级
@@ -159,6 +178,7 @@ class MusicGUI:
             update_note=self._on_note,
             update_finished=self._on_preview_finished,
         )
+        self._set_playback_controls(None)
         self.overlay = ScoreOverlay(
             self.root,
             geometry=self.config.get("overlay_geometry"),
@@ -275,24 +295,34 @@ class MusicGUI:
         ttk.Label(self.music_info_frame, text="制谱:", width=7, anchor="e").grid(row=2, column=0, sticky="e", padx=(0, 8), pady=5)
         self.music_transcriber_value_label = ttk.Label(self.music_info_frame, textvariable=self.music_info_vars['transcribedBy'], anchor="w", font=("微软雅黑", 11, "bold"), foreground=self.accent, wraplength=260)
         self.music_transcriber_value_label.grid(row=2, column=1, sticky="we", pady=5)
+        # 播放指标
+        ttk.Label(self.music_info_frame, text="总时长:", width=7, anchor="e").grid(row=3, column=0, sticky="e", padx=(0, 8), pady=3)
+        ttk.Label(self.music_info_frame, textvariable=self.music_info_vars['duration'], anchor="w").grid(row=3, column=1, sticky="we", pady=3)
+        ttk.Label(self.music_info_frame, text="BPM:", width=7, anchor="e").grid(row=4, column=0, sticky="e", padx=(0, 8), pady=3)
+        ttk.Label(self.music_info_frame, textvariable=self.music_info_vars['bpm'], anchor="w").grid(row=4, column=1, sticky="we", pady=3)
+        ttk.Label(self.music_info_frame, text="音符数:", width=7, anchor="e").grid(row=5, column=0, sticky="e", padx=(0, 8), pady=3)
+        ttk.Label(self.music_info_frame, textvariable=self.music_info_vars['noteCount'], anchor="w").grid(row=5, column=1, sticky="we", pady=3)
         # 文件名
-        ttk.Label(self.music_info_frame, text="文件名:", width=7, anchor="e").grid(row=3, column=0, sticky="e", padx=(0, 8), pady=(8, 0))
+        ttk.Label(self.music_info_frame, text="文件名:", width=7, anchor="e").grid(row=6, column=0, sticky="e", padx=(0, 8), pady=(8, 0))
         self.music_filename_value_label = ttk.Label(self.music_info_frame, textvariable=self.music_info_vars['filename'], anchor="w", font=("微软雅黑", 9), foreground="#888", wraplength=260)
-        self.music_filename_value_label.grid(row=3, column=1, sticky="we", pady=(8, 0))
+        self.music_filename_value_label.grid(row=6, column=1, sticky="we", pady=(8, 0))
         # ====== 左侧乐谱区 ======
         left_frame = ttk.Frame(main_frame)
         left_frame.grid(row=0, column=0, sticky="nswe")
 
-        # ====== 乐谱分页按钮（全部/收藏） ======
+        # ====== 乐谱分页按钮（全部/收藏/播放列表） ======
         # 可自定义：tab_names 可扩展更多分页
-        self.music_tabs = ["全部曲谱", "收藏曲谱"]  # 可自定义：分页名称
+        self.music_tabs = ["全部曲谱", "收藏曲谱", "播放列表"]
         self.current_music_tab = tk.StringVar(value=self.music_tabs[0])
+        self.music_tab_buttons = {}
         tab_frame = ttk.Frame(left_frame)
         tab_frame.pack(fill="x", pady=(0, 4))
         for name in self.music_tabs:
-            btn = ttk.Radiobutton(tab_frame, text=name, value=name, variable=self.current_music_tab,
+            label = f"播放列表 ({len(self.playlist_store.items)})" if name == "播放列表" else name
+            btn = ttk.Radiobutton(tab_frame, text=label, value=name, variable=self.current_music_tab,
                                   command=self.on_music_tab_changed, style="Toolbutton")
             btn.pack(side="left", padx=2)
+            self.music_tab_buttons[name] = btn
 
         # ====== 搜索栏 ======
         search_header = ttk.Frame(left_frame)
@@ -338,13 +368,36 @@ class MusicGUI:
         )
         self.music_listbox.bind('<<ListboxSelect>>', self.on_listbox_select)
         self.music_listbox.bind('<Button-3>', self.on_music_listbox_right_click)  # 右键菜单
+        # 播放列表操作区：普通列表可添加，播放列表内可排序和移除。
+        self.add_playlist_frame = ttk.Frame(left_frame)
+        self.add_to_playlist_btn = ttk.Button(
+            self.add_playlist_frame,
+            text="加入播放列表",
+            command=self.add_selected_to_playlist,
+            style='Accent.TButton',
+        )
+        self.add_to_playlist_btn.pack(fill="x")
+        self.manage_playlist_frame = ttk.Frame(left_frame)
+        for column in range(3):
+            self.manage_playlist_frame.columnconfigure(column, weight=1)
+        self.playlist_up_btn = ttk.Button(
+            self.manage_playlist_frame, text="上移",
+            command=lambda: self.move_selected_playlist_item(-1))
+        self.playlist_up_btn.grid(row=0, column=0, sticky="ew", padx=(0, 3))
+        self.playlist_down_btn = ttk.Button(
+            self.manage_playlist_frame, text="下移",
+            command=lambda: self.move_selected_playlist_item(1))
+        self.playlist_down_btn.grid(row=0, column=1, sticky="ew", padx=3)
+        self.playlist_remove_btn = ttk.Button(
+            self.manage_playlist_frame, text="移除",
+            command=self.remove_selected_from_playlist)
+        self.playlist_remove_btn.grid(row=0, column=2, sticky="ew", padx=(3, 0))
+        self._update_playlist_action_visibility()
         self.refresh_music_listbox()
         self.tooltip = None
         # 播放时长显示（紧凑居中）
         time_frame = ttk.Frame(center_frame)
         time_frame.pack(pady=(6, 10), fill="x")
-        self.elapsed_time_var = tk.StringVar(value="0:00")
-        self.total_time_var = tk.StringVar(value="0:00")
         time_inner = ttk.Frame(time_frame)
         time_inner.pack(anchor="center")
         ttk.Label(time_inner, textvariable=self.elapsed_time_var, font=("Consolas", 11, "bold"), foreground=self.accent, width=7, anchor="e").pack(side="left")
@@ -379,6 +432,12 @@ class MusicGUI:
         # 扒谱（音频→乐谱）入口
         self.generate_btn = ttk.Button(btn_frame, text="生成乐谱", command=self.open_generate_dialog, style='Accent.TButton')
         self.generate_btn.grid(row=1, column=1, sticky="ew", padx=(6, 0), pady=6)
+        self.previous_btn = ttk.Button(
+            btn_frame, text="上一首 (F6)", command=self.previous_track)
+        self.previous_btn.grid(row=2, column=0, sticky="ew", padx=(0, 6), pady=6)
+        self.next_btn = ttk.Button(
+            btn_frame, text="下一首 (F8)", command=self.next_track)
+        self.next_btn.grid(row=2, column=1, sticky="ew", padx=(6, 0), pady=6)
         # 状态栏
         self.status_label = ttk.Label(center_frame, textvariable=self.status_var, anchor="center", justify="center", font=("微软雅黑", 10, "bold"), background=self.bg_color, foreground=self.accent, wraplength=380)
         self.status_label.pack(pady=(10, 6), fill="x")
@@ -415,12 +474,22 @@ class MusicGUI:
         # 热键说明区
         frame = ttk.LabelFrame(parent or self.root, text="热键说明", padding=14)
         frame.pack(pady=10, fill="x", padx=8)
-        ttk.Label(frame, text="开始/继续:").grid(row=0, column=0, sticky="e", padx=4, pady=4)
-        ttk.Label(frame, textvariable=self.hotkey_vars['start'], font=("微软雅黑", 10, "bold"), foreground=self.accent).grid(row=0, column=1, sticky="w", padx=4, pady=4)
-        ttk.Label(frame, text="停止:").grid(row=2, column=0, sticky="e", padx=4, pady=4)
-        ttk.Label(frame, textvariable=self.hotkey_vars['stop'], font=("微软雅黑", 10, "bold"), foreground=self.accent).grid(row=2, column=1, sticky="w", padx=4, pady=4)
-        ttk.Label(frame, text="覆盖层移动/锁定:").grid(row=3, column=0, sticky="e", padx=4, pady=4)
-        ttk.Label(frame, textvariable=self.hotkey_vars['overlay_lock'], font=("微软雅黑", 10, "bold"), foreground=self.accent).grid(row=3, column=1, sticky="w", padx=4, pady=4)
+        hotkey_rows = [
+            ("游戏演奏:", "start"),
+            ("上一首:", "previous"),
+            ("停止:", "stop"),
+            ("下一首:", "next"),
+            ("暂停/继续:", "toggle_pause"),
+            ("覆盖层移动/锁定:", "overlay_lock"),
+        ]
+        for row, (label, name) in enumerate(hotkey_rows):
+            ttk.Label(frame, text=label).grid(row=row, column=0, sticky="e", padx=4, pady=4)
+            ttk.Label(
+                frame,
+                textvariable=self.hotkey_vars[name],
+                font=("微软雅黑", 10, "bold"),
+                foreground=self.accent,
+            ).grid(row=row, column=1, sticky="w", padx=4, pady=4)
 
     def create_diagnostics_tab(self, parent):
         frame = ttk.LabelFrame(parent, text="运行状态", padding=14)
@@ -492,19 +561,26 @@ class MusicGUI:
         old_top = old_yview[0] if old_yview else 0.0
         old_xview = self.music_listbox.xview()
         old_left = old_xview[0] if old_xview else 0.0
-        # 根据当前tab显示全部或收藏
+        # 根据当前 tab 显示全部、收藏或保持自定义顺序的播放列表。
         tab = getattr(self, 'current_music_tab', None)
         if tab and getattr(self, 'music_tabs', None):
-            if self.current_music_tab.get() == "收藏曲谱":
+            current_tab = self.current_music_tab.get()
+            if current_tab == "收藏曲谱":
                 files = [f for f in self.filtered_music_files if f in self.favorites]
+                files = sorted(files, key=str.casefold)
+            elif current_tab == "播放列表":
+                filtered = set(self.filtered_music_files)
+                files = [f for f in self.playlist_store.items if f in filtered]
             else:
-                files = self.filtered_music_files or []
+                files = sorted(self.filtered_music_files or [], key=str.casefold)
         else:
-            files = self.filtered_music_files or []
-        files = sorted(files, key=str.casefold)
+            files = sorted(self.filtered_music_files or [], key=str.casefold)
         self.music_listbox.delete(0, tk.END)
         self.visible_music_files = list(files)
         self.music_count_var.set(f"{len(files)} 首")
+        playlist_tab = getattr(self, "music_tab_buttons", {}).get("播放列表")
+        if playlist_tab is not None:
+            playlist_tab.config(text=f"播放列表 ({len(self.playlist_store.items)})")
         # 只显示文件名（带.json），不做display_name截断，保证索引一一对应
         for f in files:
             self.music_listbox.insert(tk.END, f)
@@ -520,6 +596,9 @@ class MusicGUI:
                 self.music_listbox.see(selected_index)
         else:
             self.update_song_info(None)
+        self._update_playlist_action_visibility()
+        self._update_playlist_action_states()
+        self._update_navigation_buttons()
 
     def on_search(self, event=None):
         keyword = self.search_var.get().lower()
@@ -533,8 +612,17 @@ class MusicGUI:
         sel = self.music_listbox.curselection()
         if sel and sel[0] < len(self.visible_music_files):
             filename = self.visible_music_files[sel[0]]
-            self.update_song_info(filename)
-            self.status_var.set(f"已选择乐谱: {filename}")
+            programmatic = self._programmatic_selection
+            readable = self.update_song_info(filename)
+            if self._active_mode is not None and not programmatic:
+                playing = self._playing_filename or "当前曲目"
+                self.status_var.set(f"已选择待播: {filename}；当前播放: {playing}")
+            elif self._active_mode is None and readable:
+                self.status_var.set(f"已选择乐谱: {filename}")
+            elif self._active_mode is None:
+                self.status_var.set(f"乐谱不可播放: {filename}")
+            self._update_playlist_action_states()
+            self._update_navigation_buttons()
 
     def refresh_music_list(self):
         # 兼容旧接口，实际不再用
@@ -542,102 +630,278 @@ class MusicGUI:
         self.filtered_music_files = self.all_music_files.copy() if self.all_music_files else []
         self.refresh_music_listbox()
 
-    def update_song_info(self, filename):
-        # 页面信息区展示选中曲谱详细信息
+    @staticmethod
+    def _format_time_value(seconds):
+        seconds = max(0, int(float(seconds)))
+        minutes, sec = divmod(seconds, 60)
+        hours, minutes = divmod(minutes, 60)
+        if hours:
+            return f"{hours}:{minutes:02d}:{sec:02d}"
+        return f"{minutes}:{sec:02d}"
+
+    def _read_score_for_filename(self, filename, show_error=False):
         if not filename:
-            self.music_info_vars['filename'].set("")
-            self.music_info_vars['name'].set("")
-            self.music_info_vars['author'].set("")
-            self.music_info_vars['transcribedBy'].set("")
-            return
-        self.music_info_vars['filename'].set(filename)
-        path = os.path.join(SHEET_MUSIC_DIR, filename)  # SHEET_MUSIC_DIR已用resource_path
+            return None
+        path = os.path.join(SHEET_MUSIC_DIR, filename)
         try:
-            data = read_json_with_fallback(path)
-            meta = summarize_meta(data)
-        except Exception:
-            self.music_info_vars['name'].set('')
-            self.music_info_vars['author'].set('')
-            self.music_info_vars['transcribedBy'].set('')
-            return
+            return load_score(path, valid_keys=self.key_controller.mapping.keys())
+        except (ScoreValidationError, OSError) as exc:
+            if show_error:
+                messagebox.showerror("乐谱校验失败", str(exc))
+            else:
+                self._debug_log(f"[WARN] 无法读取乐谱 {filename}: {exc}")
+            return None
+
+    def _clear_song_info(self, filename="", invalid=False, reset_progress=True):
+        self.music_info_vars['filename'].set(filename)
+        self.music_info_vars['name'].set("")
+        self.music_info_vars['author'].set("")
+        self.music_info_vars['transcribedBy'].set("")
+        placeholder = "--" if invalid else ""
+        self.music_info_vars['duration'].set(placeholder)
+        self.music_info_vars['bpm'].set(placeholder)
+        self.music_info_vars['noteCount'].set(placeholder)
+        if reset_progress:
+            self._reset_progress(total_text="--" if invalid else "0:00")
+
+    def _apply_song_info(self, filename, score, reset_progress=True):
+        meta = summarize_meta(score["raw"])
+        duration_sec = score["duration_ms"] / 1000.0
+        self.music_info_vars['filename'].set(filename)
         self.music_info_vars['name'].set(meta.get('name', ''))
         self.music_info_vars['author'].set(meta.get('author', ''))
         self.music_info_vars['transcribedBy'].set(meta.get('transcribedBy', ''))
+        self.music_info_vars['duration'].set(self._format_time_value(duration_sec))
+        bpm = meta.get('bpm', 120)
+        self.music_info_vars['bpm'].set(str(bpm) if bpm not in (None, "") else "--")
+        self.music_info_vars['noteCount'].set(str(score["note_count"]))
+        if reset_progress:
+            self._reset_progress(total_sec=duration_sec)
 
-    def start_play(self):
+    def update_song_info(self, filename, force=False, reset_progress=True):
+        """展示选中曲谱；播放期间普通选择只记录为停止后的待显示项。"""
+        if self._active_mode is not None and not force:
+            if not self._programmatic_selection:
+                if filename == self._playing_filename:
+                    self._pending_selection_filename = None
+                    self._pending_selection_changed = False
+                else:
+                    self._pending_selection_filename = filename
+                    self._pending_selection_changed = True
+            return True
+        if not filename:
+            self._clear_song_info(reset_progress=reset_progress)
+            return False
+        score = self._read_score_for_filename(filename)
+        if score is None:
+            self._clear_song_info(filename=filename, invalid=True, reset_progress=reset_progress)
+            return False
+        self._apply_song_info(filename, score, reset_progress=reset_progress)
+        return True
+
+    def _playlist_mutation_allowed(self):
+        if self._active_mode is None:
+            return True
+        self.status_var.set("播放期间不能修改播放列表，请先停止（F7）")
+        return False
+
+    def add_selected_to_playlist(self):
+        filename = self._selected_music_filename()
+        if not filename:
+            self.status_var.set("请先选择要加入播放列表的乐谱")
+            return
+        self.add_filename_to_playlist(filename)
+
+    def remove_selected_from_playlist(self):
+        filename = self._selected_music_filename()
+        if not filename or not self._playlist_mutation_allowed():
+            return
+        self.remove_filename_from_playlist(filename)
+
+    def move_selected_playlist_item(self, offset):
+        filename = self._selected_music_filename()
+        if not filename or not self._playlist_mutation_allowed():
+            return
+        visible_index = self.visible_music_files.index(filename)
+        target_visible_index = visible_index + (1 if offset > 0 else -1)
+        if target_visible_index < 0 or target_visible_index >= len(self.visible_music_files):
+            self.status_var.set("已经到达播放列表边界")
+            return
+        target_filename = self.visible_music_files[target_visible_index]
+        full_offset = (
+            self.playlist_store.items.index(target_filename)
+            - self.playlist_store.items.index(filename)
+        )
+        try:
+            moved = self.playlist_store.move(filename, full_offset)
+        except OSError as exc:
+            messagebox.showerror("播放列表保存失败", str(exc))
+            return
+        if not moved:
+            self.status_var.set("已经到达播放列表边界")
+            return
+        self.refresh_music_listbox()
+        self.status_var.set(f"已调整播放顺序: {filename}")
+
+    def _update_playlist_action_visibility(self):
+        if not getattr(self, "add_playlist_frame", None):
+            return
+        if self.current_music_tab.get() == "播放列表":
+            self.add_playlist_frame.pack_forget()
+            self.manage_playlist_frame.pack(fill="x", pady=(8, 0))
+        else:
+            self.manage_playlist_frame.pack_forget()
+            self.add_playlist_frame.pack(fill="x", pady=(8, 0))
+
+    def _update_playlist_action_states(self):
+        if not getattr(self, "add_to_playlist_btn", None):
+            return
+        locked = self._active_mode is not None
+        filename = self._selected_music_filename()
+        self.add_to_playlist_btn.config(
+            state="disabled" if locked or not filename else "normal")
+        in_playlist_view = self.current_music_tab.get() == "播放列表"
+        visible_index = (
+            self.visible_music_files.index(filename)
+            if filename in self.visible_music_files else -1
+        )
+        self.playlist_up_btn.config(
+            state="normal"
+            if in_playlist_view and not locked and visible_index > 0 else "disabled")
+        self.playlist_down_btn.config(
+            state="normal"
+            if in_playlist_view and not locked
+            and 0 <= visible_index < len(self.visible_music_files) - 1
+            else "disabled")
+        self.playlist_remove_btn.config(
+            state="normal"
+            if in_playlist_view and not locked and filename in self.playlist_store.items
+            else "disabled")
+
+    def _player_threads_running(self):
+        for player in (getattr(self, "player", None), getattr(self, "preview_player", None)):
+            thread = getattr(player, "thread", None)
+            if thread is not None and thread.is_alive():
+                return True
+        return False
+
+    def _select_filename_if_visible(self, filename):
+        if filename not in self.visible_music_files:
+            return
+        index = self.visible_music_files.index(filename)
+        self._programmatic_selection = True
+        self.music_listbox.selection_clear(0, tk.END)
+        self.music_listbox.selection_set(index)
+        self.music_listbox.activate(index)
+        self.music_listbox.see(index)
+        try:
+            self.root.after_idle(
+                lambda: setattr(self, "_programmatic_selection", False))
+        except Exception:
+            self._programmatic_selection = False
+
+    def _create_playback_session(self, filename, mode):
+        source_tab = self.current_music_tab.get()
+        return PlaybackSession.create(
+            self.visible_music_files,
+            filename,
+            mode=mode,
+            auto_advance=source_tab == "播放列表",
+            source_tab=source_tab,
+        )
+
+    def _begin_selected_playback(self, mode):
         if self._active_mode is not None:
             self.status_var.set("请先停止当前演奏或试听（F7）")
-            return
-        if self.player.state != PlaybackState.STOPPED or self.preview_player.state != PlaybackState.STOPPED:
-            self.status_var.set("播放器正在切换状态，请稍后重试")
-            return
-        self.audio_preview.stop_all()
-        if not self.check_and_set_game_window():
-            return
-        self._prepare_game_input()
-        if not self.load_music():
-            return
-        # 把当前可调参数注入播放器
-        self.player.speed = self.speed
-        self.player.simulate = self.simulate
-        self.player.miss_prob = self.miss_prob
-        self.key_controller.set_debug(self.debug)
-        self._reset_progress()
-        title = self.music_info_vars['name'].get() or self.music_info_vars['filename'].get()
-        self.overlay.set_score(self.notes_by_time, self.sorted_times, title=title)
-        self.overlay.show(self._game_hwnd)
-        self._update_overlay_status()
-        if not self.player.start(self.notes_by_time, self.sorted_times):
-            return
-        self._active_mode = "game"
-        self._set_playback_controls("game")
-        self.status_var.set("演奏中... F11 暂停 / F7 停止")
+            return False
+        if self._player_threads_running():
+            self.status_var.set("播放器正在停止，请稍后重试")
+            return False
+        filename = self._selected_music_filename()
+        if not filename:
+            messagebox.showwarning("提示", "请先选择乐谱！")
+            return False
+        score = self._read_score_for_filename(filename, show_error=True)
+        if score is None:
+            return False
+        try:
+            session = self._create_playback_session(filename, mode)
+        except ValueError:
+            self.status_var.set("当前歌曲不在可见列表中，请重新选择")
+            return False
 
-    def stop_play(self):
-        self._preview_generation += 1
-        self._preview_loading = False
-        if self.player:
-            self.player.stop()
-        if getattr(self, "preview_player", None):
-            self.preview_player.stop()
-        if getattr(self, "audio_preview", None):
-            self.audio_preview.stop_all()
-        # 解除游戏窗口置顶（若此前被本程序置顶），恢复正常桌面层级
-        self._release_game_topmost()
-        self._reset_progress()
-        if getattr(self, 'overlay', None):
-            self.overlay.hide()
-            self._update_overlay_status()
-        self._active_mode = None
-        self.status_var.set("已停止，点击游戏演奏或本地试听")
-        self._set_playback_controls(None)
+        self._playback_session = session
+        self._pending_selection_filename = None
+        self._pending_selection_changed = False
+        if not self._start_loaded_track(filename, score, mode):
+            self._playback_session = None
+            self._playing_filename = None
+            self._set_playback_controls(None)
+            return False
+        return True
+
+    def start_play(self):
+        self._begin_selected_playback("game")
 
     def start_preview(self):
         """开始、暂停或继续当前选中 JSON 曲谱的本地试听。"""
         if self._active_mode == "preview" and self.preview_player.state != PlaybackState.STOPPED:
             self.toggle_play_pause()
             return
-        if self._active_mode is not None:
-            self.status_var.set("请先停止当前演奏或试听（F7）")
-            return
-        if self.player.state != PlaybackState.STOPPED:
-            self.status_var.set("请先停止游戏演奏（F7）")
-            return
-        if not self.load_music():
-            return
+        self._begin_selected_playback("preview")
+
+    def _apply_loaded_score(self, score):
+        self.music_data = score["raw"]
+        self.notes_by_time = score["notes_by_time"]
+        self.sorted_times = score["sorted_times"]
+        self.bpm = score["meta"].get('bpm', 120)
+        if score["warnings"]:
+            self._debug_log("[WARN] " + "；".join(score["warnings"][:5]))
+
+    def _start_loaded_track(self, filename, score, mode, preserve_pending=False):
+        self._apply_loaded_score(score)
+        self._playing_filename = filename
+        if not preserve_pending:
+            self._pending_selection_filename = None
+            self._pending_selection_changed = False
+            self._select_filename_if_visible(filename)
+        elif not self._pending_selection_changed:
+            self._select_filename_if_visible(filename)
+        self._apply_song_info(filename, score, reset_progress=True)
+
+        if mode == "game":
+            self.audio_preview.stop_all()
+            if not self.check_and_set_game_window():
+                return False
+            self._prepare_game_input()
+            self.player.speed = self.speed
+            self.player.simulate = self.simulate
+            self.player.miss_prob = self.miss_prob
+            self.key_controller.set_debug(self.debug)
+            title = self.music_info_vars['name'].get() or filename
+            self.overlay.set_score(self.notes_by_time, self.sorted_times, title=title)
+            self.overlay.show(self._game_hwnd)
+            self._update_overlay_status()
+            self._active_mode = "game"
+            if not self.player.start(self.notes_by_time, self.sorted_times):
+                self._active_mode = None
+                return False
+            self._set_playback_controls("game")
+            self.status_var.set(
+                f"演奏中: {filename}（F6/F8 切歌 / F11 暂停 / F7 停止）")
+            return True
 
         self.audio_preview.stop_all()
-        self._reset_progress()
         self._preview_generation += 1
         generation = self._preview_generation
         self._preview_loading = True
         self._active_mode = "preview_loading"
         self._set_playback_controls("preview_loading")
-        self.status_var.set("正在准备试听音色...")
+        self.status_var.set(f"正在准备试听音色: {filename}")
 
         if self.audio_preview.prepared:
             self._start_prepared_preview(generation)
-            return
+            return True
 
         def progress(completed, total, index):
             self._run_on_ui(
@@ -656,11 +920,14 @@ class MusicGUI:
             self._run_on_ui(self._start_prepared_preview, generation)
 
         threading.Thread(target=worker, daemon=True).start()
+        return True
 
     def _set_preview_prepare_progress(self, generation, completed, total):
         if generation != self._preview_generation or not self._preview_loading:
             return
-        self.status_var.set(f"正在准备试听音色... {completed}/{total}")
+        filename = self._playing_filename or ""
+        self.status_var.set(
+            f"正在准备试听音色: {filename}（{completed}/{total}）")
 
     def _start_prepared_preview(self, generation):
         if generation != self._preview_generation or not self._preview_loading:
@@ -668,23 +935,146 @@ class MusicGUI:
         self._preview_loading = False
         self.preview_player.speed = self.speed
         self.preview_player.simulate = False
+        self._active_mode = "preview"
         if not self.preview_player.start(self.notes_by_time, self.sorted_times):
             self._active_mode = None
+            self._playback_session = None
             self._set_playback_controls(None)
             self.status_var.set("无法启动试听，请重试")
             return
-        self._active_mode = "preview"
         self._set_playback_controls("preview")
-        self.status_var.set("本地试听中... F11 暂停 / F7 停止")
+        self.status_var.set(
+            f"本地试听中: {self._playing_filename}（F6/F8 切歌 / F11 暂停 / F7 停止）")
 
     def _preview_prepare_failed(self, generation, exc):
         if generation != self._preview_generation:
             return
         self._preview_loading = False
         self._active_mode = None
+        self._playback_session = None
+        self._playing_filename = None
         self._set_playback_controls(None)
         self.status_var.set("试听音色准备失败")
         messagebox.showerror("无法开始试听", str(exc))
+
+    def _find_playable_session_target(self, offset):
+        session = self._playback_session
+        if session is None:
+            return None
+        for index in session.candidate_indexes(offset):
+            filename = session.items[index]
+            score = self._read_score_for_filename(filename)
+            if score is not None:
+                return index, filename, score
+            self._debug_log(f"[WARN] 跳过不可播放的队列项: {filename}")
+        return None
+
+    def previous_track(self):
+        self._change_track(-1)
+
+    def next_track(self):
+        self._change_track(1)
+
+    def _change_track(self, offset):
+        if self._active_mode is None:
+            self._move_idle_selection(offset)
+            return
+        if self._active_mode == "transition":
+            self.status_var.set("正在切换歌曲，请稍候")
+            return
+        target = self._find_playable_session_target(offset)
+        if target is None:
+            self.status_var.set("已经到达播放序列边界")
+            return
+        index, filename, score = target
+
+        if self._active_mode == "preview_loading":
+            self._playback_session.index = index
+            self._apply_loaded_score(score)
+            self._playing_filename = filename
+            self._pending_selection_filename = None
+            self._pending_selection_changed = False
+            self._select_filename_if_visible(filename)
+            self._apply_song_info(filename, score, reset_progress=True)
+            self._update_navigation_buttons()
+            self.status_var.set(f"正在准备试听音色: {filename}")
+            return
+
+        mode = self._playback_session.mode
+        self._begin_track_transition(
+            index, filename, score, mode, preserve_pending=False)
+
+    def _move_idle_selection(self, offset):
+        if not self.visible_music_files:
+            self.status_var.set("当前列表没有可选择的歌曲")
+            return
+        selected = self.music_listbox.curselection()
+        index = selected[0] if selected else 0
+        target = index + (1 if offset > 0 else -1)
+        if target < 0 or target >= len(self.visible_music_files):
+            self.status_var.set("已经到达当前列表边界")
+            return
+        self.music_listbox.selection_clear(0, tk.END)
+        self.music_listbox.selection_set(target)
+        self.music_listbox.activate(target)
+        self.music_listbox.see(target)
+        filename = self.visible_music_files[target]
+        self.update_song_info(filename)
+        self.status_var.set(f"已选择乐谱: {filename}")
+        self._update_navigation_buttons()
+
+    def _begin_track_transition(
+            self, index, filename, score, mode, preserve_pending):
+        self._transition_generation += 1
+        generation = self._transition_generation
+        self._preview_generation += 1
+        self._preview_loading = False
+        self._playback_session.index = index
+        self._active_mode = "transition"
+        self._set_playback_controls("transition")
+        self.status_var.set(f"正在切换到: {filename}")
+        self.player.stop()
+        self.preview_player.stop()
+        if mode == "preview":
+            self.audio_preview.stop_all()
+        self._wait_for_track_transition(
+            generation, filename, score, mode, preserve_pending)
+
+    def _wait_for_track_transition(
+            self, generation, filename, score, mode, preserve_pending):
+        if generation != self._transition_generation or self._active_mode != "transition":
+            return
+        if self._player_threads_running():
+            self.root.after(
+                20,
+                self._wait_for_track_transition,
+                generation,
+                filename,
+                score,
+                mode,
+                preserve_pending,
+            )
+            return
+        if not self._start_loaded_track(
+                filename, score, mode, preserve_pending=preserve_pending):
+            self.stop_play()
+            self.status_var.set(f"无法播放队列歌曲: {filename}")
+
+    def _update_navigation_buttons(self):
+        if not getattr(self, "previous_btn", None):
+            return
+        if self._active_mode == "transition":
+            previous_enabled = next_enabled = False
+        elif self._active_mode is not None and self._playback_session is not None:
+            previous_enabled = self._playback_session.can_move(-1)
+            next_enabled = self._playback_session.can_move(1)
+        else:
+            selected = self.music_listbox.curselection()
+            index = selected[0] if selected else -1
+            previous_enabled = index > 0
+            next_enabled = 0 <= index < len(self.visible_music_files) - 1
+        self.previous_btn.config(state="normal" if previous_enabled else "disabled")
+        self.next_btn.config(state="normal" if next_enabled else "disabled")
 
     def _set_playback_controls(self, mode):
         if mode is None:
@@ -707,10 +1097,21 @@ class MusicGUI:
                 text="继续试听 (F11)" if paused else "暂停试听 (F11)",
             )
             self.stop_btn.config(state="normal")
+        elif mode == "transition":
+            self.start_btn.config(state="disabled")
+            self.preview_btn.config(state="disabled", text="正在切歌...")
+            self.stop_btn.config(state="normal")
+        self._update_navigation_buttons()
+        self._update_playlist_action_states()
 
-    def _reset_progress(self):
+    def _reset_progress(self, total_sec=None, total_text=None):
         self.elapsed_time_var.set("0:00")
-        self.total_time_var.set("0:00")
+        if total_text is not None:
+            self.total_time_var.set(total_text)
+        elif total_sec is not None:
+            self.total_time_var.set(self._format_time_value(total_sec))
+        else:
+            self.total_time_var.set("0:00")
         self._progress_frac = 0.0
         self._elapsed_sec = 0.0
         self._current_note_info = (-1, None, [])
@@ -718,6 +1119,39 @@ class MusicGUI:
             self.progress_bar["value"] = 0
         if getattr(self, "progress_percent_var", None) is not None:
             self.progress_percent_var.set("0%")
+
+    def stop_play(self):
+        self._transition_generation += 1
+        self._preview_generation += 1
+        self._preview_loading = False
+        if getattr(self, "player", None):
+            self.player.stop()
+        if getattr(self, "preview_player", None):
+            self.preview_player.stop()
+        if getattr(self, "audio_preview", None):
+            self.audio_preview.stop_all()
+        self._release_game_topmost()
+        if getattr(self, 'overlay', None):
+            self.overlay.hide()
+            self._update_overlay_status()
+
+        target = (
+            self._pending_selection_filename
+            if self._pending_selection_changed
+            else self._playing_filename or self._selected_music_filename()
+        )
+        self._active_mode = None
+        self._playback_session = None
+        self._playing_filename = None
+        self._pending_selection_filename = None
+        self._pending_selection_changed = False
+        if target:
+            self._select_filename_if_visible(target)
+            self.update_song_info(target, force=True, reset_progress=True)
+        else:
+            self._clear_song_info(reset_progress=True)
+        self._set_playback_controls(None)
+        self.status_var.set("已停止，点击游戏演奏或本地试听")
 
     def toggle_play_pause(self):
         """F11：暂停或继续当前的游戏演奏/本地试听。"""
@@ -761,14 +1195,12 @@ class MusicGUI:
     def _on_elapsed(self, sec):
         self._elapsed_sec = max(0.0, float(sec))
         def _apply():
-            m, s = divmod(int(sec), 60)
-            self.elapsed_time_var.set(f"{m}:{s:02d}")
+            self.elapsed_time_var.set(self._format_time_value(sec))
         self._run_on_ui(_apply)
 
     def _on_total(self, sec):
         def _apply():
-            m, s = divmod(int(sec), 60)
-            self.total_time_var.set(f"{m}:{s:02d}")
+            self.total_time_var.set(self._format_time_value(sec))
         self._run_on_ui(_apply)
 
     def _on_progress(self, frac):
@@ -781,23 +1213,12 @@ class MusicGUI:
             self._record_log(f"[NOTE] #{idx + 1} {t_ms}ms -> {','.join(notes or [])}", echo=False)
 
     def _on_finished(self):
-        """演奏自然结束时由播放线程触发；转交主线程重置 UI 到"就绪"态。
-
-        这样用户无需先点"停止"即可直接选择下一首并按"开始"。
-        """
         self._run_on_ui(self._handle_playback_finished)
 
     def _handle_playback_finished(self):
-        # 仅在确实由"播放中"自然结束时处理，避免与 stop_play 重复重置
         if self._active_mode != "game":
             return
-        self._release_game_topmost()
-        if getattr(self, 'overlay', None):
-            self.overlay.hide()
-            self._update_overlay_status()
-        self._active_mode = None
-        self._set_playback_controls(None)
-        self.status_var.set("演奏结束，点击游戏演奏或本地试听下一首")
+        self._handle_track_finished("game")
 
     def _on_preview_finished(self):
         self._run_on_ui(self._handle_preview_finished)
@@ -805,10 +1226,58 @@ class MusicGUI:
     def _handle_preview_finished(self):
         if self._active_mode != "preview":
             return
-        # 不在此处 stop_all，让最后一个钢琴采样自然衰减。
+        self._handle_track_finished("preview")
+
+    def _handle_track_finished(self, mode):
+        session = self._playback_session
+        if session is not None and session.auto_advance:
+            target = self._find_playable_session_target(1)
+            if target is not None:
+                index, filename, score = target
+                self._begin_track_transition(
+                    index,
+                    filename,
+                    score,
+                    mode,
+                    preserve_pending=True,
+                )
+                return
+        self._finalize_natural_playback(mode)
+
+    def _finalize_natural_playback(self, mode):
+        session = self._playback_session
+        queue_finished = bool(session and session.auto_advance)
+        last_playing = self._playing_filename
+        pending_changed = self._pending_selection_changed
+        pending = self._pending_selection_filename
+
+        if mode == "game":
+            self._release_game_topmost()
+            if getattr(self, 'overlay', None):
+                self.overlay.hide()
+                self._update_overlay_status()
         self._active_mode = None
+        self._playback_session = None
         self._set_playback_controls(None)
-        self.status_var.set("试听结束，可选择下一首继续试听")
+        if pending_changed:
+            if pending:
+                self.update_song_info(pending, force=True, reset_progress=True)
+            else:
+                self._clear_song_info(reset_progress=True)
+        elif last_playing:
+            # 保留自然结束后的 100% 进度，仅刷新歌曲信息本身。
+            self.update_song_info(last_playing, force=True, reset_progress=False)
+
+        self._playing_filename = None
+        self._pending_selection_filename = None
+        self._pending_selection_changed = False
+        self._update_playlist_action_states()
+        self._update_navigation_buttons()
+        if queue_finished:
+            label = "播放列表演奏结束" if mode == "game" else "播放列表试听结束"
+        else:
+            label = "演奏结束" if mode == "game" else "试听结束"
+        self.status_var.set(f"{label}，可选择歌曲继续播放")
 
     def _on_preview_audio_error(self, exc):
         self._run_on_ui(self._handle_preview_audio_error, str(exc))
@@ -990,23 +1459,14 @@ class MusicGUI:
         release_topmost(getattr(self, '_game_hwnd', None))
 
     def load_music(self):
-        sel = self.music_listbox.curselection()
-        if not sel:
+        selected = self._selected_music_filename()
+        if not selected:
             messagebox.showwarning("提示", "请先选择乐谱！")
             return False
-        selected = self.visible_music_files[sel[0]]
-        path = os.path.join(SHEET_MUSIC_DIR, selected)  # SHEET_MUSIC_DIR已用resource_path
-        try:
-            score = load_score(path, valid_keys=self.key_controller.mapping.keys())
-        except ScoreValidationError as e:
-            messagebox.showerror("乐谱校验失败", str(e))
+        score = self._read_score_for_filename(selected, show_error=True)
+        if score is None:
             return False
-        self.music_data = score["raw"]
-        self.notes_by_time = score["notes_by_time"]
-        self.sorted_times = score["sorted_times"]
-        self.bpm = score["meta"].get('bpm', 120)
-        if score["warnings"]:
-            self._debug_log("[WARN] " + "；".join(score["warnings"][:5]))
+        self._apply_loaded_score(score)
         return True
 
     # ---------- 扒谱（音频 → 乐谱） ----------
@@ -1080,7 +1540,12 @@ class MusicGUI:
 
     def schedule_music_dir_watch(self):
         current_files = set(self.get_all_music_files())
-        if current_files != self.last_music_files:
+        try:
+            playlist_changed = self.playlist_store.refresh(current_files)
+        except OSError as exc:
+            playlist_changed = False
+            self._debug_log(f"[WARN] 播放列表清理保存失败: {exc}")
+        if current_files != self.last_music_files or playlist_changed:
             self.all_music_files = sorted(current_files, key=str.casefold)
             self.filtered_music_files = self.all_music_files.copy()
             self.on_search()  # 保持搜索关键字过滤
@@ -1094,14 +1559,19 @@ class MusicGUI:
             keyboard.unhook_all_hotkeys()
         except Exception:
             pass
-        # 注册开始、播放/暂停、停止热键
+        # 注册开始、切歌、播放/暂停、停止热键
         try:
             keyboard.add_hotkey(self.hotkeys['start'], lambda: self._run_on_ui(self.start_play))
-            keyboard.add_hotkey('F11', lambda: self._run_on_ui(self.toggle_play_pause))
+            keyboard.add_hotkey(self.hotkeys['previous'], lambda: self._run_on_ui(self.previous_track))
             keyboard.add_hotkey(self.hotkeys['stop'], lambda: self._run_on_ui(self.stop_play))
+            keyboard.add_hotkey(self.hotkeys['next'], lambda: self._run_on_ui(self.next_track))
             keyboard.add_hotkey(self.hotkeys['overlay_lock'], lambda: self._run_on_ui(self.toggle_overlay_lock))
+            keyboard.add_hotkey(self.hotkeys['toggle_pause'], lambda: self._run_on_ui(self.toggle_play_pause))
             self.hotkey_status_var.set(
-                f"已注册: {self.hotkeys['start']} 开始 / F11 暂停 / {self.hotkeys['stop']} 停止 / {self.hotkeys['overlay_lock']} 覆盖层"
+                f"已注册: {self.hotkeys['start']} 演奏 / "
+                f"{self.hotkeys['previous']} 上一首 / {self.hotkeys['stop']} 停止 / "
+                f"{self.hotkeys['next']} 下一首 / {self.hotkeys['toggle_pause']} 暂停 / "
+                f"{self.hotkeys['overlay_lock']} 覆盖层"
             )
         except Exception as e:
             self.hotkey_status_var.set(f"注册失败: {e}")
@@ -1112,9 +1582,7 @@ class MusicGUI:
         self.refresh_music_listbox()
 
     def on_music_listbox_right_click(self, event):
-        """
-        右键菜单：仅保留收藏/取消收藏
-        """
+        """右键菜单：收藏以及播放列表添加/移除。"""
         idx = self.music_listbox.nearest(event.y)
         if idx < 0 or idx >= len(self.visible_music_files or []):
             return
@@ -1123,14 +1591,56 @@ class MusicGUI:
         self.music_listbox.activate(idx)
         filename = self.visible_music_files[idx]
         self.update_song_info(filename)
-        self.status_var.set(f"已选择乐谱: {filename}")
+        if self._active_mode is None:
+            self.status_var.set(f"已选择乐谱: {filename}")
         menu = tk.Menu(self.music_listbox, tearoff=0)
-        # 只保留收藏/取消收藏
         if filename in self.favorites:
             menu.add_command(label="取消收藏", command=lambda: self.toggle_favorite(filename))
         else:
             menu.add_command(label="收藏", command=lambda: self.toggle_favorite(filename))
+        menu.add_separator()
+        mutation_state = "normal" if self._active_mode is None else "disabled"
+        if filename in self.playlist_store.items:
+            menu.add_command(
+                label="从播放列表移除",
+                state=mutation_state,
+                command=lambda: self.remove_filename_from_playlist(filename),
+            )
+        else:
+            menu.add_command(
+                label="加入播放列表",
+                state=mutation_state,
+                command=lambda: self.add_filename_to_playlist(filename),
+            )
         menu.tk_popup(event.x_root, event.y_root)
+
+    def add_filename_to_playlist(self, filename):
+        if not self._playlist_mutation_allowed():
+            return
+        if self._read_score_for_filename(filename, show_error=True) is None:
+            return
+        try:
+            added = self.playlist_store.add(filename)
+        except OSError as exc:
+            messagebox.showerror("播放列表保存失败", str(exc))
+            return
+        if added:
+            self.status_var.set(f"已加入播放列表: {filename}")
+        else:
+            self.status_var.set(f"歌曲已在播放列表中: {filename}")
+        self.refresh_music_listbox()
+
+    def remove_filename_from_playlist(self, filename):
+        if not self._playlist_mutation_allowed():
+            return
+        try:
+            removed = self.playlist_store.remove(filename)
+        except OSError as exc:
+            messagebox.showerror("播放列表保存失败", str(exc))
+            return
+        if removed:
+            self.status_var.set(f"已从播放列表移除: {filename}")
+            self.refresh_music_listbox()
 
     def toggle_favorite(self, filename):
         """

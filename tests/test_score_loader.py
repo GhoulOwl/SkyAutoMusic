@@ -40,7 +40,38 @@ class TestScoreLoader(unittest.TestCase):
         self.assertEqual(score["sorted_times"], [100, 150])
         self.assertEqual(score["notes_by_time"][100], ["1Key0"])
         self.assertEqual(score["notes_by_time"][150], ["1Key1"])
+        self.assertEqual(score["duration_ms"], 50)
+        self.assertEqual(score["note_count"], 2)
         self.assertEqual(len(score["warnings"]), 1)
+
+    def test_metrics_use_playback_span_and_deduplicated_notes(self):
+        path = _write_score([{
+            "songNotes": [
+                {"time": 1000, "key": "1Key0"},
+                {"time": 1000, "key": "1Key1"},
+                {"time": 1000, "key": "1Key1"},
+                {"time": 61000, "key": "1Key2"},
+            ],
+        }])
+        try:
+            score = load_score(path, valid_keys={"1Key0", "1Key1", "1Key2"})
+        finally:
+            os.remove(path)
+
+        self.assertEqual(score["duration_ms"], 60000)
+        self.assertEqual(score["note_count"], 3)
+
+    def test_single_event_has_zero_duration(self):
+        path = _write_score([{
+            "songNotes": [{"time": 500, "key": "1Key0"}],
+        }])
+        try:
+            score = load_score(path, valid_keys={"1Key0"})
+        finally:
+            os.remove(path)
+
+        self.assertEqual(score["duration_ms"], 0)
+        self.assertEqual(score["note_count"], 1)
 
     def test_rejects_unknown_key(self):
         path = _write_score([{"songNotes": [{"time": 0, "key": "bad"}]}])

@@ -86,11 +86,16 @@ def load_score(path, valid_keys=None):
     if not sorted_times:
         raise ScoreValidationError("乐谱没有可播放的有效音符。")
 
+    duration_ms = max(0, int(sorted_times[-1]) - int(sorted_times[0]))
+    note_count = sum(len(notes) for notes in notes_by_time.values())
+
     return {
         "raw": data,
         "meta": meta,
         "notes_by_time": notes_by_time,
         "sorted_times": sorted_times,
+        "duration_ms": duration_ms,
+        "note_count": note_count,
         "warnings": warnings,
     }
 
