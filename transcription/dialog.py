@@ -13,7 +13,9 @@ from .arranger import NOTE_NAMES
 from .backends import is_midi_file
 from .models import (
     CancelledError,
+    DEFAULT_ENABLED_STEMS,
     SourceMetadata,
+    StemKind,
     TranscriptionOptions,
     TranscriptionResult,
 )
@@ -26,21 +28,38 @@ from .netease_auth import (
     validate_cookie_account,
 )
 from .pipeline import (
+    cleanup_result_artifacts,
     export_song_json,
     next_available_path,
     rearrange_draft,
     suggested_output_stem,
     transcribe_draft,
 )
-from .preview import PreviewPlayer
+from .preview import PreviewPlayer, StemPreviewPlayer
+from player import PlaybackState
 
 
 MODE_LABELS = {
+    "智能六轨融合": "stem_fusion",
     "复音高质量（Basic Pitch）": "polyphonic",
     "单旋律快速（pYIN）": "monophonic",
 }
 SENSITIVITY_LABELS = {"低": "low", "普通": "normal", "高": "high"}
 QUANTIZE_LABELS = {"关闭": "off", "八分音符": "1/8", "十六分音符": "1/16"}
+REPEAT_CLEANUP_LABELS = {"自动": "auto", "强力": "strong", "关闭": "off"}
+FUSION_PROFILE_LABELS = {
+    "人声优先": "vocal_first",
+    "键盘优先": "keyboard_first",
+    "平衡融合": "balanced",
+}
+STEM_LABELS = {
+    "vocals": "人声",
+    "drums": "鼓点",
+    "piano": "钢琴/键盘",
+    "bass": "贝斯",
+    "guitar": "吉他",
+    "instrumental": "去人声完整伴奏",
+}
 
 
 class TranscriptionDialog:
@@ -69,7 +88,13 @@ class TranscriptionDialog:
         }
         self.online_paths = set()
         self.cancel_event = threading.Event()
-        self.preview_player = PreviewPlayer()
+        self.preview_player = PreviewPlayer(
+            on_status=self._on_score_preview_status,
+            on_finished=self._on_score_preview_finished,
+            on_error=self._on_score_preview_error,
+        )
+        self.stem_preview_player = StemPreviewPlayer()
+        self._preview_preparing = False
         self.busy = False
         self.closed = False
         self._workers_lock = threading.Lock()
@@ -91,12 +116,21 @@ class TranscriptionDialog:
         self.win.transient(parent)
         self.win.protocol("WM_DELETE_WINDOW", self.close)
 
-        self.mode_var = tk.StringVar(value="复音高质量（Basic Pitch）")
+        self.mode_var = tk.StringVar(value="智能六轨融合")
         self.sensitivity_var = tk.StringVar(value="普通")
         self.key_var = tk.StringVar(value="自动")
         self.octave_var = tk.StringVar(value="自动")
         self.quantize_var = tk.StringVar(value="关闭")
         self.polyphony_var = tk.IntVar(value=3)
+        self.repeat_cleanup_var = tk.StringVar(value="自动")
+        self.fusion_profile_var = tk.StringVar(value="人声优先")
+        self.use_drum_timing_var = tk.BooleanVar(value=True)
+        self.stem_enabled_vars: Dict[StemKind, tk.BooleanVar] = {
+            stem: tk.BooleanVar(value=stem in DEFAULT_ENABLED_STEMS)
+            for stem in STEM_LABELS
+            if stem != "drums"
+        }
+        self.stem_controls: Dict[StemKind, Dict[str, object]] = {}
         self.status_var = tk.StringVar(value="准备生成草稿…")
         self.detail_var = tk.StringVar(value="")
         self.stats_var = tk.StringVar(value="尚未生成草稿")
@@ -111,7 +145,7 @@ class TranscriptionDialog:
         self._fit_toplevel(
             self.win,
             preferred_width=1000,
-            preferred_height=860,
+            preferred_height=940,
             minimum_width=800,
             minimum_height=680,
         )
@@ -231,6 +265,33 @@ class TranscriptionDialog:
             width=6,
             state="readonly",
         ).grid(row=1, column=5, sticky="w", padx=4, pady=4)
+
+        ttk.Label(options, text="重复音清理").grid(
+            row=2, column=0, sticky="e", padx=4, pady=4
+        )
+        self.repeat_cleanup_box = ttk.Combobox(
+            options,
+            textvariable=self.repeat_cleanup_var,
+            values=list(REPEAT_CLEANUP_LABELS),
+            state="readonly",
+            width=8,
+        )
+        self.repeat_cleanup_box.grid(
+            row=2, column=1, sticky="w", padx=4, pady=4
+        )
+        ttk.Label(options, text="融合预设").grid(
+            row=2, column=2, sticky="e", padx=4, pady=4
+        )
+        self.fusion_profile_box = ttk.Combobox(
+            options,
+            textvariable=self.fusion_profile_var,
+            values=list(FUSION_PROFILE_LABELS),
+            state="readonly",
+            width=10,
+        )
+        self.fusion_profile_box.grid(
+            row=2, column=3, sticky="w", padx=4, pady=4
+        )
         options.columnconfigure(6, weight=1)
 
         progress_frame = ttk.Frame(self.win)
@@ -278,6 +339,7 @@ class TranscriptionDialog:
             justify="left",
             foreground="#555",
         ).pack(fill="x", anchor="w")
+        self._build_stem_panel(right)
 
         actions = ttk.Frame(self.win)
         actions.pack(
@@ -292,11 +354,14 @@ class TranscriptionDialog:
         )
         self.regenerate_btn.pack(side="left", padx=(0, 6))
         self.preview_btn = ttk.Button(
-            actions, text="本地试听", command=self.preview_current, state="disabled"
+            actions,
+            text="光遇音色试听",
+            command=self.preview_current,
+            state="disabled",
         )
         self.preview_btn.pack(side="left", padx=6)
         self.stop_preview_btn = ttk.Button(
-            actions, text="停止试听", command=self.preview_player.stop, state="normal"
+            actions, text="停止试听", command=self.stop_all_previews, state="normal"
         )
         self.stop_preview_btn.pack(side="left", padx=6)
         self.save_btn = ttk.Button(
@@ -310,6 +375,40 @@ class TranscriptionDialog:
         self.cancel_btn = ttk.Button(actions, text="取消", command=self.cancel)
         self.cancel_btn.pack(side="right", padx=(6, 0))
         ttk.Button(actions, text="关闭", command=self.close).pack(side="right")
+
+    def _build_stem_panel(self, parent: ttk.Frame) -> None:
+        frame = ttk.LabelFrame(parent, text="六轨分离（原声试听）", padding=6)
+        frame.pack(fill="x", pady=(8, 0))
+        for row, stem in enumerate(STEM_LABELS):
+            if stem == "drums":
+                toggle = ttk.Checkbutton(
+                    frame,
+                    text="鼓点用于节奏",
+                    variable=self.use_drum_timing_var,
+                )
+            else:
+                toggle = ttk.Checkbutton(
+                    frame,
+                    text=f"{STEM_LABELS[stem]}参与琴谱",
+                    variable=self.stem_enabled_vars[stem],
+                )
+            toggle.grid(row=row, column=0, sticky="w", padx=(0, 8), pady=1)
+            status = ttk.Label(frame, text="尚未生成", foreground="#667")
+            status.grid(row=row, column=1, sticky="w", padx=4, pady=1)
+            preview = ttk.Button(
+                frame,
+                text="试听原声",
+                width=10,
+                command=lambda value=stem: self.preview_stem(value),
+                state="disabled",
+            )
+            preview.grid(row=row, column=2, sticky="e", padx=(8, 0), pady=1)
+            self.stem_controls[stem] = {
+                "toggle": toggle,
+                "status": status,
+                "preview": preview,
+            }
+        frame.columnconfigure(1, weight=1)
 
     def _build_source_tabs(self) -> None:
         sources = ttk.Notebook(self.win)
@@ -884,11 +983,18 @@ class TranscriptionDialog:
                 )
 
             def transcribe_progress(stage: str, fraction: float, message: str) -> None:
-                stage_start, stage_weight = {
-                    "decode": (0.40, 0.05),
-                    "transcribe": (0.45, 0.45),
-                    "arrange": (0.90, 0.10),
-                }.get(stage, (0.40, 0.60))
+                if options.mode == "stem_fusion":
+                    stage_start, stage_weight = {
+                        "separate": (0.40, 0.30),
+                        "transcribe": (0.70, 0.22),
+                        "arrange": (0.92, 0.08),
+                    }.get(stage, (0.40, 0.60))
+                else:
+                    stage_start, stage_weight = {
+                        "decode": (0.40, 0.05),
+                        "transcribe": (0.45, 0.45),
+                        "arrange": (0.90, 0.10),
+                    }.get(stage, (0.40, 0.60))
                 self._after(
                     self._apply_progress,
                     stage_start + stage_weight * fraction,
@@ -901,6 +1007,7 @@ class TranscriptionDialog:
                 options,
                 self.cancel_event,
                 transcribe_progress,
+                job_dir,
             )
             result = replace(
                 result,
@@ -959,6 +1066,11 @@ class TranscriptionDialog:
         octave_text = self.octave_var.get()
         source_key = None if self.key_var.get() == "自动" else self.key_var.get()
         octave = None if octave_text == "自动" else int(octave_text)
+        enabled_stems = tuple(
+            stem
+            for stem in DEFAULT_ENABLED_STEMS
+            if self.stem_enabled_vars[stem].get()
+        )
         return TranscriptionOptions(
             mode=MODE_LABELS[self.mode_var.get()],
             sensitivity=SENSITIVITY_LABELS[self.sensitivity_var.get()],
@@ -966,6 +1078,11 @@ class TranscriptionDialog:
             octave_shift=octave,
             quantize=QUANTIZE_LABELS[self.quantize_var.get()],
             max_polyphony=int(self.polyphony_var.get()),
+            repeat_cleanup=REPEAT_CLEANUP_LABELS[self.repeat_cleanup_var.get()],
+            enabled_stems=enabled_stems,
+            use_drum_timing=bool(self.use_drum_timing_var.get()),
+            fusion_profile=FUSION_PROFILE_LABELS[self.fusion_profile_var.get()],
+            instrumental_policy="smart_fill",
         )
 
     def _set_busy(self, busy: bool) -> None:
@@ -1001,6 +1118,7 @@ class TranscriptionDialog:
             )
             has_next = (self.search_page + 1) * self.search_limit < self.search_total
             self.netease_next_btn.config(state="normal" if has_next else "disabled")
+        self._update_stem_panel(self._current_result())
 
     def generate_all(self) -> None:
         if self.busy:
@@ -1032,18 +1150,31 @@ class TranscriptionDialog:
                 break
 
             def progress(stage: str, fraction: float, message: str) -> None:
-                stage_start, stage_weight = {
-                    "decode": (0.00, 0.10),
-                    "transcribe": (0.10, 0.75),
-                    "arrange": (0.85, 0.15),
-                }.get(stage, (0.0, 1.0))
+                if options.mode == "stem_fusion":
+                    stage_start, stage_weight = {
+                        "separate": (0.00, 0.45),
+                        "transcribe": (0.45, 0.45),
+                        "arrange": (0.90, 0.10),
+                    }.get(stage, (0.0, 1.0))
+                else:
+                    stage_start, stage_weight = {
+                        "decode": (0.00, 0.10),
+                        "transcribe": (0.10, 0.75),
+                        "arrange": (0.85, 0.15),
+                    }.get(stage, (0.0, 1.0))
                 file_fraction = stage_start + stage_weight * fraction
                 overall = (index + file_fraction) / max(1, total)
                 self._after(self._apply_progress, overall, message, os.path.basename(path))
 
             try:
+                temp_root = self._temp_root
+                workspace = temp_root.name if temp_root is not None else None
                 result = transcribe_draft(
-                    path, options, self.cancel_event, progress
+                    path,
+                    options,
+                    self.cancel_event,
+                    progress,
+                    workspace,
                 )
                 self._after(self._record_result, path, result, None)
             except CancelledError:
@@ -1077,7 +1208,14 @@ class TranscriptionDialog:
     ) -> None:
         index = self._file_index(path)
         if result is not None:
+            previous = self.results.get(path)
             self.results[path] = result
+            if (
+                previous is not None
+                and previous.artifact_root
+                and previous.artifact_root != result.artifact_root
+            ):
+                cleanup_result_artifacts(previous)
             self.errors.pop(path, None)
             self.file_list.delete(index)
             self.file_list.insert(
@@ -1135,7 +1273,22 @@ class TranscriptionDialog:
         if result is None:
             self.stats_var.set(self.errors.get(path, "草稿尚未完成"))
             self.timeline.delete("all")
+            self._update_stem_panel(None)
             return
+        if result.options.mode == "stem_fusion":
+            enabled = set(result.options.enabled_stems)
+            for stem, variable in self.stem_enabled_vars.items():
+                variable.set(stem in enabled)
+            self.use_drum_timing_var.set(result.options.use_drum_timing)
+            profile_label = next(
+                (
+                    label
+                    for label, value in FUSION_PROFILE_LABELS.items()
+                    if value == result.options.fusion_profile
+                ),
+                "人声优先",
+            )
+            self.fusion_profile_var.set(profile_label)
         stats = result.stats
         warning = f"\n提示：{'；'.join(result.warnings)}" if result.warnings else ""
         self.stats_var.set(
@@ -1143,9 +1296,43 @@ class TranscriptionDialog:
             f"移调：{result.semitone_shift:+d} 半音    八度：{result.octave_shift:+d} 半音\n"
             f"BPM：{result.bpm:.1f}    音符：{len(result.song_notes)}    "
             f"和弦：{stats.get('chord_count', 0)}    折叠：{stats.get('folded_count', 0)}    "
-            f"过滤：{stats.get('filtered_count', 0)}{warning}"
+            f"过滤：{stats.get('filtered_count', 0)}\n"
+            f"参考节拍：{stats.get('timing_reference_bpm', result.bpm):.1f} BPM    "
+            f"合并碎片：{stats.get('source_fragment_merged_count', 0)}    "
+            f"抑制重复：{stats.get('mapped_repeat_suppressed_count', 0)}{warning}"
         )
+        self._update_stem_panel(result)
         self._draw_timeline()
+
+    def _update_stem_panel(
+        self,
+        result: Optional[TranscriptionResult],
+    ) -> None:
+        for stem, controls in self.stem_controls.items():
+            status = controls["status"]
+            preview = controls["preview"]
+            toggle = controls["toggle"]
+            if result is None or stem not in result.stems:
+                status.config(text="尚未生成")
+                preview.config(state="disabled")
+                toggle.config(state="normal" if not self.busy else "disabled")
+                continue
+            stem_result = result.stems[stem]
+            if stem == "drums":
+                beat_count = int(stem_result.stats.get("beat_count", 0))
+                text = f"{beat_count} 个节拍"
+            else:
+                text = f"{len(stem_result.events)} 个音符"
+            if stem_result.warnings:
+                detail = str(stem_result.warnings[0]).replace("\n", " ")
+                text += f" · 提示：{detail[:32]}"
+            status.config(text=text)
+            preview.config(
+                state="normal"
+                if os.path.isfile(stem_result.audio_path) and not self.busy
+                else "disabled"
+            )
+            toggle.config(state="normal" if not self.busy else "disabled")
 
     def _draw_timeline(self) -> None:
         canvas = self.timeline
@@ -1222,8 +1409,14 @@ class TranscriptionDialog:
                         previous, options, self.cancel_event, progress
                     )
                 else:
+                    temp_root = self._temp_root
+                    workspace = temp_root.name if temp_root is not None else None
                     updated = transcribe_draft(
-                        path, options, self.cancel_event, progress
+                        path,
+                        options,
+                        self.cancel_event,
+                        progress,
+                        workspace,
                     )
                 self._after(self._record_result, path, updated, None)
                 self._after(self._finish_regenerate, None)
@@ -1249,15 +1442,112 @@ class TranscriptionDialog:
 
     def preview_current(self) -> None:
         result = self._current_result()
-        if result is None:
+        if result is None or self._preview_preparing:
             return
+        self.stem_preview_player.stop()
+        if self.preview_player.state in (
+            PlaybackState.PLAYING,
+            PlaybackState.PAUSED,
+        ):
+            state = self.preview_player.pause_or_resume()
+            if state == PlaybackState.PAUSED:
+                self.preview_btn.config(text="继续光遇音色试听")
+                self.status_var.set("光遇音色试听已暂停")
+            else:
+                self.preview_btn.config(text="暂停光遇音色试听")
+                self.status_var.set("正在使用光遇游戏音色试听")
+            return
+        if self.preview_player.prepared:
+            self._start_score_preview(result)
+            return
+
+        self._preview_preparing = True
+        self.preview_btn.config(state="disabled", text="准备光遇音色…")
+        self.status_var.set("正在准备光遇游戏音色…")
+
+        def worker() -> None:
+            try:
+                def progress(completed: int, total: int, _index: int) -> None:
+                    self._after(
+                        self.status_var.set,
+                        f"正在准备光遇游戏音色… {completed}/{total}",
+                    )
+
+                self.preview_player.prepare(progress_callback=progress)
+                self._after(self._finish_preview_prepare, result, None)
+            except Exception as exc:
+                self._after(self._finish_preview_prepare, result, str(exc))
+
+        self._start_worker(worker)
+
+    def _finish_preview_prepare(
+        self,
+        result: TranscriptionResult,
+        error: Optional[str],
+    ) -> None:
+        self._preview_preparing = False
+        if error:
+            self.preview_btn.config(
+                state="normal" if self._current_result() else "disabled",
+                text="光遇音色试听",
+            )
+            self.status_var.set("光遇音色准备失败")
+            messagebox.showerror("试听失败", error, parent=self.win)
+            return
+        self._start_score_preview(result)
+
+    def _start_score_preview(self, result: TranscriptionResult) -> None:
         try:
-            self.status_var.set("正在生成本地试听…")
             self.preview_player.play(result)
-            self.status_var.set("正在本地试听")
+            self.preview_btn.config(text="暂停光遇音色试听")
+            self.status_var.set("正在使用光遇游戏音色试听")
         except Exception as exc:
+            self.preview_btn.config(text="光遇音色试听")
             messagebox.showerror("试听失败", str(exc), parent=self.win)
             self.status_var.set("试听失败")
+
+    def preview_stem(self, stem: StemKind) -> None:
+        result = self._current_result()
+        if result is None or stem not in result.stems:
+            return
+        self.preview_player.stop()
+        try:
+            self.stem_preview_player.play(result.stems[stem].audio_path)
+            self.preview_btn.config(text="光遇音色试听")
+            self.status_var.set(f"正在试听{STEM_LABELS[stem]}分轨原声")
+        except Exception as exc:
+            messagebox.showerror("分轨试听失败", str(exc), parent=self.win)
+            self.status_var.set("分轨试听失败")
+
+    def stop_all_previews(self) -> None:
+        self.preview_player.stop()
+        self.stem_preview_player.stop()
+        if not self.closed:
+            self.preview_btn.config(
+                text="光遇音色试听",
+                state="normal" if self._current_result() and not self.busy else "disabled",
+            )
+            self.status_var.set("试听已停止")
+
+    def _on_score_preview_status(self, message: str) -> None:
+        self._after(self.status_var.set, message)
+
+    def _on_score_preview_finished(self) -> None:
+        self._after(self._finish_score_preview_ui)
+
+    def _finish_score_preview_ui(self) -> None:
+        self.preview_btn.config(
+            text="光遇音色试听",
+            state="normal" if self._current_result() and not self.busy else "disabled",
+        )
+        self.status_var.set("光遇音色试听结束")
+
+    def _on_score_preview_error(self, exc: Exception) -> None:
+        self._after(self._show_score_preview_error, str(exc))
+
+    def _show_score_preview_error(self, detail: str) -> None:
+        self.stop_all_previews()
+        messagebox.showerror("光遇音色试听失败", detail, parent=self.win)
 
     def save_current(self) -> None:
         path = self._selected_path()
@@ -1344,7 +1634,8 @@ class TranscriptionDialog:
     def close(self) -> None:
         self.closed = True
         self.cancel_event.set()
-        self.preview_player.stop()
+        self.stem_preview_player.stop()
+        self.preview_player.close()
         try:
             self.win.destroy()
         except Exception:

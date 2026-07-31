@@ -123,16 +123,7 @@ class Transcriber:
             "transcribedBy": "SkyAutoMusic",
             "bpm": int(round(bpm if bpm is not None else result.bpm)),
             "songNotes": list(result.song_notes),
-            "_transcribe": {
-                "schemaVersion": 1,
-                "engine": result.engine,
-                "sourceFile": result.source_file,
-                "detectedKey": result.detected_key,
-                "semitoneShift": result.semitone_shift,
-                "octaveShift": result.octave_shift,
-                "quantize": result.options.quantize,
-                "maxPolyphony": result.options.max_polyphony,
-            },
+            "_transcribe": self._transcribe_metadata(result),
             "_transcribe_stats": dict(result.stats),
         }
 
@@ -160,6 +151,33 @@ class Transcriber:
         return output_path, song
 
     @staticmethod
+    def _transcribe_metadata(result: TranscriptionResult) -> Dict[str, Any]:
+        metadata: Dict[str, Any] = {
+            "schemaVersion": 2,
+            "engine": result.engine,
+            "sourceFile": result.source_file,
+            "detectedKey": result.detected_key,
+            "semitoneShift": result.semitone_shift,
+            "octaveShift": result.octave_shift,
+            "quantize": result.options.quantize,
+            "maxPolyphony": result.options.max_polyphony,
+            "repeatCleanup": result.options.repeat_cleanup,
+        }
+        if result.options.mode == "stem_fusion":
+            metadata.update({
+                "separationModel": result.separation_model,
+                "enabledStems": list(result.options.enabled_stems),
+                "useDrumTiming": result.options.use_drum_timing,
+                "fusionProfile": result.options.fusion_profile,
+                "instrumentalPolicy": result.options.instrumental_policy,
+                "stemEngines": {
+                    stem: stem_result.engine
+                    for stem, stem_result in result.stems.items()
+                },
+            })
+        return metadata
+
+    @staticmethod
     def transcribe_to_song_dict(
         result: TranscriptionResult,
         song_name: str,
@@ -169,16 +187,7 @@ class Transcriber:
             "transcribedBy": "SkyAutoMusic",
             "bpm": int(round(result.bpm or 120.0)),
             "songNotes": list(result.song_notes),
-            "_transcribe": {
-                "schemaVersion": 1,
-                "engine": result.engine,
-                "sourceFile": result.source_file,
-                "detectedKey": result.detected_key,
-                "semitoneShift": result.semitone_shift,
-                "octaveShift": result.octave_shift,
-                "quantize": result.options.quantize,
-                "maxPolyphony": result.options.max_polyphony,
-            },
+            "_transcribe": Transcriber._transcribe_metadata(result),
             "_transcribe_stats": dict(result.stats),
         }
 
@@ -206,11 +215,19 @@ class Transcriber:
 
             def pipeline_progress(stage: str, fraction: float, message: str) -> None:
                 if progress_cb:
-                    stage_start, stage_weight = {
-                        "decode": (0.00, 0.10),
-                        "transcribe": (0.10, 0.75),
-                        "arrange": (0.85, 0.15),
-                    }.get(stage, (0.0, 1.0))
+                    active_options = options or self.options
+                    if active_options.mode == "stem_fusion":
+                        stage_start, stage_weight = {
+                            "separate": (0.00, 0.45),
+                            "transcribe": (0.45, 0.45),
+                            "arrange": (0.90, 0.10),
+                        }.get(stage, (0.0, 1.0))
+                    else:
+                        stage_start, stage_weight = {
+                            "decode": (0.00, 0.10),
+                            "transcribe": (0.10, 0.75),
+                            "arrange": (0.85, 0.15),
+                        }.get(stage, (0.0, 1.0))
                     file_fraction = stage_start + stage_weight * max(
                         0.0, min(1.0, fraction)
                     )

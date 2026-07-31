@@ -65,6 +65,13 @@ def _notify(
         progress_cb(stage, max(0.0, min(1.0, float(fraction))), message)
 
 
+def _normalized_interval_ms(start_ms: float, end_ms: float) -> Tuple[int, int]:
+    """Normalize third-party timestamps before constructing a strict NoteEvent."""
+    start_value = max(0, int(round(float(start_ms))))
+    end_value = max(start_value + 1, int(round(float(end_ms))))
+    return start_value, end_value
+
+
 def _load_audio(path: str, progress_cb: Optional[ProgressCallback]):
     _notify(progress_cb, "decode", 0.0, "正在解码音频")
     try:
@@ -143,9 +150,13 @@ def transcribe_midi(
             ignored_drums += len(instrument.notes)
             continue
         for note in instrument.notes:
+            start_ms, end_ms = _normalized_interval_ms(
+                note.start * 1000,
+                note.end * 1000,
+            )
             events.append(NoteEvent(
-                start_ms=max(0, int(round(note.start * 1000))),
-                end_ms=max(0, int(round(note.end * 1000))),
+                start_ms=start_ms,
+                end_ms=end_ms,
                 midi_pitch=int(note.pitch),
                 strength=max(0.0, min(1.0, note.velocity / 127.0)),
                 source="midi",
@@ -198,15 +209,21 @@ def _stabilize_pitch_frames(values: Sequence[Optional[int]], min_frames: int = 3
     return stable
 
 
-def _monophonic_chunk(y, sr: int, voiced_threshold: float) -> List[NoteEvent]:
+def _monophonic_chunk(
+    y,
+    sr: int,
+    voiced_threshold: float,
+    min_midi: int = 36,
+    max_midi: int = 96,
+) -> List[NoteEvent]:
     import librosa
     import numpy as np
 
     hop_length = 256
     f0, voiced_flag, voiced_prob = librosa.pyin(
         y,
-        fmin=librosa.note_to_hz("C2"),
-        fmax=librosa.note_to_hz("C7"),
+        fmin=librosa.midi_to_hz(min_midi),
+        fmax=librosa.midi_to_hz(max_midi),
         sr=sr,
         hop_length=hop_length,
     )
@@ -239,17 +256,24 @@ def _monophonic_chunk(y, sr: int, voiced_threshold: float) -> List[NoteEvent]:
             end_sec = start_sec + hop_length / sr
         if len(onset_times):
             closest = min(onset_times, key=lambda item: abs(float(item) - start_sec))
-            if abs(float(closest) - start_sec) <= 0.08:
-                start_sec = max(0.0, float(closest))
+            onset_sec = max(0.0, float(closest))
+            # Backtracked onsets can occasionally land after a very short pYIN
+            # segment.  Do not turn that segment into a reversed interval.
+            if abs(onset_sec - start_sec) <= 0.08 and onset_sec < end_sec:
+                start_sec = onset_sec
         strength_values = [
             float(probability)
             for probability in voiced_prob[start:end]
             if math.isfinite(float(probability))
         ]
         strength = sum(strength_values) / len(strength_values) if strength_values else 0.5
+        start_ms, end_ms = _normalized_interval_ms(
+            start_sec * 1000,
+            end_sec * 1000,
+        )
         events.append(NoteEvent(
-            start_ms=int(round(start_sec * 1000)),
-            end_ms=int(round(end_sec * 1000)),
+            start_ms=start_ms,
+            end_ms=end_ms,
             midi_pitch=int(value),
             strength=strength,
             source="pyin",
@@ -262,6 +286,8 @@ def transcribe_monophonic(
     sensitivity: str = "normal",
     cancel_event: Optional[threading.Event] = None,
     progress_cb: Optional[ProgressCallback] = None,
+    min_midi: int = 36,
+    max_midi: int = 96,
 ) -> BackendOutput:
     y, sr = _load_audio(path, progress_cb)
     _check_cancel(cancel_event)
@@ -280,7 +306,20 @@ def transcribe_monophonic(
         )
         start_sample = int(round(read_start * sr))
         end_sample = int(round(read_end * sr))
-        local = _monophonic_chunk(y[start_sample:end_sample], sr, voiced_threshold)
+        if min_midi == 36 and max_midi == 96:
+            local = _monophonic_chunk(
+                y[start_sample:end_sample],
+                sr,
+                voiced_threshold,
+            )
+        else:
+            local = _monophonic_chunk(
+                y[start_sample:end_sample],
+                sr,
+                voiced_threshold,
+                min_midi,
+                max_midi,
+            )
         final = index == len(regions) - 1
         for event in local:
             shifted = event.shifted(int(round(read_start * 1000)))
@@ -323,6 +362,8 @@ class BasicPitchBackend:
         sensitivity: str = "normal",
         cancel_event: Optional[threading.Event] = None,
         progress_cb: Optional[ProgressCallback] = None,
+        min_midi: int = 36,
+        max_midi: int = 96,
     ) -> BackendOutput:
         y, sr = _load_audio(path, progress_cb)
         _check_cancel(cancel_event)
@@ -341,8 +382,8 @@ class BasicPitchBackend:
                 "缺少 Basic Pitch、soundfile 或 librosa，无法使用复音模式"
             ) from exc
         model = self._load_model()
-        min_frequency = float(librosa.note_to_hz("C2"))
-        max_frequency = float(librosa.note_to_hz("C7"))
+        min_frequency = float(librosa.midi_to_hz(min_midi))
+        max_frequency = float(librosa.midi_to_hz(max_midi))
 
         with tempfile.TemporaryDirectory(prefix="sky-transcribe-") as temp_dir:
             for index, (core_start, core_end, read_start, read_end) in enumerate(regions):
@@ -374,11 +415,29 @@ class BasicPitchBackend:
 
                 final = index == len(regions) - 1
                 for start_sec, end_sec, pitch, strength, _pitch_bends in note_events:
+                    try:
+                        absolute_start = (float(start_sec) + read_start) * 1000
+                        absolute_end = (float(end_sec) + read_start) * 1000
+                        if not (
+                            math.isfinite(absolute_start)
+                            and math.isfinite(absolute_end)
+                            and math.isfinite(float(strength))
+                        ):
+                            continue
+                        start_ms, end_ms = _normalized_interval_ms(
+                            absolute_start,
+                            absolute_end,
+                        )
+                        midi_pitch = int(round(float(pitch)))
+                        if not 0 <= midi_pitch <= 127:
+                            continue
+                    except (TypeError, ValueError, OverflowError):
+                        continue
                     event = NoteEvent(
-                        start_ms=int(round((float(start_sec) + read_start) * 1000)),
-                        end_ms=int(round((float(end_sec) + read_start) * 1000)),
-                        midi_pitch=int(pitch),
-                        strength=float(strength),
+                        start_ms=start_ms,
+                        end_ms=end_ms,
+                        midi_pitch=midi_pitch,
+                        strength=max(0.0, min(1.0, float(strength))),
                         source="basic_pitch",
                     )
                     if _owned_by_core(event, core_start, core_end, final):
@@ -400,5 +459,28 @@ def transcribe_polyphonic(
     sensitivity: str = "normal",
     cancel_event: Optional[threading.Event] = None,
     progress_cb: Optional[ProgressCallback] = None,
+    min_midi: int = 36,
+    max_midi: int = 96,
 ) -> BackendOutput:
-    return _BASIC_PITCH_BACKEND.transcribe(path, sensitivity, cancel_event, progress_cb)
+    return _BASIC_PITCH_BACKEND.transcribe(
+        path,
+        sensitivity,
+        cancel_event,
+        progress_cb,
+        min_midi,
+        max_midi,
+    )
+
+
+def estimate_audio_timing(
+    path: str,
+    cancel_event: Optional[threading.Event] = None,
+    progress_cb: Optional[ProgressCallback] = None,
+) -> Tuple[float, List[int], float]:
+    """Estimate one shared beat map without producing pitched note events."""
+
+    y, sr = _load_audio(path, progress_cb)
+    _check_cancel(cancel_event)
+    bpm, beat_times = _estimate_beats(y, sr)
+    duration = len(y) / max(1, sr)
+    return bpm, beat_times, duration

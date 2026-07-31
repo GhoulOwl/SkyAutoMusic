@@ -36,6 +36,7 @@ from transcription.models import (  # noqa: E402
 from transcription.pipeline import (  # noqa: E402
     export_song_json,
     next_available_path,
+    rearrange_draft,
     transcribe_draft,
 )
 from transcription.preview import PREVIEW_SR, render_preview_wav  # noqa: E402
@@ -148,6 +149,187 @@ class TestKeyAndArrangement(unittest.TestCase):
         quantized = quantize_events(events, "1/16", 120, [0, 500, 1000])
         self.assertEqual(quantized[0].start_ms, 125)
         self.assertEqual(quantized[1].start_ms, 190)
+
+    def test_default_repeat_cleanup_is_auto_and_validated(self):
+        self.assertEqual(TranscriptionOptions().repeat_cleanup, "auto")
+        for mode in ("off", "auto", "strong"):
+            self.assertEqual(
+                TranscriptionOptions(repeat_cleanup=mode).repeat_cleanup,
+                mode,
+            )
+        with self.assertRaises(ValueError):
+            TranscriptionOptions(repeat_cleanup="invalid")
+
+    def test_fragmented_sustained_note_is_merged_at_detected_tempo(self):
+        notes, *_rest, stats = arrange_events(
+            [
+                event(0, 60, duration=180),
+                event(200, 60, duration=180),
+                event(400, 60, duration=180),
+            ],
+            TranscriptionOptions(source_key="C major", octave_shift=0),
+            bpm=300,
+            beat_times_ms=[0, 200, 400, 600],
+        )
+        self.assertEqual(notes, [{"time": 0, "key": "1Key0"}])
+        self.assertEqual(stats["source_fragment_merged_count"], 2)
+        self.assertEqual(stats["timing_reference_bpm"], 150.0)
+
+    def test_clear_same_pitch_rearticulation_is_preserved_in_auto_mode(self):
+        notes, *_rest, stats = arrange_events(
+            [
+                event(0, 60, duration=80),
+                event(200, 60, duration=80),
+            ],
+            TranscriptionOptions(
+                source_key="C major",
+                octave_shift=0,
+                repeat_cleanup="auto",
+            ),
+            bpm=150,
+            beat_times_ms=[0, 400, 800],
+        )
+        self.assertEqual([note["time"] for note in notes], [0, 200])
+        self.assertEqual(stats["intentional_repeat_preserved_count"], 1)
+        self.assertEqual(stats["mapped_repeat_suppressed_count"], 0)
+
+    def test_a_b_a_melody_is_not_treated_as_consecutive_repeat(self):
+        notes, *_rest, stats = arrange_events(
+            [
+                event(0, 60, duration=50),
+                event(100, 62, duration=50),
+                event(200, 60, duration=50),
+            ],
+            TranscriptionOptions(
+                source_key="C major",
+                octave_shift=0,
+                repeat_cleanup="strong",
+            ),
+            bpm=150,
+            beat_times_ms=[0, 400, 800],
+        )
+        self.assertEqual(
+            [note["key"] for note in notes],
+            ["1Key0", "1Key1", "1Key0"],
+        )
+        self.assertEqual(stats["mapped_repeat_suppressed_count"], 0)
+
+    def test_octave_fold_collision_does_not_retrigger_same_sky_key(self):
+        notes, *_rest, stats = arrange_events(
+            [
+                event(0, 48, duration=50),
+                event(150, 60, duration=50),
+            ],
+            TranscriptionOptions(source_key="C major", octave_shift=0),
+            bpm=120,
+            beat_times_ms=[0, 500, 1000],
+        )
+        self.assertEqual(notes, [{"time": 0, "key": "1Key0"}])
+        self.assertEqual(stats["mapped_repeat_suppressed_count"], 1)
+
+    def test_repeat_cleanup_scales_with_song_tempo(self):
+        for bpm in (60, 120, 180):
+            beat_ms = 60000.0 / bpm
+            second_start = int(round(beat_ms * 0.25))
+            duration = max(1, int(round(beat_ms * 0.10)))
+            notes, *_rest, stats = arrange_events(
+                [
+                    event(0, 48, duration=duration),
+                    event(second_start, 60, duration=duration),
+                ],
+                TranscriptionOptions(source_key="C major", octave_shift=0),
+                bpm=bpm,
+                beat_times_ms=[
+                    0,
+                    int(round(beat_ms)),
+                    int(round(beat_ms * 2)),
+                ],
+            )
+            self.assertEqual(len(notes), 1, f"bpm={bpm}")
+            self.assertEqual(
+                stats["mapped_repeat_suppressed_count"],
+                1,
+                f"bpm={bpm}",
+            )
+
+    def test_repeat_cleanup_uses_local_tempo_for_variable_speed_song(self):
+        notes, *_rest, stats = arrange_events(
+            [
+                event(0, 48, duration=50),
+                event(250, 60, duration=50),
+                event(10000, 48, duration=50),
+                event(10250, 60, duration=50),
+            ],
+            TranscriptionOptions(source_key="C major", octave_shift=0),
+            bpm=100,
+            beat_times_ms=[
+                0,
+                800,
+                1600,
+                2400,
+                3200,
+                10000,
+                10333,
+                10666,
+                10999,
+                11332,
+            ],
+        )
+        self.assertEqual([note["time"] for note in notes], [0, 10000, 10250])
+        self.assertEqual(stats["mapped_repeat_suppressed_count"], 1)
+
+    def test_repeat_cleanup_uses_onset_fallback_without_beats_or_bpm(self):
+        notes, *_rest, stats = arrange_events(
+            [
+                event(0, 48, duration=50),
+                event(200, 60, duration=50),
+            ],
+            TranscriptionOptions(source_key="C major", octave_shift=0),
+            bpm=0,
+            beat_times_ms=[],
+        )
+        self.assertEqual(len(notes), 1)
+        self.assertEqual(stats["timing_reference_bpm"], 150.0)
+
+    def test_strong_and_off_repeat_cleanup_modes(self):
+        events = [
+            event(0, 60, duration=80),
+            event(200, 60, duration=80),
+        ]
+        common = {
+            "bpm": 150,
+            "beat_times_ms": [0, 400, 800],
+        }
+        auto_notes, *_ = arrange_events(
+            events,
+            TranscriptionOptions(
+                source_key="C major",
+                octave_shift=0,
+                repeat_cleanup="auto",
+            ),
+            **common,
+        )
+        strong_notes, *_ = arrange_events(
+            events,
+            TranscriptionOptions(
+                source_key="C major",
+                octave_shift=0,
+                repeat_cleanup="strong",
+            ),
+            **common,
+        )
+        off_notes, *_ = arrange_events(
+            events,
+            TranscriptionOptions(
+                source_key="C major",
+                octave_shift=0,
+                repeat_cleanup="off",
+            ),
+            **common,
+        )
+        self.assertEqual(len(auto_notes), 2)
+        self.assertEqual(len(strong_notes), 1)
+        self.assertEqual(len(off_notes), 2)
 
     def test_polyphony_options_accept_one_through_five(self):
         for value in range(1, 6):
@@ -287,6 +469,43 @@ class TestPipelineAndExport(unittest.TestCase):
             with self.assertRaises(CancelledError):
                 transcribe_draft(handle.name, cancel_event=cancelled)
 
+    def test_repeat_cleanup_rearranges_cached_events_without_retranscribing(self):
+        events = [
+            event(0, 60, duration=80),
+            event(200, 60, duration=80),
+        ]
+        original = TranscriptionResult(
+            events=events,
+            song_notes=[
+                {"time": 0, "key": "1Key0"},
+                {"time": 200, "key": "1Key0"},
+            ],
+            detected_key="C major",
+            bpm=150,
+            stats={},
+            warnings=[],
+            engine="basic_pitch",
+            source_file="song.wav",
+            beat_times_ms=[0, 400, 800],
+            options=TranscriptionOptions(
+                source_key="C major",
+                octave_shift=0,
+                repeat_cleanup="auto",
+            ),
+        )
+        updated = rearrange_draft(
+            original,
+            TranscriptionOptions(
+                source_key="C major",
+                octave_shift=0,
+                repeat_cleanup="strong",
+            ),
+        )
+        self.assertEqual(updated.events, events)
+        self.assertEqual(updated.engine, "basic_pitch")
+        self.assertEqual(updated.song_notes, [{"time": 0, "key": "1Key0"}])
+        self.assertEqual(updated.options.repeat_cleanup, "strong")
+
     def test_atomic_json_export_and_loader_compatibility(self):
         result = TranscriptionResult(
             events=[event(0, 60)],
@@ -308,6 +527,7 @@ class TestPipelineAndExport(unittest.TestCase):
                 payload = json.load(handle)[0]
             self.assertEqual(payload["transcribedBy"], "SkyAutoMusic")
             self.assertEqual(payload["_transcribe"]["sourceFile"], "source.wav")
+            self.assertEqual(payload["_transcribe"]["repeatCleanup"], "auto")
             self.assertFalse(any(name.endswith(".tmp") for name in os.listdir(directory)))
 
     def test_next_available_path_never_silently_overwrites(self):

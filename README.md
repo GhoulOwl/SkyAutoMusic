@@ -22,8 +22,9 @@ SkyAutoMusic 是一款用于自动演奏《Sky光遇》等游戏内乐器的Pyth
 - 半透明乐谱覆盖层：显示播放进度、音符密度与当前按键，F10 可解锁拖动位置
 - 诊断页：查看热键、游戏窗口、前台窗口、管理员权限、键盘输入方式与最近按键日志
 - 窗口大小和位置自动保存，下次启动自动恢复
-- 音频/MIDI 扒谱：支持 pYIN 单旋律、Basic Pitch ONNX 复音、自动转调和15键编配
-- 扒谱草稿可查看15键时间线、调整调性/八度/量化/复音数并本地合成试听
+- 音频智能扒谱：离线分离人声、鼓点、钢琴/键盘、贝斯、吉他与完整伴奏，按“人声主旋律优先”融合为15键光遇琴谱
+- 鼓点只校准 BPM、重拍和量化网格；专用乐器轨补充和声、低音，完整伴奏仅智能补漏
+- 扒谱草稿可查看15键时间线、调整调性/八度/量化/复音数和六轨开关；最终琴谱统一使用光遇钢琴音色试听
 - 网易云在线扒谱：支持关键词搜索、分页结果、加密 Cookie、yt-dlp 下载及自动生成可审核草稿
 - 适配Windows平台
 
@@ -38,10 +39,12 @@ pip install pyautogui keyboard psutil pywin32 interception-python
 
 ```bash
 pip install -r requirements.txt
+python scripts/fetch_separation_model.py
 ```
 
 发布版固定使用 Python 3.10，并通过 `requirements-lock.txt` 安装锁定依赖，使
-Basic Pitch 使用 ONNX Runtime；不打包 TensorFlow。
+Basic Pitch 使用 ONNX Runtime、Demucs 使用 CPU 版 PyTorch/Torchaudio；不打包
+TensorFlow 或 CUDA。完整 ZIP 已包含模型，只有源码运行需要执行上述模型获取脚本。
 
 ### 启用虚拟 HID / 驱动级键盘（可选，推荐）
 默认输入方式为"自动"，会优先尝试驱动级键盘；若未安装 Interception 驱动则自动回退到常规键盘（`keyboard` / `pyautogui`），不影响使用。
@@ -74,38 +77,46 @@ Basic Pitch 使用 ONNX Runtime；不打包 TensorFlow。
 6. 程序会自动检测Sky/光遇窗口并置顶，未检测到会提示。
 7. 窗口大小和位置、收藏数据等会自动保存，无需手动配置。
 8. 点击“生成乐谱”进入扒谱窗口：
-   - “本地文件”页可选择音频或 MIDI；音频默认使用 Basic Pitch 复音高质量模式，也可切换 pYIN 单旋律快速模式，MIDI 会忽略鼓轨。
+   - “本地文件”页可选择音频或 MIDI；音频默认使用智能六轨融合，MIDI 会自动绕过分离。
+   - 六轨面板可独立控制人声、钢琴/键盘、贝斯、吉他和完整伴奏是否参与琴谱；鼓点开关只影响节奏，不产生琴键音符。
+   - “单轨原声试听”播放分离出的真实 WAV；“光遇音色试听”播放融合后的15键琴谱，两者互斥。
+   - 可选择“人声优先 / 键盘优先 / 平衡”融合预设。轨道、调性、八度、量化、复音数和重复音设置变化只重新融合缓存结果。
    - “网易云在线”页可搜索歌曲并翻页；选择结果后点击“生成在线草稿”，程序会通过 yt-dlp 下载并用内置 FFmpeg 转成临时 WAV。
    - 生成结果先保存在内存草稿中；试听、调参后点击“保存当前”或“保存全部”才会写入乐谱文件夹。
    - 会员或登录歌曲可点击 Cookie 区的“编辑”，粘贴 Netscape 格式 `cookies.txt` 完整内容。程序仅保留网易云域名 Cookie，并使用 Windows DPAPI 按当前用户加密保存到 `netease_auth.json`。
 
-## 构建与发布（EXE）
+## 构建与发布（完整 ZIP 目录）
 
-本工具提供两种方式获取 Windows 可执行文件（exe）。内置钢琴音色会打包进 exe；**乐谱与配置文件不打包，需自行放置**（见下方说明）。
+智能分轨需要模型、运行库和许可证，因此发布版采用 PyInstaller `onedir`，并将完整目录压缩为
+`SkyAutoMusic-windows-x64.zip`。**不要只复制其中的 EXE**；乐谱与个人配置仍不打包。
 
 ### 方式一：GitHub Actions 自动构建（推荐）
 1. 进入仓库的 **Actions** 页面，选择 `Build EXE & Release` 工作流。
 2. 点击 **Run workflow**，可填写可选的 Release 名称，确认后即开始构建。
-3. 构建完成后，自动在 **Releases** 中生成 `build-<序号>` 版本，下载其中的 `SkyAutoMusic.exe` 即可。
+3. 构建完成后，自动在 **Releases** 中生成 `build-<序号>` 版本，下载并完整解压 `SkyAutoMusic-windows-x64.zip`。
 
 > 构建在 GitHub 云端 Windows 环境中完成（依赖 Windows API），无需本地环境。
 
 ### 方式二：本地用 PyInstaller 构建
 ```bash
 pip install -r requirements.txt pyinstaller==6.21.0
-pyinstaller --noconfirm --onefile --windowed --name SkyAutoMusic ^
+python scripts/fetch_separation_model.py
+pyinstaller --noconfirm --onedir --windowed --name SkyAutoMusic ^
   --hidden-import keyboard --hidden-import win32timezone ^
   --hidden-import interception --collect-all interception ^
   --add-data "assets/audio/sky/Piano;assets/audio/sky/Piano" ^
+  --add-data "assets/models/htdemucs_6s;assets/models/htdemucs_6s" ^
+  --add-data "THIRD_PARTY_LICENSES;THIRD_PARTY_LICENSES" ^
   --collect-all basic_pitch --collect-all onnxruntime ^
+  --collect-all demucs --collect-all sphn --collect-all torchaudio ^
   --collect-all yt_dlp --collect-all imageio_ffmpeg ^
   play_music_gui.py
 ```
-生成的 `dist/SkyAutoMusic.exe` 即为可执行文件。
+生成的 `dist/SkyAutoMusic/` 是完整运行目录，请整体压缩或分发。
 
 ### 运行 exe 前的准备
-- 将 `SkyAutoMusic.exe` 放到一个**有写入权限**的目录（如桌面或专门文件夹）。
-- 在该 exe **同级目录**放入 `Sheet Music/` 文件夹，并存放你的乐谱 JSON 文件。
+- 将 ZIP 完整解压到一个**有写入权限**的目录（如桌面或专门文件夹），不要移动或删除 `_internal`、模型和音色资源。
+- 在 `SkyAutoMusic.exe` **同级目录**放入 `Sheet Music/` 文件夹，并存放你的乐谱 JSON 文件。
 - 首次运行会自动在同目录生成 `config.json`、`favorites.json` 等配置文件，设置与收藏可持久化保存。
 
 ## 乐谱文件格式说明
@@ -130,6 +141,7 @@ pyinstaller --noconfirm --onefile --windowed --name SkyAutoMusic ^
 ## 特色功能说明
 - **收藏与分页**：右键曲谱可收藏，分页按钮切换显示全部/收藏曲谱。
 - **本地试听**：使用 `assets/audio/sky/Piano/0.mp3` 至 `14.mp3` 预览 JSON 曲谱；`1KeyN` 与 `2KeyN` 均映射到 `N.mp3`，缺失音色会从 Sky Music 自动下载并缓存。
+- **智能分轨**：使用 `htdemucs_6s` 离线分离六轨；模型或校验清单缺失、损坏时可切换为原有复音/单旋律模式继续扒谱。
 - **乐谱信息展示**：右侧主控区高亮显示歌名、作者、制谱人、文件名。
 - **稳定节奏播放**：播放器按乐谱 `time` 毫秒时间戳进行绝对时间调度，不按 BPM 重算节奏；BPM 字段主要作为乐谱元信息保留。
 - **虚拟 HID / 驱动级键盘**：在诊断页"键盘输入方式"可选择"自动 / 虚拟HID驱动级键盘 / 常规键盘"。驱动级模式通过 Interception 内核驱动在驱动层注入按键，兼容性更好；点击"校准驱动级键盘"可重新识别键盘设备。

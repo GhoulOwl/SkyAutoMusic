@@ -23,4 +23,6 @@ __pycache__/
 .dub/
 .pio/
 netease_auth.json
+assets/models/htdemucs_6s/*.th
+assets/models/htdemucs_6s/model-manifest.json
 

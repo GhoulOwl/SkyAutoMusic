@@ -29,22 +29,34 @@ jobs:
           pip install -r requirements-lock.txt
           pip install pyinstaller==6.21.0
 
-      - name: Verify ONNX transcription runtime
+      - name: Verify transcription runtimes
         run: |
-          python -c "import importlib.util; assert importlib.util.find_spec('onnxruntime'), 'onnxruntime missing'; assert importlib.util.find_spec('tensorflow') is None, 'TensorFlow must not be bundled'"
+          python -c "import importlib.util; assert importlib.util.find_spec('onnxruntime'), 'onnxruntime missing'; assert importlib.util.find_spec('demucs'), 'demucs missing'; assert importlib.util.find_spec('torch'), 'torch missing'; assert importlib.util.find_spec('tensorflow') is None, 'TensorFlow must not be bundled'"
+
+      - name: Fetch and verify bundled six-stem model
+        run: python scripts/fetch_separation_model.py
 
       - name: Run unit tests
         run: python -B -m unittest discover -s tests -v
 
+      - name: Smoke-test real CPU six-stem separation
+        run: python scripts/smoke_six_stem.py
+
       - name: Build with PyInstaller
         run: |
-          pyinstaller --noconfirm --onefile --windowed --name SkyAutoMusic `
+          pyinstaller --noconfirm --onedir --windowed --name SkyAutoMusic `
             --hidden-import keyboard `
             --hidden-import win32timezone `
+            --hidden-import torch `
             --add-data "assets/audio/sky/Piano;assets/audio/sky/Piano" `
+            --add-data "assets/models/htdemucs_6s;assets/models/htdemucs_6s" `
+            --add-data "THIRD_PARTY_LICENSES;THIRD_PARTY_LICENSES" `
             --hidden-import interception `
             --collect-all basic_pitch `
             --collect-all onnxruntime `
+            --collect-all demucs `
+            --collect-all sphn `
+            --collect-all torchaudio `
             --collect-all interception `
             --collect-all yt_dlp `
             --collect-all imageio_ffmpeg `
@@ -54,19 +66,33 @@ jobs:
         shell: pwsh
         run: |
           python tests/generate_transcriber_fixture.py transcriber-smoke.wav
-          $process = Start-Process -FilePath "dist/SkyAutoMusic.exe" `
+          $process = Start-Process -FilePath "dist/SkyAutoMusic/SkyAutoMusic.exe" `
             -ArgumentList "--transcriber-self-test", (Resolve-Path "transcriber-smoke.wav").Path `
             -WindowStyle Hidden `
             -Wait -PassThru
           if ($process.ExitCode -ne 0) {
             throw "Packaged transcriber self-test failed with exit code $($process.ExitCode)"
           }
+          $modelProcess = Start-Process -FilePath "dist/SkyAutoMusic/SkyAutoMusic.exe" `
+            -ArgumentList "--six-stem-model-self-test" `
+            -WindowStyle Hidden `
+            -Wait -PassThru
+          if ($modelProcess.ExitCode -ne 0) {
+            throw "Packaged six-stem model self-test failed with exit code $($modelProcess.ExitCode)"
+          }
+
+      - name: Create complete Windows ZIP
+        shell: pwsh
+        run: |
+          Compress-Archive -Path "dist/SkyAutoMusic" `
+            -DestinationPath "dist/SkyAutoMusic-windows-x64.zip" `
+            -CompressionLevel Optimal
 
       - name: Create Release
         uses: softprops/action-gh-release@v2
         with:
           tag_name: build-${{ github.run_number }}
           name: ${{ github.event.inputs.release_name != '' && github.event.inputs.release_name || format('Build {0}', github.run_number) }}
-          files: dist/SkyAutoMusic.exe
+          files: dist/SkyAutoMusic-windows-x64.zip
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

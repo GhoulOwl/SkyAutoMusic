@@ -21,9 +21,9 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r requirements-lock.txt
 
-      - name: Verify ONNX transcription runtime
+      - name: Verify transcription runtimes
         run: |
-          python -c "import importlib.util; assert importlib.util.find_spec('onnxruntime'), 'onnxruntime missing'; assert importlib.util.find_spec('tensorflow') is None, 'TensorFlow must not be installed'"
+          python -c "import importlib.util; assert importlib.util.find_spec('onnxruntime'), 'onnxruntime missing'; assert importlib.util.find_spec('demucs'), 'demucs missing'; assert importlib.util.find_spec('torch'), 'torch missing'; assert importlib.util.find_spec('tensorflow') is None, 'TensorFlow must not be installed'"
 
       - name: Run unit tests
         run: python -B -m unittest discover -s tests -v

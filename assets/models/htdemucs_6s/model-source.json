@@ -1,0 +1,8 @@
+{
+  "name": "htdemucs_6s",
+  "checkpoint": "5c90dfd2-34c22ccb.th",
+  "sha256Prefix": "34c22ccb",
+  "url": "https://dl.fbaipublicfiles.com/demucs/hybrid_transformer/5c90dfd2-34c22ccb.th",
+  "license": "MIT",
+  "project": "https://github.com/adefossez/demucs"
+}

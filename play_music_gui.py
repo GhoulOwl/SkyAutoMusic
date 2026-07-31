@@ -1189,7 +1189,24 @@ def run_transcriber_self_test(audio_path):
     return True
 
 
+def run_six_stem_model_self_test():
+    """供打包流水线验证随包 CPU 运行时、模型文件与完整 SHA-256。"""
+    from transcription.separation import DemucsStemSeparator
+
+    DemucsStemSeparator().prepare()
+    return True
+
+
 if __name__ == "__main__":
+    if "--six-stem-model-self-test" in sys.argv:
+        try:
+            run_six_stem_model_self_test()
+            sys.exit(0)
+        except Exception as exc:
+            try:
+                print(f"six-stem model self-test failed: {exc}", file=sys.stderr)
+            finally:
+                sys.exit(1)
     if "--transcriber-self-test" in sys.argv:
         try:
             arg_index = sys.argv.index("--transcriber-self-test")
