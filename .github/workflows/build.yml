@@ -33,14 +33,14 @@ jobs:
         run: |
           python -c "import importlib.util; assert importlib.util.find_spec('onnxruntime'), 'onnxruntime missing'; assert importlib.util.find_spec('demucs'), 'demucs missing'; assert importlib.util.find_spec('torch'), 'torch missing'; assert importlib.util.find_spec('tensorflow') is None, 'TensorFlow must not be bundled'"
 
-      - name: Fetch and verify bundled six-stem model
+      - name: Fetch and verify bundled separation model
         run: python scripts/fetch_separation_model.py
 
       - name: Run unit tests
         run: python -B -m unittest discover -s tests -v
 
-      - name: Smoke-test real CPU six-stem separation
-        run: python scripts/smoke_six_stem.py
+      - name: Smoke-test real CPU vocal/accompaniment separation
+        run: python scripts/smoke_separation.py
 
       - name: Build with PyInstaller
         run: |
@@ -74,11 +74,11 @@ jobs:
             throw "Packaged transcriber self-test failed with exit code $($process.ExitCode)"
           }
           $modelProcess = Start-Process -FilePath "dist/SkyAutoMusic/SkyAutoMusic.exe" `
-            -ArgumentList "--six-stem-model-self-test" `
+            -ArgumentList "--separation-model-self-test" `
             -WindowStyle Hidden `
             -Wait -PassThru
           if ($modelProcess.ExitCode -ne 0) {
-            throw "Packaged six-stem model self-test failed with exit code $($modelProcess.ExitCode)"
+            throw "Packaged separation model self-test failed with exit code $($modelProcess.ExitCode)"
           }
 
       - name: Create complete Windows ZIP

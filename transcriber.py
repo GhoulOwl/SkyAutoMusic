@@ -40,7 +40,7 @@ class TranscribeStats:
 
     def __init__(self, values: Optional[Dict[str, Any]] = None):
         values = dict(values or {})
-        self.onset_count = int(values.get("raw_event_count", values.get("onset_count", 0)))
+        self.onset_count = int(values.get("onset_count", values.get("raw_event_count", 0)))
         self.note_count = int(values.get("arranged_note_count", values.get("note_count", 0)))
         self.clamped_low = int(values.get("clamped_low", 0))
         self.clamped_high = int(values.get("clamped_high", 0))
@@ -158,21 +158,24 @@ class Transcriber:
             "sourceFile": result.source_file,
             "detectedKey": result.detected_key,
             "semitoneShift": result.semitone_shift,
-            "octaveShift": result.octave_shift,
-            "quantize": result.options.quantize,
+            "arrangementPreset": result.options.arrangement_preset,
             "maxPolyphony": result.options.max_polyphony,
-            "repeatCleanup": result.options.repeat_cleanup,
         }
-        if result.options.mode == "stem_fusion":
+        if result.analysis is not None:
+            analysis = result.analysis
             metadata.update({
                 "separationModel": result.separation_model,
-                "enabledStems": list(result.options.enabled_stems),
-                "useDrumTiming": result.options.use_drum_timing,
-                "fusionProfile": result.options.fusion_profile,
-                "instrumentalPolicy": result.options.instrumental_policy,
-                "stemEngines": {
-                    stem: stem_result.engine
-                    for stem, stem_result in result.stems.items()
+                "analysisVersion": 2,
+                "meter": analysis.tempo_map.meter,
+                "tempoMode": "bar_smooth",
+                "leadSource": analysis.lead_source,
+                "usedMixFallback": analysis.used_mix_fallback,
+                "confidence": {
+                    "timing": round(analysis.tempo_map.confidence, 3),
+                    "key": round(analysis.key_confidence, 3),
+                    "melody": round(analysis.melody_confidence, 3),
+                    "harmony": round(analysis.harmony_confidence, 3),
+                    "structure": round(analysis.structure_confidence, 3),
                 },
             })
         return metadata
@@ -216,18 +219,15 @@ class Transcriber:
             def pipeline_progress(stage: str, fraction: float, message: str) -> None:
                 if progress_cb:
                     active_options = options or self.options
-                    if active_options.mode == "stem_fusion":
-                        stage_start, stage_weight = {
-                            "separate": (0.00, 0.45),
-                            "transcribe": (0.45, 0.45),
-                            "arrange": (0.90, 0.10),
-                        }.get(stage, (0.0, 1.0))
-                    else:
-                        stage_start, stage_weight = {
-                            "decode": (0.00, 0.10),
-                            "transcribe": (0.10, 0.75),
-                            "arrange": (0.85, 0.15),
-                        }.get(stage, (0.0, 1.0))
+                    stage_start, stage_weight = {
+                        "decode": (0.00, 0.05),
+                        "separate": (0.05, 0.45),
+                        "timing": (0.50, 0.10),
+                        "melody": (0.60, 0.15),
+                        "harmony": (0.75, 0.10),
+                        "structure": (0.85, 0.05),
+                        "arrange": (0.90, 0.10),
+                    }.get(stage, (0.0, 1.0))
                     file_fraction = stage_start + stage_weight * max(
                         0.0, min(1.0, fraction)
                     )

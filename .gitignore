@@ -26,4 +26,7 @@ netease_auth.json
 playlist.json
 assets/models/htdemucs_6s/*.th
 assets/models/htdemucs_6s/model-manifest.json
+assets/llm/llama-cpp/
+config.json
+Favorites.json
 

@@ -175,31 +175,3 @@ class PreviewPlayer:
 
     def _handle_error(self, exc: Exception) -> None:
         self.on_error(exc)
-
-
-class StemPreviewPlayer:
-    """Play a separated PCM WAV stem without converting it to Sky notes."""
-
-    def __init__(self) -> None:
-        self.path: Optional[str] = None
-
-    def play(self, path: str) -> None:
-        if os.name != "nt":
-            raise TranscriptionError("分轨原声试听目前仅支持 Windows")
-        if not os.path.isfile(path):
-            raise TranscriptionError(f"分轨试听文件不存在: {path}")
-        import winsound
-
-        self.stop()
-        self.path = path
-        winsound.PlaySound(path, winsound.SND_ASYNC | winsound.SND_FILENAME)
-
-    def stop(self) -> None:
-        if os.name == "nt":
-            try:
-                import winsound
-
-                winsound.PlaySound(None, 0)
-            except Exception:
-                pass
-        self.path = None

@@ -93,7 +93,7 @@ class TestCompatibilityFacade(unittest.TestCase):
             warnings=[],
             engine="pyin",
             source_file="input.wav",
-            options=TranscriptionOptions(mode="monophonic"),
+            options=TranscriptionOptions(mode="audio_arrangement"),
         )
         callbacks = []
         with tempfile.TemporaryDirectory() as directory:

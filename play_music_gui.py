@@ -1686,9 +1686,9 @@ def run_transcriber_self_test(audio_path):
     result = transcribe_draft(
         audio_path,
         TranscriptionOptions(
-            mode="polyphonic",
+            mode="audio_arrangement",
             source_key="C major",
-            octave_shift=0,
+            melody_octave_shift=0,
             max_polyphony=3,
         ),
     )
@@ -1699,22 +1699,22 @@ def run_transcriber_self_test(audio_path):
     return True
 
 
-def run_six_stem_model_self_test():
+def run_separation_model_self_test():
     """供打包流水线验证随包 CPU 运行时、模型文件与完整 SHA-256。"""
-    from transcription.separation import DemucsStemSeparator
+    from transcription.separation import TwoStemSeparator
 
-    DemucsStemSeparator().prepare()
+    TwoStemSeparator().prepare()
     return True
 
 
 if __name__ == "__main__":
-    if "--six-stem-model-self-test" in sys.argv:
+    if "--separation-model-self-test" in sys.argv:
         try:
-            run_six_stem_model_self_test()
+            run_separation_model_self_test()
             sys.exit(0)
         except Exception as exc:
             try:
-                print(f"six-stem model self-test failed: {exc}", file=sys.stderr)
+                print(f"separation model self-test failed: {exc}", file=sys.stderr)
             finally:
                 sys.exit(1)
     if "--transcriber-self-test" in sys.argv:

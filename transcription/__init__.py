@@ -1,16 +1,17 @@
-"""SkyAutoMusic 音频/MIDI 扒谱流水线。"""
+"""SkyAutoMusic V2 audio-to-15-key arranging pipeline."""
 
 from .models import (
+    AnalysisDraft,
     CancelledError,
-    DEFAULT_ENABLED_STEMS,
-    FusionProfile,
-    InstrumentalPolicy,
+    ChordSpan,
+    LeadSource,
+    MelodyNote,
+    Meter,
     NoteEvent,
     ProgressCallback,
-    RepeatCleanupMode,
+    Section,
     SourceMetadata,
-    StemKind,
-    StemResult,
+    TempoMap,
     TranscriptionError,
     TranscriptionOptions,
     TranscriptionResult,
@@ -26,24 +27,8 @@ from .pipeline import (
 )
 
 __all__ = [
-    "CancelledError",
-    "DEFAULT_ENABLED_STEMS",
-    "FusionProfile",
-    "InstrumentalPolicy",
-    "NoteEvent",
-    "ProgressCallback",
-    "RepeatCleanupMode",
-    "SourceMetadata",
-    "StemKind",
-    "StemResult",
-    "TranscriptionError",
-    "TranscriptionOptions",
-    "TranscriptionResult",
-    "cleanup_result_artifacts",
-    "export_song_json",
-    "next_available_path",
-    "rearrange_draft",
-    "sanitize_filename_stem",
-    "suggested_output_stem",
-    "transcribe_draft",
+    "AnalysisDraft", "CancelledError", "ChordSpan", "LeadSource", "MelodyNote", "Meter", "NoteEvent",
+    "ProgressCallback", "Section", "SourceMetadata", "TempoMap", "TranscriptionError", "TranscriptionOptions",
+    "TranscriptionResult", "cleanup_result_artifacts", "export_song_json", "next_available_path",
+    "rearrange_draft", "sanitize_filename_stem", "suggested_output_stem", "transcribe_draft",
 ]
