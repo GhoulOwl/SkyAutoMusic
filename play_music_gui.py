@@ -1707,7 +1707,26 @@ def run_separation_model_self_test():
     return True
 
 
+def run_quality_runtime_self_test():
+    """Verify the optional V3 code is packaged without downloading weights."""
+    import importlib.util
+    if importlib.util.find_spec("muscriptor") is None or importlib.util.find_spec("beat_this") is None:
+        raise RuntimeError("MuScriptor / Beat This runtime is missing")
+    from transcription.quality import resolve_quality_model
+    assert resolve_quality_model("auto", "cpu") == "small"
+    return True
+
+
 if __name__ == "__main__":
+    if "--quality-runtime-self-test" in sys.argv:
+        try:
+            run_quality_runtime_self_test()
+            sys.exit(0)
+        except Exception as exc:
+            try:
+                print(f"quality runtime self-test failed: {exc}", file=sys.stderr)
+            finally:
+                sys.exit(1)
     if "--separation-model-self-test" in sys.argv:
         try:
             run_separation_model_self_test()

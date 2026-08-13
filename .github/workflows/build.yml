@@ -31,7 +31,7 @@ jobs:
 
       - name: Verify transcription runtimes
         run: |
-          python -c "import importlib.util; assert importlib.util.find_spec('onnxruntime'), 'onnxruntime missing'; assert importlib.util.find_spec('demucs'), 'demucs missing'; assert importlib.util.find_spec('torch'), 'torch missing'; assert importlib.util.find_spec('tensorflow') is None, 'TensorFlow must not be bundled'"
+          python -c "import importlib.util; assert importlib.util.find_spec('onnxruntime'), 'onnxruntime missing'; assert importlib.util.find_spec('demucs'), 'demucs missing'; assert importlib.util.find_spec('muscriptor'), 'muscriptor missing'; assert importlib.util.find_spec('beat_this'), 'beat_this missing'; assert importlib.util.find_spec('torch'), 'torch missing'; assert importlib.util.find_spec('tensorflow') is None, 'TensorFlow must not be bundled'"
 
       - name: Fetch and verify bundled separation model
         run: python scripts/fetch_separation_model.py
@@ -57,6 +57,8 @@ jobs:
             --collect-all demucs `
             --collect-all sphn `
             --collect-all torchaudio `
+            --collect-all muscriptor `
+            --collect-all beat_this `
             --collect-all interception `
             --collect-all yt_dlp `
             --collect-all imageio_ffmpeg `
@@ -79,6 +81,13 @@ jobs:
             -Wait -PassThru
           if ($modelProcess.ExitCode -ne 0) {
             throw "Packaged separation model self-test failed with exit code $($modelProcess.ExitCode)"
+          }
+          $qualityProcess = Start-Process -FilePath "dist/SkyAutoMusic/SkyAutoMusic.exe" `
+            -ArgumentList "--quality-runtime-self-test" `
+            -WindowStyle Hidden `
+            -Wait -PassThru
+          if ($qualityProcess.ExitCode -ne 0) {
+            throw "Packaged V3 quality runtime self-test failed with exit code $($qualityProcess.ExitCode)"
           }
 
       - name: Create complete Windows ZIP

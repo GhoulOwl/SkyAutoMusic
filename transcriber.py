@@ -153,7 +153,7 @@ class Transcriber:
     @staticmethod
     def _transcribe_metadata(result: TranscriptionResult) -> Dict[str, Any]:
         metadata: Dict[str, Any] = {
-            "schemaVersion": 2,
+            "schemaVersion": 3 if result.quality_analysis is not None else 2,
             "engine": result.engine,
             "sourceFile": result.source_file,
             "detectedKey": result.detected_key,
@@ -177,6 +177,18 @@ class Transcriber:
                     "harmony": round(analysis.harmony_confidence, 3),
                     "structure": round(analysis.structure_confidence, 3),
                 },
+            })
+        if result.quality_analysis is not None:
+            quality = result.quality_analysis
+            metadata.update({
+                "analysisVersion": 3,
+                "qualityModel": quality.model_name,
+                "qualityDevice": quality.device,
+                "timingBackend": quality.timing_backend,
+                "quantization": quality.quantization,
+                "meter": quality.meter,
+                "refinedRegions": [list(region) for region in quality.refined_regions],
+                "confidence": {"timing": round(quality.timing_confidence, 3)},
             })
         return metadata
 
@@ -226,6 +238,8 @@ class Transcriber:
                         "melody": (0.60, 0.15),
                         "harmony": (0.75, 0.10),
                         "structure": (0.85, 0.05),
+                        "quality": (0.05, 0.85),
+                        "refine": (0.05, 0.90),
                         "arrange": (0.90, 0.10),
                     }.get(stage, (0.0, 1.0))
                     file_fraction = stage_start + stage_weight * max(

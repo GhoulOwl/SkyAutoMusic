@@ -11,7 +11,7 @@ from transcription.benchmark import run_benchmark
 
 
 def main() -> int:
-    parser = argparse.ArgumentParser(description="Run the private SkyAutoMusic V2 golden set.")
+    parser = argparse.ArgumentParser(description="Run the private SkyAutoMusic V2/V3 15-key golden set.")
     parser.add_argument("manifest", type=Path)
     parser.add_argument("output", type=Path)
     args = parser.parse_args()

@@ -15,7 +15,7 @@ interception-python>=1.13
 # 固定经 Windows/Python 3.10 构建使用的直接依赖版本，避免二进制 ABI 漂移。
 numpy==1.26.4
 scipy==1.13.1
-soundfile==0.13.1
+soundfile==0.14.0
 librosa==0.11.0
 pretty_midi==0.2.11.post0
 onnxruntime==1.21.1
@@ -25,6 +25,9 @@ basic-pitch==0.4.0
 torch==2.6.0
 torchaudio==2.6.0
 demucs==4.1.0
+# ---- V3 高质量整曲扒谱（可选模型首次使用时下载，权重不随发行包分发）----
+muscriptor==0.3.0
+beat-this==1.1.0
 # ---- 网易云在线扒谱 ----
 # yt-dlp 解析网易云单曲直链；imageio-ffmpeg 自带 Windows FFmpeg，
 # 将 MP3/FLAC/AAC/M4A 统一转换为扒谱用 WAV。

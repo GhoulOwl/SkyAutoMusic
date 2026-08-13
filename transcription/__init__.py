@@ -1,4 +1,4 @@
-"""SkyAutoMusic V2 audio-to-15-key arranging pipeline."""
+"""SkyAutoMusic audio-to-15-key arranging pipeline."""
 
 from .models import (
     AnalysisDraft,
@@ -9,10 +9,15 @@ from .models import (
     Meter,
     NoteEvent,
     ProgressCallback,
+    QualityAnalysisDraft,
+    QualityModel,
     Section,
     SourceMetadata,
+    SymbolicNote,
+    SymbolicRole,
     TempoMap,
     TranscriptionError,
+    TranscriptionEngine,
     TranscriptionOptions,
     TranscriptionResult,
 )
@@ -21,6 +26,7 @@ from .pipeline import (
     export_song_json,
     next_available_path,
     rearrange_draft,
+    refine_region,
     sanitize_filename_stem,
     suggested_output_stem,
     transcribe_draft,
@@ -28,7 +34,7 @@ from .pipeline import (
 
 __all__ = [
     "AnalysisDraft", "CancelledError", "ChordSpan", "LeadSource", "MelodyNote", "Meter", "NoteEvent",
-    "ProgressCallback", "Section", "SourceMetadata", "TempoMap", "TranscriptionError", "TranscriptionOptions",
+    "ProgressCallback", "QualityAnalysisDraft", "QualityModel", "Section", "SourceMetadata", "SymbolicNote", "SymbolicRole", "TempoMap", "TranscriptionEngine", "TranscriptionError", "TranscriptionOptions",
     "TranscriptionResult", "cleanup_result_artifacts", "export_song_json", "next_available_path",
-    "rearrange_draft", "sanitize_filename_stem", "suggested_output_stem", "transcribe_draft",
+    "rearrange_draft", "refine_region", "sanitize_filename_stem", "suggested_output_stem", "transcribe_draft",
 ]

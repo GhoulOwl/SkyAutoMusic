@@ -7,6 +7,7 @@ import re
 import shutil
 import tempfile
 import threading
+import bisect
 from dataclasses import replace
 from typing import Dict, Optional
 
@@ -21,6 +22,7 @@ from .models import (
     TranscriptionOptions,
     TranscriptionResult,
 )
+from .quality import analyze_quality_audio, arrange_quality_analysis
 
 
 def _check_cancel(cancel_event: Optional[threading.Event]) -> None:
@@ -61,6 +63,25 @@ def transcribe_draft(
             semitone_shift=shift, octave_shift=octave, beat_times_ms=list(backend.beat_times_ms), options=midi_options, source=source,
         )
 
+    # `auto` deliberately remains the portable V2 engine. Quality mode is an
+    # explicit user choice because its model is separately licensed/downloaded.
+    if options.engine == "quality":
+        _notify(progress_cb, "quality", 0.0, "正在启动高质量整曲扒谱")
+        quality, raw_events = analyze_quality_audio(path, options, cancel_event, progress_cb)
+        _check_cancel(cancel_event)
+        _notify(progress_cb, "arrange", 0.0, "正在进行旋律优先 15 键编配")
+        notes, key, shift, stats = arrange_quality_analysis(quality, options)
+        if not notes:
+            raise TranscriptionError("高质量分析完成，但没有生成可用的 15 键音符")
+        stats.update({"duration_sec": round(quality.duration_sec, 3), "backend_event_count": len(raw_events)})
+        _notify(progress_cb, "arrange", 1.0, "高质量 15 键编配完成")
+        return TranscriptionResult(
+            events=raw_events, song_notes=notes, detected_key=key, bpm=quality.bpm,
+            stats=stats, warnings=[], engine="arrangement_v3_quality", source_file=os.path.basename(path),
+            semitone_shift=shift, beat_times_ms=list(quality.beat_times_ms), options=options,
+            source=source, quality_analysis=quality,
+        )
+
     analysis, raw_events, artifact_root, model, warnings = analyze_audio(
         path, options, cancel_event, progress_cb, workspace_dir
     )
@@ -98,6 +119,19 @@ def rearrange_draft(
 ) -> TranscriptionResult:
     _check_cancel(cancel_event)
     _notify(progress_cb, "arrange", 0.0, "正在重新编配")
+    if result.quality_analysis is not None:
+        if options.bpm_override is not None or options.meter != "auto":
+            raise TranscriptionError("高质量草稿的 BPM 或拍号修正需要重新生成当前歌曲")
+        notes, key, shift, stats = arrange_quality_analysis(result.quality_analysis, options)
+        _check_cancel(cancel_event)
+        _notify(progress_cb, "arrange", 1.0, "高质量草稿重新编配完成")
+        return TranscriptionResult(
+            events=list(result.events), song_notes=notes, detected_key=key, bpm=result.quality_analysis.bpm,
+            stats={**result.stats, **stats}, warnings=list(result.warnings), engine="arrangement_v3_quality",
+            source_file=result.source_file, semitone_shift=shift, beat_times_ms=list(result.quality_analysis.beat_times_ms),
+            options=options, source=result.source, quality_analysis=result.quality_analysis,
+            artifact_root=result.artifact_root,
+        )
     if result.analysis is None:
         notes, key, shift, octave, stats = arrange_events(result.events, replace(options, mode="midi"), result.bpm, result.beat_times_ms)
         return TranscriptionResult(
@@ -120,9 +154,83 @@ def rearrange_draft(
     )
 
 
+def refine_region(
+    result: TranscriptionResult,
+    source_path: str,
+    start_ms: int,
+    end_ms: int,
+    options: Optional[TranscriptionOptions] = None,
+    cancel_event: Optional[threading.Event] = None,
+    progress_cb: Optional[ProgressCallback] = None,
+) -> TranscriptionResult:
+    """Re-transcribe one bar-aligned V3 region while keeping the song grid fixed.
+
+    The selected range gets one bar of audio context on each side, but only the
+    requested bar range replaces symbolic notes.  This prevents a local repair
+    from shifting the rest of an already reviewed score.
+    """
+    quality = result.quality_analysis
+    if quality is None:
+        raise TranscriptionError("片段精修仅适用于高质量草稿")
+    if not os.path.isfile(source_path):
+        raise TranscriptionError(f"精修源文件不存在：{source_path}")
+    if end_ms <= start_ms:
+        raise TranscriptionError("精修结束时间必须晚于开始时间")
+    _check_cancel(cancel_event)
+    active_options = options or result.options
+    if active_options.engine != "quality":
+        active_options = replace(active_options, engine="quality")
+    if not active_options.rights_confirmed:
+        raise TranscriptionError("片段精修同样需要确认输入音频的使用权利")
+
+    bars = quality.bar_starts_ms or quality.beat_times_ms or [0]
+    core_start = max((bar for bar in bars if bar <= start_ms), default=0)
+    core_end = next((bar for bar in bars if bar >= end_ms), int(round(quality.duration_sec * 1000)))
+    if core_end <= core_start:
+        core_end = int(round(quality.duration_sec * 1000))
+    left_index = max(0, bisect.bisect_left(bars, core_start) - 1)
+    right_index = min(len(bars) - 1, bisect.bisect_right(bars, core_end))
+    context_start, context_end = bars[left_index], bars[right_index]
+    context_end = max(context_end, core_end)
+    if progress_cb:
+        progress_cb("refine", 0.0, "正在准备小节片段精修")
+
+    try:
+        import librosa
+        import soundfile as sf
+    except ImportError as exc:
+        raise TranscriptionError("缺少 librosa / soundfile，无法进行片段精修") from exc
+    root = result.artifact_root or tempfile.mkdtemp(prefix="sky-arrangement-v3-")
+    os.makedirs(root, exist_ok=True)
+    clip_path = os.path.join(root, f"refine-{core_start}-{core_end}.wav")
+    try:
+        waveform, sr = librosa.load(source_path, sr=16000, mono=True, offset=context_start / 1000.0, duration=max(.01, (context_end - context_start) / 1000.0))
+        sf.write(clip_path, waveform, sr, subtype="PCM_16")
+        local_options = replace(active_options, quality_model="medium")
+        local, _raw = analyze_quality_audio(clip_path, local_options, cancel_event, progress_cb, beam_size=4)
+    finally:
+        try:
+            os.unlink(clip_path)
+        except OSError:
+            pass
+    offset = context_start
+    replacement = [replace(note, start_ms=note.start_ms + offset, end_ms=note.end_ms + offset) for note in local.symbolic_notes if core_start <= note.start_ms + offset < core_end]
+    retained = [note for note in quality.symbolic_notes if not (core_start <= note.start_ms < core_end)]
+    updated = replace(quality, symbolic_notes=sorted(retained + replacement, key=lambda note: (note.start_ms, note.midi_pitch)), refined_regions=[*quality.refined_regions, (core_start, core_end)])
+    notes, key, shift, stats = arrange_quality_analysis(updated, active_options, forced_shift=result.semitone_shift)
+    if progress_cb:
+        progress_cb("refine", 1.0, "片段精修完成，等待确认替换")
+    return TranscriptionResult(
+        events=list(result.events), song_notes=notes, detected_key=key, bpm=updated.bpm,
+        stats={**result.stats, **stats}, warnings=list(result.warnings), engine="arrangement_v3_quality",
+        source_file=result.source_file, semitone_shift=shift, beat_times_ms=list(updated.beat_times_ms),
+        options=active_options, source=result.source, quality_analysis=updated, artifact_root=root,
+    )
+
+
 def _metadata(result: TranscriptionResult) -> Dict[str, object]:
     metadata: Dict[str, object] = {
-        "schemaVersion": 2,
+        "schemaVersion": 3 if result.quality_analysis is not None else 2,
         "engine": result.engine,
         "sourceFile": result.source_file,
         "detectedKey": result.detected_key,
@@ -146,6 +254,18 @@ def _metadata(result: TranscriptionResult) -> Dict[str, object]:
                 "melody": round(analysis.melody_confidence, 3), "harmony": round(analysis.harmony_confidence, 3),
                 "structure": round(analysis.structure_confidence, 3),
             },
+        })
+    if result.quality_analysis is not None:
+        quality = result.quality_analysis
+        metadata.update({
+            "analysisVersion": 3,
+            "qualityModel": quality.model_name,
+            "qualityDevice": quality.device,
+            "timingBackend": quality.timing_backend,
+            "quantization": quality.quantization,
+            "meter": quality.meter,
+            "refinedRegions": [list(region) for region in quality.refined_regions],
+            "confidence": {"timing": round(quality.timing_confidence, 3)},
         })
     return metadata
 

@@ -1,4 +1,4 @@
-"""V2 音频编配流水线的数据模型。"""
+"""Audio-to-15-key arrangement pipeline data models."""
 from __future__ import annotations
 
 from dataclasses import dataclass, field, replace
@@ -9,6 +9,9 @@ ArrangementPreset = Literal["auto", "simple", "standard", "full"]
 TranscriptionMode = Literal["audio_arrangement", "midi"]
 Meter = Literal["auto", "4/4", "3/4", "6/8"]
 LeadSource = Literal["vocal", "instrumental", "chords_only"]
+TranscriptionEngine = Literal["auto", "fast", "quality"]
+QualityModel = Literal["auto", "small", "medium"]
+SymbolicRole = Literal["melody", "bass", "harmony", "other", "drums"]
 SourcePlatform = Literal["local", "netease"]
 ProgressCallback = Callable[[str, float, str], None]
 
@@ -64,6 +67,42 @@ class NoteEvent:
 
 
 @dataclass(frozen=True)
+class SymbolicNote:
+    """Instrument-aware note emitted by the V3 whole-song transcription backend."""
+
+    start_ms: int
+    end_ms: int
+    midi_pitch: int
+    instrument: str
+    role: SymbolicRole = "other"
+
+    def __post_init__(self) -> None:
+        if self.start_ms < 0 or self.end_ms <= self.start_ms:
+            raise ValueError("symbolic note must have a positive interval")
+        if not 0 <= self.midi_pitch <= 127:
+            raise ValueError("symbolic MIDI pitch must be in 0..127")
+
+
+@dataclass
+class QualityAnalysisDraft:
+    """Cached V3 symbolic transcription and its non-uniform beat grid."""
+
+    duration_sec: float
+    symbolic_notes: List[SymbolicNote]
+    beat_times_ms: List[int]
+    downbeat_times_ms: List[int]
+    bar_starts_ms: List[int]
+    bpm: float
+    meter: Meter
+    timing_confidence: float
+    model_name: str
+    device: str
+    timing_backend: str = "beat_this"
+    quantization: str = "adaptive_8th_triplet_16th"
+    refined_regions: List[Tuple[int, int]] = field(default_factory=list)
+
+
+@dataclass(frozen=True)
 class TranscriptionOptions:
     mode: TranscriptionMode = "audio_arrangement"
     arrangement_preset: ArrangementPreset = "auto"
@@ -72,6 +111,9 @@ class TranscriptionOptions:
     max_polyphony: int = 4
     bpm_override: Optional[float] = None
     meter: Meter = "auto"
+    engine: TranscriptionEngine = "auto"
+    quality_model: QualityModel = "auto"
+    rights_confirmed: bool = False
 
     def __post_init__(self) -> None:
         if self.mode not in ("audio_arrangement", "midi"):
@@ -86,6 +128,10 @@ class TranscriptionOptions:
             raise ValueError("bpm_override must be in 40..220")
         if self.meter not in ("auto", "4/4", "3/4", "6/8"):
             raise ValueError(f"unsupported meter: {self.meter}")
+        if self.engine not in ("auto", "fast", "quality"):
+            raise ValueError(f"unsupported transcription engine: {self.engine}")
+        if self.quality_model not in ("auto", "small", "medium"):
+            raise ValueError(f"unsupported quality model: {self.quality_model}")
 
 
 @dataclass(frozen=True)
@@ -177,6 +223,6 @@ class TranscriptionResult:
     options: TranscriptionOptions = field(default_factory=TranscriptionOptions, repr=False)
     source: Optional[SourceMetadata] = None
     analysis: Optional[AnalysisDraft] = field(default=None, repr=False)
+    quality_analysis: Optional[QualityAnalysisDraft] = field(default=None, repr=False)
     separation_model: str = ""
     artifact_root: str = field(default="", repr=False)
-

@@ -5,6 +5,7 @@ import os
 import tempfile
 import threading
 import tkinter as tk
+import webbrowser
 from dataclasses import replace
 from tkinter import filedialog, messagebox, ttk
 from typing import Callable, Dict, List, Optional, Sequence
@@ -14,12 +15,15 @@ from .backends import is_midi_file
 from .models import CancelledError, SourceMetadata, TranscriptionOptions, TranscriptionResult
 from .netease import NetEaseClient, NetEaseTrack
 from .netease_auth import CookieValidationResult, NetEaseCookieStore, parse_netscape_cookies, serialize_netscape_cookies
-from .pipeline import cleanup_result_artifacts, export_song_json, next_available_path, rearrange_draft, suggested_output_stem, transcribe_draft
+from .pipeline import cleanup_result_artifacts, export_song_json, next_available_path, rearrange_draft, refine_region, suggested_output_stem, transcribe_draft
 from .preview import PreviewPlayer
+from .quality import choose_quality_device, prepare_quality_model, resolve_quality_model
 
 
 PRESET_LABELS = {"自动编配": "auto", "简洁": "simple", "标准": "standard", "丰满": "full"}
 METER_LABELS = {"自动": "auto", "4/4": "4/4", "3/4": "3/4", "6/8": "6/8"}
+ENGINE_LABELS = {"自动（当前为快速）": "auto", "快速（离线）": "fast", "高质量（MuScriptor）": "quality"}
+QUALITY_MODEL_LABELS = {"自动选择": "auto", "Small（CPU）": "small", "Medium（GPU / Apple 芯片）": "medium"}
 
 
 class TranscriptionDialog:
@@ -50,6 +54,9 @@ class TranscriptionDialog:
         self.search_tracks: List[NetEaseTrack] = []
         self.busy = False
         self.closed = False
+        self.refine_start_ms: Optional[int] = None
+        self.refine_end_ms: Optional[int] = None
+        self.refinement_candidate: Optional[tuple[str, TranscriptionResult]] = None
 
         self.win = tk.Toplevel(parent)
         self.win.title("生成乐谱")
@@ -64,6 +71,9 @@ class TranscriptionDialog:
         self.polyphony_var = tk.IntVar(value=4)
         self.bpm_var = tk.StringVar(value="自动")
         self.meter_var = tk.StringVar(value="自动")
+        self.engine_var = tk.StringVar(value="快速（离线）")
+        self.quality_model_var = tk.StringVar(value="自动选择")
+        self.rights_var = tk.BooleanVar(value=False)
         self.status_var = tk.StringVar(value="选择音频后生成草稿")
         self.detail_var = tk.StringVar(value="")
         self.stats_var = tk.StringVar(value="尚未生成草稿")
@@ -112,6 +122,16 @@ class TranscriptionDialog:
         ttk.Label(options, text="拍号修正").grid(row=1, column=4, sticky="e", padx=4, pady=4)
         self.meter_box = ttk.Combobox(options, textvariable=self.meter_var, values=list(METER_LABELS), state="readonly", width=7)
         self.meter_box.grid(row=1, column=5, sticky="w", padx=4, pady=4)
+        ttk.Label(options, text="扒谱引擎").grid(row=2, column=0, sticky="e", padx=4, pady=4)
+        self.engine_box = ttk.Combobox(options, textvariable=self.engine_var, values=list(ENGINE_LABELS), state="readonly", width=18)
+        self.engine_box.grid(row=2, column=1, columnspan=2, sticky="w", padx=4, pady=4)
+        ttk.Label(options, text="高质量模型").grid(row=2, column=3, sticky="e", padx=4, pady=4)
+        self.quality_model_box = ttk.Combobox(options, textvariable=self.quality_model_var, values=list(QUALITY_MODEL_LABELS), state="readonly", width=20)
+        self.quality_model_box.grid(row=2, column=4, columnspan=2, sticky="w", padx=4, pady=4)
+        self.rights_check = ttk.Checkbutton(options, text="我确认拥有该音频及生成乐谱所需权利（高质量模式）", variable=self.rights_var)
+        self.rights_check.grid(row=3, column=0, columnspan=4, sticky="w", padx=4, pady=4)
+        self.model_setup_btn = ttk.Button(options, text="配置/下载高质量模型…", command=self.configure_quality_model)
+        self.model_setup_btn.grid(row=3, column=4, columnspan=2, sticky="w", padx=4, pady=4)
 
         progress = ttk.Frame(self.win)
         progress.pack(fill="x", padx=12, pady=6)
@@ -133,14 +153,23 @@ class TranscriptionDialog:
         self.timeline = tk.Canvas(right, background="#FFFFFF", highlightthickness=1, highlightbackground="#D9DEE7", height=340)
         self.timeline.pack(fill="both", expand=True, pady=(4, 6))
         self.timeline.bind("<Configure>", lambda _event: self._draw_timeline())
+        self.timeline.bind("<ButtonPress-1>", self._begin_refine_selection)
+        self.timeline.bind("<B1-Motion>", self._update_refine_selection)
+        self.timeline.bind("<ButtonRelease-1>", self._finish_refine_selection)
         ttk.Label(right, textvariable=self.stats_var, justify="left", foreground="#555").pack(fill="x", anchor="w")
 
         actions = ttk.Frame(self.win)
         actions.pack(fill="x", padx=12, pady=(6, 12))
         self.regenerate_btn = ttk.Button(actions, text="应用参数", command=self.regenerate_current, state="disabled")
         self.regenerate_btn.pack(side="left", padx=(0, 6))
-        self.preview_btn = ttk.Button(actions, text="光遇音色试听", command=self.preview_current, state="disabled")
+        self.preview_btn = ttk.Button(actions, text="钢琴音色试听", command=self.preview_current, state="disabled")
         self.preview_btn.pack(side="left", padx=6)
+        self.refine_btn = ttk.Button(actions, text="精修所选小节", command=self.refine_current, state="disabled")
+        self.refine_btn.pack(side="left", padx=6)
+        self.accept_refine_btn = ttk.Button(actions, text="接受精修", command=self.accept_refinement, state="disabled")
+        self.accept_refine_btn.pack(side="left", padx=6)
+        self.discard_refine_btn = ttk.Button(actions, text="放弃精修", command=self.discard_refinement, state="disabled")
+        self.discard_refine_btn.pack(side="left", padx=6)
         ttk.Button(actions, text="停止试听", command=self.stop_preview).pack(side="left", padx=6)
         self.save_btn = ttk.Button(actions, text="保存当前", command=self.save_current, state="disabled")
         self.save_btn.pack(side="right", padx=6)
@@ -162,6 +191,8 @@ class TranscriptionDialog:
             mode="audio_arrangement", arrangement_preset=PRESET_LABELS[self.preset_var.get()],
             source_key=None if self.key_var.get() == "自动" else self.key_var.get(), melody_octave_shift=octave,
             max_polyphony=int(self.polyphony_var.get()), bpm_override=bpm, meter=METER_LABELS[self.meter_var.get()],
+            engine=ENGINE_LABELS[self.engine_var.get()], quality_model=QUALITY_MODEL_LABELS[self.quality_model_var.get()],
+            rights_confirmed=bool(self.rights_var.get()),
         )
 
     def choose_local_files(self) -> None:
@@ -190,11 +221,17 @@ class TranscriptionDialog:
         current = self._current_result()
         self.regenerate_btn.config(state="disabled" if busy or current is None else "normal")
         self.preview_btn.config(state="disabled" if busy or current is None else "normal")
+        can_refine = current is not None and current.quality_analysis is not None and self.refine_start_ms is not None and self.refine_end_ms is not None and self.refinement_candidate is None
+        self.refine_btn.config(state="normal" if not busy and can_refine else "disabled")
+        self.accept_refine_btn.config(state="normal" if not busy and self.refinement_candidate is not None else "disabled")
+        self.discard_refine_btn.config(state="normal" if not busy and self.refinement_candidate is not None else "disabled")
         self.save_btn.config(state="disabled" if busy or current is None else "normal")
         self.save_all_btn.config(state="disabled" if busy or not self.results else "normal")
-        for control in (self.preset_box, self.key_box, self.octave_box, self.polyphony_box, self.bpm_box, self.meter_box):
+        for control in (self.preset_box, self.key_box, self.octave_box, self.polyphony_box, self.bpm_box, self.meter_box, self.engine_box, self.quality_model_box):
             control.config(state="disabled" if busy else "readonly")
         self.bpm_box.config(state="disabled" if busy else "normal")
+        self.rights_check.config(state="disabled" if busy else "normal")
+        self.model_setup_btn.config(state="disabled" if busy else "normal")
 
     def generate_all(self) -> None:
         if self.busy or not self.files:
@@ -207,7 +244,7 @@ class TranscriptionDialog:
                 if self.cancel_event.is_set():
                     break
                 def progress(stage: str, fraction: float, message: str, _index=index) -> None:
-                    weights = {"decode": (0.0, .05), "separate": (.05, .45), "timing": (.50, .10), "melody": (.60, .15), "harmony": (.75, .10), "structure": (.85, .05), "arrange": (.90, .10)}
+                    weights = {"decode": (0.0, .05), "separate": (.05, .45), "timing": (.50, .10), "melody": (.60, .15), "harmony": (.75, .10), "structure": (.85, .05), "quality": (.05, .85), "arrange": (.90, .10), "refine": (.05, .90)}
                     start, weight = weights.get(stage, (0.0, 1.0))
                     self._after(self._apply_progress, (_index + start + weight * fraction) / len(pending), message, self.source_labels.get(path, os.path.basename(path)))
                 try:
@@ -276,6 +313,8 @@ class TranscriptionDialog:
 
     def _current_result(self) -> Optional[TranscriptionResult]:
         path = self._selected_path()
+        if path and self.refinement_candidate and self.refinement_candidate[0] == path:
+            return self.refinement_candidate[1]
         return self.results.get(path) if path else None
 
     def _on_selection(self, _event=None) -> None:
@@ -295,6 +334,8 @@ class TranscriptionDialog:
             self.key_var.set(result.options.source_key or "自动")
             self.octave_var.set("自动" if result.options.melody_octave_shift is None else f"{result.options.melody_octave_shift:+d}".replace("+0", "0"))
             self.polyphony_var.set(result.options.max_polyphony)
+        self.engine_var.set(next(label for label, value in ENGINE_LABELS.items() if value == result.options.engine))
+        self.quality_model_var.set(next(label for label, value in QUALITY_MODEL_LABELS.items() if value == result.options.quality_model))
         self.stats_var.set(f"引擎：{result.engine}    调性：{result.detected_key}    BPM：{result.bpm:.1f}\n音符：{len(result.song_notes)}    落点：{stats.get('onset_count', 0)}    和弦：{stats.get('chord_count', 0)}    平均复音：{stats.get('average_polyphony', 0)}{confidence}{warning}")
         self._draw_timeline()
 
@@ -311,16 +352,128 @@ class TranscriptionDialog:
             for section in result.analysis.sections:
                 x = left + (section.start_ms - start) / span * (width - left - right)
                 canvas.create_line(x, 0, x, height, fill="#D6DCE8", dash=(2, 2))
+        if result.quality_analysis:
+            for bar in result.quality_analysis.bar_starts_ms:
+                x = left + (bar - start) / span * (width - left - right)
+                canvas.create_line(x, 0, x, height, fill="#D6DCE8", dash=(2, 2))
+        if self.refine_start_ms is not None and self.refine_end_ms is not None:
+            lo, hi = sorted((self.refine_start_ms, self.refine_end_ms))
+            x0 = left + (lo - start) / span * (width - left - right); x1 = left + (hi - start) / span * (width - left - right)
+            canvas.create_rectangle(x0, 0, x1, height, fill="#FFF4C2", outline="#E8B931", stipple="gray25")
         for note in result.song_notes:
             key = int(str(note["key"])[4:]); display = 14 - key; x = left + (int(note["time"]) - start) / span * (width - left - right)
             canvas.create_rectangle(x - 1.5, display * row + 2, x + 2.5, (display + 1) * row - 2, fill=self.accent if key >= 7 else "#98A6BA", outline="")
+
+    def _timeline_time(self, event: tk.Event) -> Optional[int]:
+        result = self._current_result()
+        if not result or not result.song_notes:
+            return None
+        times = [int(note["time"]) for note in result.song_notes]; start, span = min(times), max(1, max(times) - min(times))
+        width, left, right = max(100, self.timeline.winfo_width()), 42, 8
+        ratio = max(0.0, min(1.0, (event.x - left) / max(1, width - left - right)))
+        return int(round(start + span * ratio))
+
+    def _begin_refine_selection(self, event: tk.Event) -> None:
+        if self.busy or not (result := self._current_result()) or result.quality_analysis is None or self.refinement_candidate:
+            return
+        self.refine_start_ms = self._timeline_time(event); self.refine_end_ms = self.refine_start_ms; self._draw_timeline()
+
+    def _update_refine_selection(self, event: tk.Event) -> None:
+        if self.refine_start_ms is not None:
+            self.refine_end_ms = self._timeline_time(event); self._draw_timeline()
+
+    def _finish_refine_selection(self, event: tk.Event) -> None:
+        if self.refine_start_ms is None:
+            return
+        self.refine_end_ms = self._timeline_time(event)
+        if self.refine_end_ms is not None and abs(self.refine_end_ms - self.refine_start_ms) < 100:
+            self.refine_start_ms = self.refine_end_ms = None
+        self._set_busy(self.busy); self._draw_timeline()
+
+    def configure_quality_model(self) -> None:
+        if self.busy:
+            return
+        window = tk.Toplevel(self.win); window.title("配置高质量模型"); window.transient(self.win); window.resizable(False, False)
+        requested = QUALITY_MODEL_LABELS[self.quality_model_var.get()]
+        model_name = resolve_quality_model(requested, choose_quality_device())
+        model_url = f"https://huggingface.co/MuScriptor/muscriptor-{model_name}"
+        ttk.Label(window, text=(
+            "打开模型页后，如显示“granted access”，说明许可已就绪；无需再次授权。\n"
+            "否则先同意共享联系信息与非商用条件，再创建一个 Read Token 用于本次下载。\n"
+            "Token 只在本次下载期间使用，不会保存到配置或乐谱中。"
+        ), justify="left").pack(padx=14, pady=(14, 8))
+        links = ttk.Frame(window); links.pack(pady=(0, 4))
+        ttk.Button(links, text=f"打开 MuScriptor {model_name.title()} 条件页", command=lambda: webbrowser.open(model_url)).pack(side="left", padx=4)
+        ttk.Button(links, text="创建 Read Token", command=lambda: webbrowser.open("https://huggingface.co/settings/tokens/new?tokenType=read")).pack(side="left", padx=4)
+        token_var = tk.StringVar()
+        row = ttk.Frame(window); row.pack(fill="x", padx=14, pady=6)
+        ttk.Label(row, text="临时 HF Token（可留空）").pack(side="left")
+        ttk.Entry(row, textvariable=token_var, show="•", width=32).pack(side="left", padx=(8, 0))
+        button = ttk.Button(window, text="下载并验证"); button.pack(pady=(4, 14))
+        def start() -> None:
+            button.config(state="disabled", text="正在准备…")
+            def worker() -> None:
+                try:
+                    name, device = prepare_quality_model(requested, token_var.get().strip() or None)
+                    self._after(done, f"MuScriptor {name} 已在 {device} 就绪", None)
+                except Exception as exc:
+                    self._after(done, "", str(exc))
+            self._start_worker(worker)
+        def done(message: str, error: Optional[str]) -> None:
+            if error:
+                button.config(state="normal", text="下载并验证"); messagebox.showerror("高质量模型", error, parent=window); return
+            self.status_var.set(message); window.destroy()
+        button.config(command=start)
+
+    def refine_current(self) -> None:
+        path = self._selected_path(); current = self.results.get(path or "")
+        if self.busy or not path or not current or current.quality_analysis is None or self.refine_start_ms is None or self.refine_end_ms is None:
+            return
+        self.cancel_event = threading.Event(); self._set_busy(True)
+        start, end, options = self.refine_start_ms, self.refine_end_ms, self._options()
+        def worker() -> None:
+            try:
+                candidate = refine_region(current, path, start, end, options, self.cancel_event, lambda _s, f, m: self._after(self._apply_progress, f, m, self.source_labels[path]))
+                self._after(self._finish_refinement, path, candidate, None)
+            except Exception as exc:
+                self._after(self._finish_refinement, path, None, str(exc))
+        self._start_worker(worker)
+
+    def _finish_refinement(self, path: str, candidate: Optional[TranscriptionResult], error: Optional[str]) -> None:
+        self._set_busy(False)
+        if error or candidate is None:
+            self.status_var.set(error or "片段精修失败")
+            if error != "转写已取消": messagebox.showerror("片段精修失败", error or "未知错误", parent=self.win)
+            return
+        self.refinement_candidate = (path, candidate)
+        self.status_var.set("已生成精修试听，确认后才会替换当前草稿")
+        self._set_busy(False); self._show_path(path)
+
+    def accept_refinement(self) -> None:
+        if not self.refinement_candidate:
+            return
+        path, candidate = self.refinement_candidate; previous = self.results.get(path)
+        self.results[path] = candidate; self.refinement_candidate = None
+        if previous and previous.artifact_root and previous.artifact_root != candidate.artifact_root:
+            cleanup_result_artifacts(previous)
+        self.refine_start_ms = self.refine_end_ms = None
+        self.status_var.set("已接受片段精修")
+        self._set_busy(False); self._show_path(path)
+
+    def discard_refinement(self) -> None:
+        if not self.refinement_candidate:
+            return
+        self.refinement_candidate = None; self.refine_start_ms = self.refine_end_ms = None
+        self.status_var.set("已放弃片段精修")
+        self._set_busy(False)
+        if path := self._selected_path(): self._show_path(path)
 
     def preview_current(self) -> None:
         result = self._current_result()
         if not result or self.busy: return
         if self.preview_player.prepared:
             try:
-                self.preview_player.play(result); self.preview_btn.config(text="暂停光遇音色试听"); self.status_var.set("正在试听")
+                self.preview_player.play(result); self.preview_btn.config(text="暂停钢琴音色试听"); self.status_var.set("正在试听")
             except Exception as exc: messagebox.showerror("试听失败", str(exc), parent=self.win)
             return
         self._preview_preparing = True; self.preview_btn.config(state="disabled", text="准备音色…")
@@ -333,12 +486,12 @@ class TranscriptionDialog:
     def _finish_preview_prepare(self, result: TranscriptionResult, error: Optional[str]) -> None:
         self._preview_preparing = False
         if error:
-            self.preview_btn.config(text="光遇音色试听", state="normal"); messagebox.showerror("试听失败", error, parent=self.win); return
-        self.preview_player.play(result); self.preview_btn.config(text="暂停光遇音色试听")
+            self.preview_btn.config(text="钢琴音色试听", state="normal"); messagebox.showerror("试听失败", error, parent=self.win); return
+        self.preview_player.play(result); self.preview_btn.config(text="暂停钢琴音色试听")
 
     def stop_preview(self) -> None:
         self.preview_player.stop()
-        if not self.closed: self.preview_btn.config(text="光遇音色试听", state="normal" if self._current_result() and not self.busy else "disabled")
+        if not self.closed: self.preview_btn.config(text="钢琴音色试听", state="normal" if self._current_result() and not self.busy else "disabled")
 
     def _preview_status(self, message: str) -> None:
         if not self.closed: self.status_var.set(message)
