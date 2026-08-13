@@ -3,10 +3,16 @@ import os
 import subprocess
 import sys
 
-import psutil
-import win32con
-import win32gui
-import win32process
+if os.name == "nt":
+    import psutil
+    import win32con
+    import win32gui
+    import win32process
+else:  # Keep the helper module importable on macOS/Linux.
+    psutil = None
+    win32con = None
+    win32gui = None
+    win32process = None
 
 
 SKY_PROCESS_NAMES = {"sky.exe", "sky"}
@@ -98,7 +104,7 @@ def switch_to_english_input(hwnd=None):
 
 
 def describe_window(hwnd):
-    if not hwnd:
+    if os.name != "nt" or not hwnd:
         return "无"
     try:
         _tid, pid = win32process.GetWindowThreadProcessId(hwnd)
@@ -110,6 +116,8 @@ def describe_window(hwnd):
 
 
 def describe_foreground_window():
+    if os.name != "nt":
+        return "不适用于当前平台"
     try:
         return describe_window(win32gui.GetForegroundWindow())
     except Exception:
@@ -117,6 +125,8 @@ def describe_foreground_window():
 
 
 def find_sky_game_window(current_pid=None):
+    if os.name != "nt":
+        return None
     current_pid = os.getpid() if current_pid is None else current_pid
     candidates = []
 
@@ -143,7 +153,7 @@ def find_sky_game_window(current_pid=None):
 
 
 def bring_window_to_front(hwnd):
-    if not hwnd:
+    if os.name != "nt" or not hwnd:
         return False
 
     try:
@@ -198,7 +208,7 @@ def bring_window_to_front(hwnd):
 
 
 def release_topmost(hwnd):
-    if not hwnd:
+    if os.name != "nt" or not hwnd:
         return
     try:
         win32gui.SetWindowPos(
@@ -215,6 +225,8 @@ def release_topmost(hwnd):
 
 
 def get_window_rect(hwnd):
+    if os.name != "nt":
+        return None
     try:
         return win32gui.GetWindowRect(hwnd)
     except Exception:

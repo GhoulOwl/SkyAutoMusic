@@ -3,8 +3,14 @@ try:
 except ImportError:  # 允许无 Tk 的测试环境导入纯辅助函数 display_key
     tk = None
 
-import win32con
-import win32gui
+import os
+
+if os.name == "nt":
+    import win32con
+    import win32gui
+else:  # The overlay is not created on non-Windows hosts.
+    win32con = None
+    win32gui = None
 
 from window_focus import get_window_rect
 
@@ -16,6 +22,34 @@ def display_key(note_key):
     if isinstance(note_key, str) and note_key.startswith("2Key"):
         return "1Key" + note_key[4:]
     return note_key
+
+
+class NullScoreOverlay:
+    """No-op overlay used on platforms without game-window integration."""
+
+    window = None
+    locked = True
+
+    def set_score(self, *_args, **_kwargs):
+        return None
+
+    def show(self, *_args, **_kwargs):
+        return None
+
+    def hide(self):
+        return None
+
+    def toggle_lock(self):
+        return self.locked
+
+    def set_locked(self, locked):
+        self.locked = bool(locked)
+
+    def update_playback(self, *_args, **_kwargs):
+        return None
+
+    def close(self):
+        return None
 
 
 class ScoreOverlay:
@@ -209,6 +243,8 @@ class ScoreOverlay:
             self.redraw()
 
     def _apply_clickthrough(self):
+        if os.name != "nt":
+            return
         try:
             hwnd = self.window.winfo_id()
             styles = win32gui.GetWindowLong(hwnd, win32con.GWL_EXSTYLE)

@@ -344,16 +344,20 @@ class BasicPitchBackend:
         if self._model is not None:
             return self._model
         try:
-            from basic_pitch import ICASSP_2022_MODEL_PATH
+            from basic_pitch import FilenameSuffix, build_icassp_2022_model_path
             from basic_pitch.inference import Model
         except ImportError as exc:
             raise TranscriptionError(
-                "缺少 Basic Pitch / ONNX Runtime，无法使用复音高质量模式"
+                "缺少 Basic Pitch 运行时，无法使用复音高质量模式"
             ) from exc
         try:
-            self._model = Model(ICASSP_2022_MODEL_PATH)
+            # Basic Pitch chooses CoreML by default on macOS.  The project
+            # deliberately uses the bundled ONNX model on every platform so
+            # Windows and macOS produce the same inference path.
+            model_path = build_icassp_2022_model_path(FilenameSuffix.onnx)
+            self._model = Model(model_path)
         except Exception as exc:
-            raise TranscriptionError(f"Basic Pitch 模型加载失败: {exc}") from exc
+            raise TranscriptionError(f"Basic Pitch ONNX 模型加载失败: {exc}") from exc
         return self._model
 
     def transcribe(

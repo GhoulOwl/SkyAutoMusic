@@ -14,7 +14,7 @@ from .arranger import NOTE_NAMES
 from .backends import is_midi_file
 from .models import CancelledError, SourceMetadata, TranscriptionOptions, TranscriptionResult
 from .netease import NetEaseClient, NetEaseTrack
-from .netease_auth import CookieValidationResult, NetEaseCookieStore, parse_netscape_cookies, serialize_netscape_cookies
+from .netease_auth import CookieValidationResult, NetEaseCookieStore, parse_netscape_cookies, serialize_netscape_cookies, validate_cookie_account
 from .pipeline import cleanup_result_artifacts, export_song_json, next_available_path, rearrange_draft, refine_region, suggested_output_stem, transcribe_draft
 from .preview import PreviewPlayer
 from .quality import choose_quality_device, prepare_quality_model, resolve_quality_model
@@ -505,12 +505,35 @@ class TranscriptionDialog:
         text = tk.Text(window, wrap="none"); text.pack(fill="both", expand=True, padx=10, pady=10)
         try: text.insert("1.0", self.cookie_store.load_text() or "")
         except Exception: pass
+        save_button = ttk.Button(window, text="保存并验证")
+        save_button.pack(pady=(0, 10))
+
+        def finish_save(canonical: str, validation: CookieValidationResult, error: Optional[str]) -> None:
+            save_button.configure(text="保存并验证", state="normal")
+            if error:
+                messagebox.showerror("Cookie 验证失败", error, parent=window)
+                return
+            try:
+                self.cookie_store.save(canonical, validation)
+                self.cookie_status_var.set(self.cookie_store.load_validation().message)
+                window.destroy()
+            except Exception as exc: messagebox.showerror("Cookie 无效", str(exc), parent=window)
+
         def save() -> None:
             try:
                 canonical = serialize_netscape_cookies(parse_netscape_cookies(text.get("1.0", "end")))
-                self.cookie_store.save(canonical, CookieValidationResult("unverified", "已加密保存，尚未联网验证")); self.cookie_status_var.set(self.cookie_store.load_validation().message); window.destroy()
-            except Exception as exc: messagebox.showerror("Cookie 无效", str(exc), parent=window)
-        ttk.Button(window, text="保存", command=save).pack(pady=(0, 10))
+            except Exception as exc:
+                messagebox.showerror("Cookie 无效", str(exc), parent=window)
+                return
+            save_button.configure(text="正在联网验证…", state="disabled")
+
+            def worker() -> None:
+                validation = validate_cookie_account(parse_netscape_cookies(canonical))
+                self._after(finish_save, canonical, validation, None)
+
+            self._start_worker(worker)
+
+        save_button.configure(command=save)
 
     def search_netease(self) -> None:
         query = self.query_var.get().strip()

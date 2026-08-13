@@ -2,14 +2,18 @@ import io
 import os
 import sys
 import tempfile
+import types
 import unittest
+from unittest import mock
 
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from audio_preview import (  # noqa: E402
     AudioPreviewController,
+    create_sample_player,
     MciSamplePlayer,
+    PygameSamplePlayer,
     PianoSampleLibrary,
     SAMPLE_COUNT,
     note_to_sample_index,
@@ -151,6 +155,14 @@ class TestAudioPreviewController(unittest.TestCase):
         self.assertEqual(backend.closed, 1)
         self.assertFalse(controller.prepared)
 
+    def test_macos_factory_selects_pygame_backend(self):
+        with mock.patch("audio_preview.sys.platform", "darwin"), mock.patch(
+            "audio_preview.PygameSamplePlayer"
+        ) as player:
+            paths = [f"{index}.mp3" for index in range(SAMPLE_COUNT)]
+            create_sample_player(paths)
+            player.assert_called_once_with(paths)
+
 
 class TestMciSamplePlayer(unittest.TestCase):
     def test_chord_commands_use_independent_aliases(self):
@@ -165,6 +177,81 @@ class TestMciSamplePlayer(unittest.TestCase):
         play_commands = [command for command in commands if command.startswith("play ")]
         self.assertEqual(len(play_commands), 2)
         self.assertNotEqual(play_commands[0], play_commands[1])
+
+
+class _FakePygameChannel:
+    def __init__(self, channel_id):
+        self.channel_id = channel_id
+        self.played = []
+        self.stopped = 0
+
+    def play(self, sound):
+        self.played.append(sound)
+
+    def stop(self):
+        self.stopped += 1
+
+
+class _FakePygameMixer:
+    def __init__(self):
+        self.channels = {}
+        self.sound_paths = []
+        self.init_calls = 0
+        self.quit_calls = 0
+        self.channel_count = 0
+
+    def pre_init(self, **_kwargs):
+        return None
+
+    def init(self):
+        self.init_calls += 1
+
+    def set_num_channels(self, count):
+        self.channel_count = count
+
+    def Sound(self, path):
+        self.sound_paths.append(path)
+        return path
+
+    def Channel(self, channel_id):
+        channel = self.channels.setdefault(channel_id, _FakePygameChannel(channel_id))
+        return channel
+
+    def quit(self):
+        self.quit_calls += 1
+
+
+class TestPygameSamplePlayer(unittest.TestCase):
+    def test_chords_use_private_channels_and_close_releases_mixer(self):
+        from audio_preview import _PygameMixerRuntime
+
+        mixer = _FakePygameMixer()
+        pygame = types.SimpleNamespace(mixer=mixer)
+        paths = [f"{index}.mp3" for index in range(SAMPLE_COUNT)]
+        player = PygameSamplePlayer(paths, pygame_module=pygame)
+        player.play_indices([0, 4])
+        used = [channel for channel in mixer.channels.values() if channel.played]
+        self.assertEqual(len(used), 2)
+        self.assertEqual(mixer.init_calls, 1)
+        player.close()
+        self.assertEqual(mixer.quit_calls, 1)
+        self.assertIsNone(_PygameMixerRuntime._pygame)
+
+    def test_two_players_stop_only_their_own_channels(self):
+        mixer = _FakePygameMixer()
+        pygame = types.SimpleNamespace(mixer=mixer)
+        paths = [f"{index}.mp3" for index in range(SAMPLE_COUNT)]
+        first = PygameSamplePlayer(paths, pygame_module=pygame)
+        second = PygameSamplePlayer(paths, pygame_module=pygame)
+        first.play_indices([0])
+        second.play_indices([1])
+        first_channels = mixer.channels[first._channel_ids[0]]
+        second_channels = mixer.channels[second._channel_ids[0]]
+        first.stop_all()
+        self.assertGreater(first_channels.stopped, 0)
+        self.assertEqual(second_channels.stopped, 0)
+        first.close()
+        second.close()
 
 
 if __name__ == "__main__":

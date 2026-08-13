@@ -1,15 +1,15 @@
 --extra-index-url https://download.pytorch.org/whl/cpu
 
-pyautogui==0.9.54
-keyboard==0.13.5
-pywin32==306
-psutil==5.9.8
+pyautogui==0.9.54; sys_platform == "win32"
+keyboard==0.13.5; sys_platform == "win32"
+pywin32==306; sys_platform == "win32"
+psutil==5.9.8; sys_platform == "win32"
 # ---- 虚拟HID/驱动级键盘（Interception）----
 # 提示：使用驱动级键盘需额外安装内核驱动 interception-driver（见 README）。
 # 安装驱动后，按键注入在驱动层完成，可绕过部分游戏对 SendInput 的屏蔽。
 # 未安装驱动时程序会自动回退到 keyboard / pyautogui，无需卸载本依赖。
 # 注意：interception-python 需要 Python>=3.10。
-interception-python>=1.13
+interception-python>=1.13; sys_platform == "win32"
 # ---- 扒谱（音频转乐谱）功能依赖 ----
 # Windows 发布固定使用 Python 3.10，使 basic-pitch 选择 ONNX Runtime 而非 TensorFlow。
 # 固定经 Windows/Python 3.10 构建使用的直接依赖版本，避免二进制 ABI 漂移。
@@ -33,3 +33,6 @@ beat-this==1.1.0
 # 将 MP3/FLAC/AAC/M4A 统一转换为扒谱用 WAV。
 yt-dlp==2026.7.4
 imageio-ffmpeg==0.6.0
+# macOS preview and credential storage backends.
+pygame-ce==2.5.8; sys_platform == "darwin"
+keyring==25.7.0; sys_platform == "darwin"

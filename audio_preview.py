@@ -291,12 +291,167 @@ class MciSamplePlayer:
             pass
 
 
+class _PygameMixerRuntime:
+    """Process-wide pygame mixer and private channel-block allocator.
+
+    The main window and the transcription dialog can each own a preview
+    controller.  Giving every controller its own channel block means stopping
+    one preview does not stop the other one.
+    """
+
+    CHANNELS_PER_OWNER = 32
+    _lock = threading.RLock()
+    _pygame = None
+    _owners = 0
+    _next_channel = 0
+    _free_blocks = []
+
+    @classmethod
+    def acquire(cls, pygame_module=None):
+        with cls._lock:
+            if cls._pygame is None:
+                try:
+                    if pygame_module is None:
+                        import pygame
+                    else:
+                        pygame = pygame_module
+                except Exception as exc:
+                    raise AudioPreviewError(
+                        "macOS 试听需要 pygame-ce，请先安装 macOS 依赖"
+                    ) from exc
+                try:
+                    pygame.mixer.pre_init(
+                        frequency=48000,
+                        size=-16,
+                        channels=2,
+                        buffer=512,
+                    )
+                    pygame.mixer.init()
+                except Exception as exc:
+                    try:
+                        pygame.mixer.quit()
+                    except Exception:
+                        pass
+                    raise AudioPreviewError(f"无法初始化 macOS 音频设备: {exc}") from exc
+                cls._pygame = pygame
+                cls._owners = 0
+                cls._next_channel = 0
+                cls._free_blocks = []
+
+            if cls._free_blocks:
+                block = cls._free_blocks.pop()
+            else:
+                start = cls._next_channel
+                block = tuple(range(start, start + cls.CHANNELS_PER_OWNER))
+                cls._next_channel += cls.CHANNELS_PER_OWNER
+                try:
+                    cls._pygame.mixer.set_num_channels(cls._next_channel)
+                except Exception as exc:
+                    if cls._owners == 0:
+                        try:
+                            cls._pygame.mixer.quit()
+                        except Exception:
+                            pass
+                        cls._pygame = None
+                    raise AudioPreviewError(f"无法分配 macOS 试听声道: {exc}") from exc
+            cls._owners += 1
+            return cls._pygame, block
+
+    @classmethod
+    def release(cls, block):
+        with cls._lock:
+            if cls._pygame is None:
+                return
+            cls._free_blocks.append(tuple(block))
+            cls._owners = max(0, cls._owners - 1)
+            if cls._owners:
+                return
+            try:
+                cls._pygame.mixer.quit()
+            finally:
+                cls._pygame = None
+                cls._next_channel = 0
+                cls._free_blocks = []
+
+
+class PygameSamplePlayer:
+    """Cross-platform sample player used by the macOS preview mode."""
+
+    def __init__(self, sample_paths, pygame_module=None):
+        if len(sample_paths) != SAMPLE_COUNT:
+            raise AudioPreviewError(f"需要 {SAMPLE_COUNT} 个钢琴音色文件")
+        self._lock = threading.RLock()
+        self._closed = False
+        self._pygame, self._channel_ids = _PygameMixerRuntime.acquire(pygame_module)
+        self._channels = []
+        try:
+            self._sounds = [self._pygame.mixer.Sound(path) for path in sample_paths]
+            self._channels = [
+                self._pygame.mixer.Channel(channel_id)
+                for channel_id in self._channel_ids
+            ]
+        except Exception as exc:
+            _PygameMixerRuntime.release(self._channel_ids)
+            self._closed = True
+            raise AudioPreviewError(f"无法读取 macOS 钢琴音色: {exc}") from exc
+        self._cursor = 0
+
+    def play_indices(self, indices):
+        with self._lock:
+            if self._closed:
+                raise AudioPreviewError("试听音频设备已关闭")
+            for index in indices:
+                if not 0 <= int(index) < len(self._sounds):
+                    continue
+                channel = self._channels[self._cursor]
+                self._cursor = (self._cursor + 1) % len(self._channels)
+                try:
+                    channel.play(self._sounds[int(index)])
+                except Exception as exc:
+                    raise AudioPreviewError(f"播放 macOS 钢琴音色失败: {exc}") from exc
+
+    def stop_all(self):
+        with self._lock:
+            if self._closed:
+                return
+            for channel in self._channels:
+                try:
+                    channel.stop()
+                except Exception:
+                    pass
+
+    def close(self):
+        with self._lock:
+            if self._closed:
+                return
+            self._closed = True
+            for channel in self._channels:
+                try:
+                    channel.stop()
+                except Exception:
+                    pass
+            block = self._channel_ids
+            self._channels = []
+            self._channel_ids = ()
+        _PygameMixerRuntime.release(block)
+
+
+def create_sample_player(sample_paths):
+    """Create the native preview backend for the current operating system."""
+
+    if sys.platform == "win32":
+        return MciSamplePlayer(sample_paths)
+    if sys.platform == "darwin":
+        return PygameSamplePlayer(sample_paths)
+    raise AudioPreviewError("当前操作系统没有可用的试听后端")
+
+
 class AudioPreviewController:
     """Keyboard-controller-compatible adapter backed by piano samples."""
 
     def __init__(self, library=None, backend_factory=None, on_error=None):
         self.library = library or PianoSampleLibrary()
-        self.backend_factory = backend_factory or MciSamplePlayer
+        self.backend_factory = backend_factory or create_sample_player
         self.on_error = on_error
         self._backend = None
         self._lock = threading.RLock()

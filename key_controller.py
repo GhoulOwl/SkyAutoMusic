@@ -11,8 +11,22 @@
 的顺序自动选择第一个可用的后端；单次按键失败时也会沿同一链路自动回退。
 """
 
-import keyboard
-import pyautogui
+import sys
+
+if sys.platform == "win32":
+    try:
+        import keyboard
+    except Exception:  # keyboard is optional even on Windows.
+        keyboard = None
+    try:
+        import pyautogui
+    except Exception:  # pyautogui is the final Windows fallback.
+        pyautogui = None
+else:
+    # Do not import Windows input packages on macOS/Linux.  The GUI hides game
+    # playback there, but keeping the backend objects preserves the public API.
+    keyboard = None
+    pyautogui = None
 
 
 note_to_key = {
@@ -51,6 +65,9 @@ class _InterceptionBackend:
 
     def _load(self):
         """惰性加载 interception 模块；驱动未安装时返回 None。"""
+        if sys.platform != "win32":
+            self._available = False
+            return None
         if self._module is not None or self._available is False:
             return self._module
         try:
@@ -102,12 +119,16 @@ class _KeyboardBackend:
 
     @property
     def available(self):
-        return True
+        return keyboard is not None
 
     def press(self, key):
+        if keyboard is None:
+            raise RuntimeError("keyboard 后端不可用")
         keyboard.press(key)
 
     def release(self, key):
+        if keyboard is None:
+            raise RuntimeError("keyboard 后端不可用")
         keyboard.release(key)
 
 
@@ -119,12 +140,16 @@ class _PyAutoGUIBackend:
 
     @property
     def available(self):
-        return True
+        return pyautogui is not None
 
     def press(self, key):
+        if pyautogui is None:
+            raise RuntimeError("pyautogui 后端不可用")
         pyautogui.keyDown(key)
 
     def release(self, key):
+        if pyautogui is None:
+            raise RuntimeError("pyautogui 后端不可用")
         pyautogui.keyUp(key)
 
 
@@ -244,6 +269,8 @@ class KeyController:
                 continue
         if last_err:
             self.log_func(f"[WARN] 按键{action}失败: {key} ({last_err})")
+        else:
+            self.log_func(f"[WARN] 当前平台不支持键盘注入: {action} {key}")
 
     def press(self, note):
         key = self._resolve(note)

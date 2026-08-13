@@ -27,3 +27,37 @@ jobs:
 
       - name: Run unit tests
         run: python -B -m unittest discover -s tests -v
+
+  macos-arm64:
+    runs-on: macos-15
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.10'
+      - name: Install macOS dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements-macos-lock.txt
+      - name: Verify Apple Silicon runtimes
+        run: |
+          python - <<'PY'
+          import importlib.util
+          import platform
+          import sys
+          assert platform.machine() == "arm64", platform.machine()
+          assert sys.version_info[:2] == (3, 10), sys.version
+          import tkinter
+          for name in ("basic_pitch", "coremltools", "demucs", "onnxruntime", "pygame", "keyring", "torch", "torchaudio"):
+              assert importlib.util.find_spec(name), name
+          assert importlib.util.find_spec("win32gui") is None
+          assert importlib.util.find_spec("interception") is None
+          PY
+      - name: Run unit tests
+        env:
+          SDL_AUDIODRIVER: dummy
+        run: python -B -m unittest discover -s tests -v
+      - name: Verify GUI import
+        run: python -c "import play_music_gui; print('GUI import OK')"

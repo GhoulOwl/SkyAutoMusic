@@ -39,7 +39,7 @@ def render_preview_wav(
         import librosa
         import numpy as np
     except ImportError as exc:
-        raise TranscriptionError("缺少 librosa / numpy，无法生成光遇音色试听") from exc
+        raise TranscriptionError("缺少 librosa / numpy，无法生成钢琴音色试听") from exc
 
     notes = list(song_notes)
     if not notes:
@@ -55,7 +55,7 @@ def render_preview_wav(
                 mono=True,
             )
         except Exception as exc:
-            raise TranscriptionError(f"无法读取光遇音色 {index}: {exc}") from exc
+            raise TranscriptionError(f"无法读取钢琴音色 {index}: {exc}") from exc
         decoded[index] = np.asarray(audio, dtype=np.float32)
 
     first_ms = min(int(note["time"]) for note in notes)
@@ -131,7 +131,7 @@ class PreviewPlayer:
 
     def play(self, result: TranscriptionResult) -> bool:
         if not self.prepared:
-            raise TranscriptionError("光遇试听音色尚未准备完成")
+            raise TranscriptionError("钢琴音色尚未准备完成")
         self.stop()
         notes_by_time = defaultdict(list)
         for note in result.song_notes:
@@ -146,7 +146,7 @@ class PreviewPlayer:
         self.player.speed = 1.0
         self.player.simulate = False
         if not self.player.start(dict(notes_by_time), sorted_times):
-            raise TranscriptionError("无法启动光遇音色试听")
+            raise TranscriptionError("无法启动钢琴音色试听")
         return True
 
     def pause_or_resume(self) -> PlaybackState:
@@ -167,7 +167,7 @@ class PreviewPlayer:
 
     def _handle_status(self, message: str) -> None:
         if message.startswith("演奏进度"):
-            message = "光遇音色试听" + message[len("演奏进度"):]
+            message = "钢琴音色试听" + message[len("演奏进度"):]
         self.on_status(message)
 
     def _handle_finished(self) -> None:

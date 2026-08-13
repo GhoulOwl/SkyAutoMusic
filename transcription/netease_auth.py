@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 import base64
+import hashlib
 import json
 import os
+import sys
 import tempfile
 import time
 import urllib.error
@@ -231,6 +233,51 @@ def _dpapi_unprotect(data: bytes) -> bytes:
     return plaintext
 
 
+class _MacKeychainCookieStore:
+    """Store the canonical Netscape cookie text in macOS Keychain."""
+
+    SERVICE = "SkyAutoMusic.NetEase"
+
+    def __init__(self, path: str):
+        try:
+            import keyring
+        except ImportError as exc:
+            raise RuntimeError("macOS 网易云 Cookie 需要安装 keyring") from exc
+        self._keyring = keyring
+        self.service = self.SERVICE
+        self.account = hashlib.sha256(
+            os.path.abspath(path).encode("utf-8")
+        ).hexdigest()
+
+    def save(self, text: str) -> None:
+        try:
+            self._keyring.set_password(self.service, self.account, text)
+        except Exception as exc:
+            raise RuntimeError(f"无法写入 macOS Keychain: {exc}") from exc
+
+    def load(self) -> Optional[str]:
+        try:
+            value = self._keyring.get_password(self.service, self.account)
+        except Exception as exc:
+            raise RuntimeError(f"无法读取 macOS Keychain: {exc}") from exc
+        return value or None
+
+    def clear(self) -> None:
+        # Avoid treating the keyring's backend-specific "item missing"
+        # exception as an access failure.  Reading first also keeps clear()
+        # idempotent across macOS keyring implementations.
+        if self.load() is None:
+            return
+        try:
+            self._keyring.delete_password(self.service, self.account)
+        except Exception as exc:
+            # keyring raises when the item does not exist; clearing an already
+            # empty store remains idempotent, while other errors are visible.
+            message = str(exc).lower()
+            if "not found" not in message and "no password" not in message:
+                raise RuntimeError(f"无法清除 macOS Keychain: {exc}") from exc
+
+
 class NetEaseCookieStore:
     """Persist only encrypted, NetEase-scoped Netscape cookies."""
 
@@ -242,6 +289,9 @@ class NetEaseCookieStore:
         unprotect: Optional[Callable[[bytes], bytes]] = None,
     ):
         self.path = os.path.abspath(path)
+        self._keychain = None
+        if sys.platform == "darwin" and protect is None and unprotect is None:
+            self._keychain = _MacKeychainCookieStore(self.path)
         self._protect = protect or _dpapi_protect
         self._unprotect = unprotect or _dpapi_unprotect
 
@@ -252,6 +302,19 @@ class NetEaseCookieStore:
     ) -> None:
         cookies = parse_netscape_cookies(canonical_text)
         filtered_text = serialize_netscape_cookies(cookies)
+        if self._keychain is not None:
+            self._keychain.save(filtered_text)
+            payload = {
+                "schemaVersion": 2,
+                "credentialBackend": "macos-keychain",
+                "keychainService": self._keychain.service,
+                "keychainAccount": self._keychain.account,
+                "validation": validation.state,
+                "nickname": validation.nickname,
+                "savedAt": int(time.time()),
+            }
+            self._write_payload(payload)
+            return
         encrypted = self._protect(filtered_text.encode("utf-8"))
         payload = {
             "schemaVersion": 1,
@@ -260,6 +323,9 @@ class NetEaseCookieStore:
             "nickname": validation.nickname,
             "savedAt": int(time.time()),
         }
+        self._write_payload(payload)
+
+    def _write_payload(self, payload: dict) -> None:
         directory = os.path.dirname(self.path)
         os.makedirs(directory, exist_ok=True)
         temporary_path = None
@@ -290,8 +356,25 @@ class NetEaseCookieStore:
             return None
         with open(self.path, "r", encoding="utf-8") as handle:
             payload = json.load(handle)
-        if int(payload.get("schemaVersion", 0)) != 1:
+        version = int(payload.get("schemaVersion", 0))
+        if version == 2:
+            if self._keychain is None:
+                raise RuntimeError("此 Cookie 使用 macOS Keychain，请在 macOS 上重新读取")
+            if (
+                payload.get("credentialBackend") != "macos-keychain"
+                or payload.get("keychainService") != self._keychain.service
+                or payload.get("keychainAccount") != self._keychain.account
+            ):
+                raise RuntimeError("网易云 Cookie 的 Keychain 引用与当前文件不匹配")
+            plaintext = self._keychain.load()
+            if not plaintext:
+                raise RuntimeError("macOS Keychain 中没有找到网易云 Cookie，请重新录入")
+            cookies = parse_netscape_cookies(plaintext)
+            return serialize_netscape_cookies(cookies)
+        if version != 1:
             raise RuntimeError("Cookie 存储版本不受支持，请清除后重新保存")
+        if self._keychain is not None:
+            raise RuntimeError("Windows Cookie 认证不可跨平台迁移，请在 macOS 上重新录入")
         encrypted = base64.b64decode(payload["ciphertext"], validate=True)
         plaintext = self._unprotect(encrypted).decode("utf-8")
         cookies = parse_netscape_cookies(plaintext)
@@ -309,14 +392,23 @@ class NetEaseCookieStore:
             nickname = str(payload.get("nickname") or "")
             if state == "valid":
                 suffix = f"：{nickname}" if nickname else ""
-                message = f"已加密保存并验证{suffix}"
+                if self._keychain is not None:
+                    message = f"已保存到 macOS Keychain 并验证{suffix}"
+                else:
+                    message = f"已加密保存并验证{suffix}"
             else:
-                message = "已加密保存，尚未联网验证"
+                message = (
+                    "已保存到 macOS Keychain，尚未联网验证"
+                    if self._keychain is not None
+                    else "已加密保存，尚未联网验证"
+                )
             return CookieValidationResult(state, message, nickname)
         except Exception:
             return CookieValidationResult("unverified", "Cookie 状态无法读取")
 
     def clear(self) -> None:
+        if self._keychain is not None:
+            self._keychain.clear()
         try:
             os.unlink(self.path)
         except FileNotFoundError:

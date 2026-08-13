@@ -99,6 +99,7 @@ class _FakeBackend:
         self.calls.append(("release", key))
 
 
+@unittest.skipUnless(sys.platform == "win32", "Windows input backend tests")
 class TestInputBackends(unittest.TestCase):
     def _force_driver_unavailable(self, controller):
         controller._backends["interception"]._available = False

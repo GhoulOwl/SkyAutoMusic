@@ -29,4 +29,5 @@ assets/models/htdemucs_6s/model-manifest.json
 assets/llm/llama-cpp/
 config.json
 Favorites.json
-
+golden_samples
+.transcription-cache/

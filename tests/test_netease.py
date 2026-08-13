@@ -4,6 +4,7 @@ import sys
 import tempfile
 import threading
 import unittest
+from unittest import mock
 import urllib.error
 
 
@@ -143,6 +144,51 @@ class TestNetEaseCookies(unittest.TestCase):
             self.assertFalse(os.path.exists(materialized))
             store.clear()
             self.assertFalse(os.path.exists(path))
+
+    @unittest.skipUnless(sys.platform == "darwin", "macOS Keychain test")
+    def test_macos_store_uses_keychain_without_plaintext_metadata(self):
+        text = _cookies_text(
+            ".music.163.com\tTRUE\t/\tTRUE\t0\tMUSIC_U\tmac-secret-value"
+        )
+        values = {}
+
+        fake_keyring = mock.Mock()
+        fake_keyring.set_password.side_effect = (
+            lambda service, account, value: values.__setitem__((service, account), value)
+        )
+        fake_keyring.get_password.side_effect = (
+            lambda service, account: values.get((service, account))
+        )
+        fake_keyring.delete_password.side_effect = (
+            lambda service, account: values.pop((service, account), None)
+        )
+        with tempfile.TemporaryDirectory() as directory, mock.patch.dict(
+            sys.modules, {"keyring": fake_keyring}
+        ), mock.patch.object(sys, "platform", "darwin"):
+            path = os.path.join(directory, "netease_auth.json")
+            store = NetEaseCookieStore(path)
+            store.save(text, CookieValidationResult("valid", "ok", "tester"))
+            with open(path, "r", encoding="utf-8") as handle:
+                metadata = handle.read()
+            self.assertIn('"schemaVersion": 2', metadata)
+            self.assertNotIn("mac-secret-value", metadata)
+            self.assertIn("mac-secret-value", store.load_text())
+            store.clear()
+            self.assertFalse(os.path.exists(path))
+            fake_keyring.delete_password.assert_called_once()
+
+    def test_macos_rejects_windows_schema_without_dpapi_fallback(self):
+        fake_keyring = mock.Mock()
+        with tempfile.TemporaryDirectory() as directory, mock.patch.dict(
+            sys.modules, {"keyring": fake_keyring}
+        ), mock.patch.object(sys, "platform", "darwin"):
+            path = os.path.join(directory, "netease_auth.json")
+            with open(path, "w", encoding="utf-8") as handle:
+                json.dump({"schemaVersion": 1, "ciphertext": "AA=="}, handle)
+            store = NetEaseCookieStore(path)
+            with self.assertRaisesRegex(RuntimeError, "不可跨平台迁移"):
+                store.load_text()
+            fake_keyring.get_password.assert_not_called()
 
 
 class TestNetEaseClient(unittest.TestCase):

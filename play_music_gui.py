@@ -1,5 +1,6 @@
 import os
 import json
+import importlib.util
 import threading
 import tkinter as tk
 from tkinter import ttk, messagebox
@@ -11,7 +12,8 @@ from key_controller import KeyController, note_to_key
 from player import MusicPlayer, PlaybackState
 from playlist_store import PlaybackSession, PlaylistStore
 from score_loader import ScoreValidationError, load_score, summarize_meta
-from score_overlay import ScoreOverlay
+from score_overlay import NullScoreOverlay, ScoreOverlay
+from platform_support import CAPABILITIES
 from window_focus import (
     bring_window_to_front,
     describe_foreground_window,
@@ -54,7 +56,11 @@ def is_dark_mode():
 class MusicGUI:
     def __init__(self, root):
         self.root = root
-        self.root.title("SkyAutoMusic 自动弹琴")
+        self.root.title(
+            "SkyAutoMusic 乐谱工具"
+            if not CAPABILITIES.game_playback_supported
+            else "SkyAutoMusic 自动弹琴"
+        )
         # 读取窗口配置
         win_w, win_h = 760, 600
         x, y = None, None
@@ -103,13 +109,19 @@ class MusicGUI:
         }
         self.hotkeys = self.default_hotkeys.copy()
         self.hotkey_vars = {k: tk.StringVar(value=v) for k, v in self.hotkeys.items()}
-        self.status_var = tk.StringVar(value="请选择乐谱并点击开始演奏")
+        self.status_var = tk.StringVar(
+            value=("请选择乐谱并点击本地试听"
+                   if not CAPABILITIES.game_playback_supported
+                   else "请选择乐谱并点击开始演奏")
+        )
         self.elapsed_time_var = tk.StringVar(value="0:00")
         self.total_time_var = tk.StringVar(value="0:00")
         self.hotkey_status_var = tk.StringVar(value="未注册")
         self.game_window_var = tk.StringVar(value="未检测")
         self.foreground_window_var = tk.StringVar(value="未检测")
-        self.admin_status_var = tk.StringVar(value="是" if is_admin() else "否")
+        self.admin_status_var = tk.StringVar(
+            value="是" if CAPABILITIES.is_windows and is_admin() else "不适用"
+        )
         self.overlay_status_var = tk.StringVar(value="未显示")
         self.music_count_var = tk.StringVar(value="0 首")
         self.music_info_vars = {
@@ -179,13 +191,16 @@ class MusicGUI:
             update_finished=self._on_preview_finished,
         )
         self._set_playback_controls(None)
-        self.overlay = ScoreOverlay(
-            self.root,
-            geometry=self.config.get("overlay_geometry"),
-            locked=self.config.get("overlay_locked", True),
-            on_geometry_changed=self._on_overlay_geometry_changed,
-            log_func=self._debug_log,
-        )
+        if CAPABILITIES.overlay_supported:
+            self.overlay = ScoreOverlay(
+                self.root,
+                geometry=self.config.get("overlay_geometry"),
+                locked=self.config.get("overlay_locked", True),
+                on_geometry_changed=self._on_overlay_geometry_changed,
+                log_func=self._debug_log,
+            )
+        else:
+            self.overlay = NullScoreOverlay()
         self.music_data = None
         self.notes_by_time = None
         self.sorted_times = None
@@ -423,8 +438,11 @@ class MusicGUI:
         btn_frame.pack(pady=8, fill="x")
         btn_frame.columnconfigure(0, weight=1)
         btn_frame.columnconfigure(1, weight=1)
-        self.start_btn = ttk.Button(btn_frame, text="游戏演奏 (F5)", command=self.start_play, style='Accent.TButton')
-        self.start_btn.grid(row=0, column=0, sticky="ew", padx=(0, 6), pady=6)
+        if CAPABILITIES.game_playback_supported:
+            self.start_btn = ttk.Button(btn_frame, text="游戏演奏 (F5)", command=self.start_play, style='Accent.TButton')
+            self.start_btn.grid(row=0, column=0, sticky="ew", padx=(0, 6), pady=6)
+        else:
+            self.start_btn = None
         self.stop_btn = ttk.Button(btn_frame, text="停止 (F7)", command=self.stop_play, state="disabled", style='Accent.TButton')
         self.stop_btn.grid(row=0, column=1, sticky="ew", padx=(6, 0), pady=6)
         self.preview_btn = ttk.Button(btn_frame, text="本地试听", command=self.start_preview, style='Accent.TButton')
@@ -470,18 +488,27 @@ class MusicGUI:
         group_label.bind("<Button-1>", lambda e: webbrowser.open("https://qm.qq.com/q/XVf2HjGJgK"))
         # 其它说明
         ttk.Label(frame, text="本程序完全免费，仅供学习交流，严禁商用.").grid(row=2, column=0, sticky="w", padx=4, pady=4)
-        ttk.Label(frame, text="右键曲谱可以收藏曲谱，方便下次演奏.").grid(row=3, column=0, sticky="w", padx=4, pady=4)
+        ttk.Label(frame, text="右键曲谱可以收藏曲谱，方便下次播放.").grid(row=3, column=0, sticky="w", padx=4, pady=4)
         # 热键说明区
         frame = ttk.LabelFrame(parent or self.root, text="热键说明", padding=14)
         frame.pack(pady=10, fill="x", padx=8)
-        hotkey_rows = [
-            ("游戏演奏:", "start"),
-            ("上一首:", "previous"),
-            ("停止:", "stop"),
-            ("下一首:", "next"),
-            ("暂停/继续:", "toggle_pause"),
-            ("覆盖层移动/锁定:", "overlay_lock"),
-        ]
+        hotkey_rows = (
+            [
+                ("游戏演奏:", "start"),
+                ("上一首:", "previous"),
+                ("停止:", "stop"),
+                ("下一首:", "next"),
+                ("暂停/继续:", "toggle_pause"),
+                ("覆盖层移动/锁定:", "overlay_lock"),
+            ]
+            if CAPABILITIES.game_playback_supported
+            else [
+                ("上一首试听:", "previous"),
+                ("停止试听:", "stop"),
+                ("下一首试听:", "next"),
+                ("暂停/继续试听:", "toggle_pause"),
+            ]
+        )
         for row, (label, name) in enumerate(hotkey_rows):
             ttk.Label(frame, text=label).grid(row=row, column=0, sticky="e", padx=4, pady=4)
             ttk.Label(
@@ -492,6 +519,31 @@ class MusicGUI:
             ).grid(row=row, column=1, sticky="w", padx=4, pady=4)
 
     def create_diagnostics_tab(self, parent):
+        if not CAPABILITIES.is_windows:
+            frame = ttk.LabelFrame(parent, text="运行状态", padding=14)
+            frame.pack(padx=10, pady=10, fill="x")
+            basic_pitch_status = self._module_status("onnxruntime", "未安装")
+            demucs_status = self._demucs_model_status()
+            keychain_status = self._module_status("keyring", "未安装")
+            rows = [
+                ("平台:", tk.StringVar(value="macOS")),
+                ("架构:", tk.StringVar(value=CAPABILITIES.machine)),
+                ("Python/Tk:", tk.StringVar(value=f"{sys.version.split()[0]} / 已加载")),
+                ("试听后端:", tk.StringVar(value=CAPABILITIES.audio_backend)),
+                ("Basic Pitch:", tk.StringVar(value=basic_pitch_status)),
+                ("Demucs 模型:", tk.StringVar(value=demucs_status)),
+                ("凭据后端:", tk.StringVar(value=f"{CAPABILITIES.credential_backend} ({keychain_status})")),
+            ]
+            for row, (label, var) in enumerate(rows):
+                ttk.Label(frame, text=label, width=12, anchor="e").grid(row=row, column=0, sticky="e", padx=4, pady=4)
+                ttk.Label(frame, textvariable=var, anchor="w").grid(row=row, column=1, sticky="we", padx=4, pady=4)
+            frame.columnconfigure(1, weight=1)
+            log_frame = ttk.LabelFrame(parent, text="运行日志", padding=8)
+            log_frame.pack(padx=10, pady=8, fill="both", expand=True)
+            self.debug_text = tk.Text(log_frame, height=10, wrap="word", font=("Consolas", 9), bg="#FFFFFF", fg="#222", relief="solid", borderwidth=1)
+            self.debug_text.pack(fill="both", expand=True)
+            self.debug_text.configure(state="disabled")
+            return
         frame = ttk.LabelFrame(parent, text="运行状态", padding=14)
         frame.pack(padx=10, pady=10, fill="x")
         rows = [
@@ -532,6 +584,7 @@ class MusicGUI:
         self.input_method_combo.bind("<<ComboboxSelected>>", self._on_input_method_change)
         ttk.Button(input_frame, text="校准驱动级键盘", command=self.calibrate_driver_keyboard, style='Accent.TButton').grid(row=0, column=2, padx=4, pady=4)
         self.input_method_status_var = tk.StringVar(value="")
+
         ttk.Label(input_frame, textvariable=self.input_method_status_var, anchor="w", wraplength=430, foreground="#888").grid(row=1, column=0, columnspan=3, sticky="we", padx=4, pady=(2, 0))
         input_frame.columnconfigure(1, weight=1)
 
@@ -540,6 +593,25 @@ class MusicGUI:
         self.debug_text = tk.Text(log_frame, height=10, wrap="word", font=("Consolas", 9), bg="#FFFFFF", fg="#222", relief="solid", borderwidth=1)
         self.debug_text.pack(fill="both", expand=True)
         self.debug_text.configure(state="disabled")
+
+    @staticmethod
+    def _module_status(module_name, missing_text):
+        """Return a compact import diagnostic without importing heavy modules."""
+        try:
+            return "已安装" if importlib.util.find_spec(module_name) else missing_text
+        except (ImportError, ModuleNotFoundError, ValueError):
+            return missing_text
+
+    @staticmethod
+    def _demucs_model_status():
+        try:
+            from transcription.separation import validate_model_repository
+
+            validate_model_repository()
+            return "已就绪"
+        except Exception as exc:
+            message = str(exc).split("。", 1)[0]
+            return f"未就绪（{message[:42]}）"
 
     def get_all_music_files(self):
         files = [f for f in os.listdir(SHEET_MUSIC_DIR) if f.lower().endswith('.json')]
@@ -841,6 +913,9 @@ class MusicGUI:
         return True
 
     def start_play(self):
+        if not CAPABILITIES.game_playback_supported:
+            self.status_var.set("当前 macOS 模式不支持游戏演奏")
+            return False
         self._begin_selected_playback("game")
 
     def start_preview(self):
@@ -870,6 +945,9 @@ class MusicGUI:
         self._apply_song_info(filename, score, reset_progress=True)
 
         if mode == "game":
+            if not CAPABILITIES.game_playback_supported:
+                self.status_var.set("当前平台不支持游戏演奏")
+                return False
             self.audio_preview.stop_all()
             if not self.check_and_set_game_window():
                 return False
@@ -1077,6 +1155,26 @@ class MusicGUI:
         self.next_btn.config(state="normal" if next_enabled else "disabled")
 
     def _set_playback_controls(self, mode):
+        if not getattr(self, "start_btn", None):
+            if mode is None:
+                self.preview_btn.config(state="normal", text="本地试听")
+                self.stop_btn.config(state="disabled")
+            elif mode == "preview_loading":
+                self.preview_btn.config(state="disabled", text="准备音色...")
+                self.stop_btn.config(state="normal")
+            elif mode == "preview":
+                paused = self.preview_player.state == PlaybackState.PAUSED
+                self.preview_btn.config(
+                    state="normal",
+                    text="继续试听 (F11)" if paused else "暂停试听 (F11)",
+                )
+                self.stop_btn.config(state="normal")
+            else:
+                self.preview_btn.config(state="disabled", text="正在切歌...")
+                self.stop_btn.config(state="normal")
+            self._update_navigation_buttons()
+            self._update_playlist_action_states()
+            return
         if mode is None:
             self.start_btn.config(state="normal")
             self.preview_btn.config(state="normal", text="本地试听")
@@ -1151,7 +1249,11 @@ class MusicGUI:
         else:
             self._clear_song_info(reset_progress=True)
         self._set_playback_controls(None)
-        self.status_var.set("已停止，点击游戏演奏或本地试听")
+        self.status_var.set(
+            "已停止，点击本地试听"
+            if not CAPABILITIES.game_playback_supported
+            else "已停止，点击游戏演奏或本地试听"
+        )
 
     def toggle_play_pause(self):
         """F11：暂停或继续当前的游戏演奏/本地试听。"""
@@ -1339,7 +1441,7 @@ class MusicGUI:
         self._update_overlay_status()
 
     def _update_overlay_status(self):
-        if not getattr(self, 'overlay', None):
+        if not CAPABILITIES.overlay_supported or not getattr(self, 'overlay', None):
             self.overlay_status_var.set("未初始化")
             return
         visible = "显示" if self.overlay.window.winfo_viewable() else "隐藏"
@@ -1357,6 +1459,15 @@ class MusicGUI:
         self.debug_text.configure(state="disabled")
 
     def _refresh_diagnostics(self, schedule=True):
+        if not CAPABILITIES.is_windows:
+            self.admin_status_var.set("不适用")
+            self.game_window_var.set("不适用")
+            self.foreground_window_var.set("不适用")
+            self.overlay_status_var.set("不适用")
+            self._refresh_log_text()
+            if schedule:
+                self.root.after(1000, self._refresh_diagnostics)
+            return
         self.admin_status_var.set("是" if is_admin() else "否")
         try:
             hwnd = self._game_hwnd or find_sky_game_window()
@@ -1428,6 +1539,8 @@ class MusicGUI:
             "请在接下来的几秒内按下键盘上的任意一个键，\n程序将据此识别你的键盘设备。")
 
     def check_and_set_game_window(self):
+        if not CAPABILITIES.game_playback_supported:
+            return False
         hwnd = find_sky_game_window()
         if hwnd:
             self._game_hwnd = hwnd
@@ -1529,7 +1642,7 @@ class MusicGUI:
             cfg = dict(getattr(self, "config", {}) or {})
             cfg.update({'width': width, 'height': height, 'x': x, 'y': y})
             cfg['input_method'] = getattr(self, 'input_method', 'auto')
-            if getattr(self, 'overlay', None):
+            if CAPABILITIES.overlay_supported and getattr(self, 'overlay', None) and self.overlay.window:
                 cfg["overlay_geometry"] = self.overlay.window.geometry()
                 cfg["overlay_locked"] = self.overlay.locked
             with open(CONFIG_FILE, 'w', encoding='utf-8') as f:
@@ -1553,6 +1666,15 @@ class MusicGUI:
         self.root.after(1000, self.schedule_music_dir_watch)
 
     def bind_hotkeys(self):
+        if not CAPABILITIES.global_hotkeys_supported:
+            # macOS preview controls are intentionally local to this window;
+            # no Accessibility permission or system-wide key hook is needed.
+            self.root.bind("<F6>", lambda _event: self._run_on_ui(self.previous_track))
+            self.root.bind("<F7>", lambda _event: self._run_on_ui(self.stop_play))
+            self.root.bind("<F8>", lambda _event: self._run_on_ui(self.next_track))
+            self.root.bind("<F11>", lambda _event: self._run_on_ui(self.toggle_play_pause))
+            self.hotkey_status_var.set("窗口内快捷键已启用: F6/F7/F8/F11")
+            return
         import keyboard
         # 先解绑，防止重复注册
         try:
@@ -1750,9 +1872,17 @@ if __name__ == "__main__":
     if relaunch_as_admin_if_needed():
         sys.exit(0)
     root = tk.Tk()
+    # On macOS Aqua, a visible root can be mapped before its packed Notebook
+    # receives a real size, producing a blank first frame (the Notebook is
+    # temporarily 1x1). Build while withdrawn, force one geometry pass, then
+    # reveal the fully laid-out window.
+    root.withdraw()
     style = ttk.Style()
     style.theme_use('clam')
     style.configure('.', font=('微软雅黑', 10))
     app = MusicGUI(root)
     app.bind_hotkeys()
+    root.update_idletasks()
+    root.deiconify()
+    root.update_idletasks()
     root.mainloop() 
