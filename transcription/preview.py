@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import bisect
 import math
 import os
 import tempfile
@@ -105,10 +106,12 @@ class PreviewPlayer:
         on_status: Optional[Callable[[str], None]] = None,
         on_finished: Optional[Callable[[], None]] = None,
         on_error: Optional[Callable[[Exception], None]] = None,
+        on_position: Optional[Callable[[int], None]] = None,
     ) -> None:
         self.on_status = on_status or (lambda _message: None)
         self.on_finished = on_finished or (lambda: None)
         self.on_error = on_error or (lambda _exc: None)
+        self.on_position = on_position or (lambda _time_ms: None)
         self.controller = controller or AudioPreviewController(
             on_error=self._handle_error
         )
@@ -116,7 +119,9 @@ class PreviewPlayer:
             key_controller=self.controller,
             update_status=self._handle_status,
             update_finished=self._handle_finished,
+            update_note=self._handle_note,
         )
+        self._times: list[int] = []
 
     @property
     def prepared(self) -> bool:
@@ -129,25 +134,44 @@ class PreviewPlayer:
     def prepare(self, progress_callback=None) -> None:
         self.controller.prepare(progress_callback=progress_callback)
 
-    def play(self, result: TranscriptionResult) -> bool:
+    def play(
+        self,
+        result: TranscriptionResult,
+        start_ms: Optional[int] = None,
+        end_ms: Optional[int] = None,
+    ) -> bool:
+        """Play a score or an inclusive source-time range from it."""
         if not self.prepared:
             raise TranscriptionError("钢琴音色尚未准备完成")
         self.stop()
         notes_by_time = defaultdict(list)
         for note in result.song_notes:
             time_ms = int(note["time"])
+            if start_ms is not None and time_ms < start_ms:
+                continue
+            if end_ms is not None and time_ms > end_ms:
+                continue
             key = str(note["key"])
             _key_index(note)
             if key not in notes_by_time[time_ms]:
                 notes_by_time[time_ms].append(key)
         sorted_times = sorted(notes_by_time)
         if not sorted_times:
-            raise TranscriptionError("没有可试听的音符")
+            raise TranscriptionError("所选区域没有可试听的音符")
+        self._times = sorted_times
         self.player.speed = 1.0
         self.player.simulate = False
         if not self.player.start(dict(notes_by_time), sorted_times):
             raise TranscriptionError("无法启动钢琴音色试听")
         return True
+
+    def seek_ms(self, time_ms: int) -> Optional[int]:
+        """Seek an active preview to the first note at or after ``time_ms``."""
+        if self.state == PlaybackState.STOPPED or not self._times:
+            return None
+        index = min(len(self._times) - 1, bisect.bisect_left(self._times, int(time_ms)))
+        self.player.seek(index)
+        return self._times[index]
 
     def pause_or_resume(self) -> PlaybackState:
         if self.player.state == PlaybackState.PLAYING:
@@ -172,6 +196,10 @@ class PreviewPlayer:
 
     def _handle_finished(self) -> None:
         self.on_finished()
+
+    def _handle_note(self, _index, time_ms, _notes) -> None:
+        if time_ms is not None:
+            self.on_position(int(time_ms))
 
     def _handle_error(self, exc: Exception) -> None:
         self.on_error(exc)

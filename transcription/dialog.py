@@ -46,8 +46,14 @@ class TranscriptionDialog:
         self.errors: Dict[str, str] = {}
         self.source_labels: Dict[str, str] = {path: os.path.basename(path) for path in self.files}
         self.cancel_event = threading.Event()
-        self.preview_player = PreviewPlayer(on_status=self._preview_status, on_finished=self._preview_finished, on_error=self._preview_error)
+        self.preview_player = PreviewPlayer(
+            on_status=self._preview_status,
+            on_finished=self._preview_finished,
+            on_error=self._preview_error,
+            on_position=self._preview_position,
+        )
         self._preview_preparing = False
+        self._pending_preview: Optional[tuple[TranscriptionResult, Optional[int], Optional[int], str]] = None
         self._temp_root = tempfile.TemporaryDirectory(prefix="sky-arrangement-drafts-")
         self.cookie_store = NetEaseCookieStore(auth_file or os.path.join(os.path.dirname(os.path.abspath(output_dir)), "netease_auth.json"))
         self.netease_client = netease_client or NetEaseClient()
@@ -57,6 +63,8 @@ class TranscriptionDialog:
         self.refine_start_ms: Optional[int] = None
         self.refine_end_ms: Optional[int] = None
         self.refinement_candidate: Optional[tuple[str, TranscriptionResult]] = None
+        self.playhead_ms = 0
+        self._transport_dragging = False
 
         self.win = tk.Toplevel(parent)
         self.win.title("生成乐谱")
@@ -150,6 +158,12 @@ class TranscriptionDialog:
         for path in self.files:
             self.file_list.insert(tk.END, f"… {self.source_labels[path]}")
         ttk.Label(right, text="15 键时间线（蓝色：旋律区；灰色：伴奏区）").pack(anchor="w")
+        self.transport = tk.Canvas(right, background="#F7F8FB", highlightthickness=1, highlightbackground="#D9DEE7", height=38, cursor="sb_h_double_arrow")
+        self.transport.pack(fill="x", pady=(4, 0))
+        self.transport.bind("<Configure>", lambda _event: self._draw_transport())
+        self.transport.bind("<ButtonPress-1>", self._begin_transport_drag)
+        self.transport.bind("<B1-Motion>", self._move_transport_drag)
+        self.transport.bind("<ButtonRelease-1>", self._finish_transport_drag)
         self.timeline = tk.Canvas(right, background="#FFFFFF", highlightthickness=1, highlightbackground="#D9DEE7", height=340)
         self.timeline.pack(fill="both", expand=True, pady=(4, 6))
         self.timeline.bind("<Configure>", lambda _event: self._draw_timeline())
@@ -164,6 +178,8 @@ class TranscriptionDialog:
         self.regenerate_btn.pack(side="left", padx=(0, 6))
         self.preview_btn = ttk.Button(actions, text="钢琴音色试听", command=self.preview_current, state="disabled")
         self.preview_btn.pack(side="left", padx=6)
+        self.region_preview_btn = ttk.Button(actions, text="试听所选精修区", command=self.preview_refine_region, state="disabled")
+        self.region_preview_btn.pack(side="left", padx=6)
         self.refine_btn = ttk.Button(actions, text="精修所选小节", command=self.refine_current, state="disabled")
         self.refine_btn.pack(side="left", padx=6)
         self.accept_refine_btn = ttk.Button(actions, text="接受精修", command=self.accept_refinement, state="disabled")
@@ -222,7 +238,9 @@ class TranscriptionDialog:
         self.regenerate_btn.config(state="disabled" if busy or current is None else "normal")
         self.preview_btn.config(state="disabled" if busy or current is None else "normal")
         can_refine = current is not None and current.quality_analysis is not None and self.refine_start_ms is not None and self.refine_end_ms is not None and self.refinement_candidate is None
+        can_preview_region = current is not None and current.quality_analysis is not None and self.refine_start_ms is not None and self.refine_end_ms is not None
         self.refine_btn.config(state="normal" if not busy and can_refine else "disabled")
+        self.region_preview_btn.config(state="normal" if not busy and can_preview_region else "disabled")
         self.accept_refine_btn.config(state="normal" if not busy and self.refinement_candidate is not None else "disabled")
         self.discard_refine_btn.config(state="normal" if not busy and self.refinement_candidate is not None else "disabled")
         self.save_btn.config(state="disabled" if busy or current is None else "normal")
@@ -318,13 +336,15 @@ class TranscriptionDialog:
         return self.results.get(path) if path else None
 
     def _on_selection(self, _event=None) -> None:
+        self.refine_start_ms = self.refine_end_ms = None
+        self.playhead_ms = 0
         if path := self._selected_path(): self._show_path(path)
         self._set_busy(self.busy)
 
     def _show_path(self, path: str) -> None:
         result = self.results.get(path)
         if result is None:
-            self.stats_var.set(self.errors.get(path, "草稿尚未完成")); self.timeline.delete("all"); return
+            self.stats_var.set(self.errors.get(path, "草稿尚未完成")); self.timeline.delete("all"); self.transport.delete("all"); return
         stats, analysis = result.stats, result.analysis
         warning = f"\n提示：{'；'.join(result.warnings)}" if result.warnings else ""
         confidence = ""
@@ -341,9 +361,12 @@ class TranscriptionDialog:
 
     def _draw_timeline(self) -> None:
         canvas = self.timeline; canvas.delete("all"); result = self._current_result()
-        if not result or not result.song_notes: return
+        if not result or not result.song_notes:
+            self._draw_transport()
+            return
         width, height, left, right = max(100, canvas.winfo_width()), max(160, canvas.winfo_height()), 42, 8
-        row = height / 15.0; times = [int(note["time"]) for note in result.song_notes]; start, span = min(times), max(1, max(times) - min(times))
+        start, end = self._score_bounds(result)
+        row = height / 15.0; span = max(1, end - start)
         for key in range(15):
             display = 14 - key; y0, y1 = display * row, (display + 1) * row
             canvas.create_rectangle(0, y0, width, y1, fill="#F7F9FC" if key % 2 else "#FFF", outline="")
@@ -363,15 +386,88 @@ class TranscriptionDialog:
         for note in result.song_notes:
             key = int(str(note["key"])[4:]); display = 14 - key; x = left + (int(note["time"]) - start) / span * (width - left - right)
             canvas.create_rectangle(x - 1.5, display * row + 2, x + 2.5, (display + 1) * row - 2, fill=self.accent if key >= 7 else "#98A6BA", outline="")
+        self._draw_transport()
+
+    @staticmethod
+    def _format_time(time_ms: int) -> str:
+        seconds = max(0, int(round(time_ms / 1000)))
+        return f"{seconds // 60}:{seconds % 60:02d}"
+
+    def _score_bounds(self, result: TranscriptionResult) -> tuple[int, int]:
+        tail = max((int(note["time"]) for note in result.song_notes), default=0)
+        if result.quality_analysis is not None:
+            tail = max(tail, int(round(result.quality_analysis.duration_sec * 1000)))
+        elif result.analysis is not None:
+            tail = max(tail, int(round(result.analysis.duration_sec * 1000)))
+        else:
+            tail = max(tail, int(round(float(result.stats.get("duration_sec", 0)) * 1000)))
+        return 0, max(1, tail)
+
+    def _draw_transport(self) -> None:
+        canvas = self.transport; canvas.delete("all"); result = self._current_result()
+        if not result or not result.song_notes:
+            return
+        width, height, left, right = max(100, canvas.winfo_width()), max(30, canvas.winfo_height()), 42, 8
+        start, end = self._score_bounds(result); span = max(1, end - start)
+        x0, x1, y = left, width - right, height // 2
+        canvas.create_rectangle(x0, y - 4, x1, y + 4, fill="#D9DEE7", outline="")
+        if result.quality_analysis:
+            for bar in result.quality_analysis.bar_starts_ms:
+                x = x0 + (bar - start) / span * (x1 - x0)
+                canvas.create_line(x, y - 8, x, y + 8, fill="#AAB4C6")
+        if self.refine_start_ms is not None and self.refine_end_ms is not None:
+            lo, hi = sorted((self.refine_start_ms, self.refine_end_ms))
+            selection_left = x0 + (lo - start) / span * (x1 - x0)
+            selection_right = x0 + (hi - start) / span * (x1 - x0)
+            canvas.create_rectangle(selection_left, y - 4, selection_right, y + 4, fill="#F5C85B", outline="")
+        self.playhead_ms = max(start, min(end, self.playhead_ms))
+        playhead_x = x0 + (self.playhead_ms - start) / span * (x1 - x0)
+        canvas.create_line(playhead_x, 3, playhead_x, height - 3, fill="#E25555", width=2)
+        canvas.create_polygon(playhead_x - 5, 3, playhead_x + 5, 3, playhead_x, 10, fill="#E25555", outline="")
+        canvas.create_text(4, y, text=self._format_time(start), anchor="w", fill="#667")
+        canvas.create_text(width - 4, y, text=self._format_time(end), anchor="e", fill="#667")
 
     def _timeline_time(self, event: tk.Event) -> Optional[int]:
         result = self._current_result()
         if not result or not result.song_notes:
             return None
-        times = [int(note["time"]) for note in result.song_notes]; start, span = min(times), max(1, max(times) - min(times))
+        start, end = self._score_bounds(result); span = max(1, end - start)
         width, left, right = max(100, self.timeline.winfo_width()), 42, 8
         ratio = max(0.0, min(1.0, (event.x - left) / max(1, width - left - right)))
         return int(round(start + span * ratio))
+
+    def _transport_time(self, event: tk.Event) -> Optional[int]:
+        result = self._current_result()
+        if not result or not result.song_notes:
+            return None
+        start, end = self._score_bounds(result); span = max(1, end - start)
+        width, left, right = max(100, self.transport.winfo_width()), 42, 8
+        ratio = max(0.0, min(1.0, (event.x - left) / max(1, width - left - right)))
+        return int(round(start + span * ratio))
+
+    def _set_playhead(self, time_ms: Optional[int], seek: bool = False) -> None:
+        if time_ms is None:
+            return
+        self.playhead_ms = int(time_ms)
+        if seek:
+            actual = self.preview_player.seek_ms(self.playhead_ms)
+            if actual is not None:
+                self.playhead_ms = actual
+        self._draw_transport()
+
+    def _begin_transport_drag(self, event: tk.Event) -> None:
+        self._transport_dragging = True
+        self._set_playhead(self._transport_time(event))
+
+    def _move_transport_drag(self, event: tk.Event) -> None:
+        if self._transport_dragging:
+            self._set_playhead(self._transport_time(event))
+
+    def _finish_transport_drag(self, event: tk.Event) -> None:
+        if not self._transport_dragging:
+            return
+        self._transport_dragging = False
+        self._set_playhead(self._transport_time(event), seek=True)
 
     def _begin_refine_selection(self, event: tk.Event) -> None:
         if self.busy or not (result := self._current_result()) or result.quality_analysis is None or self.refinement_candidate:
@@ -468,26 +564,59 @@ class TranscriptionDialog:
         self._set_busy(False)
         if path := self._selected_path(): self._show_path(path)
 
-    def preview_current(self) -> None:
-        result = self._current_result()
-        if not result or self.busy: return
+    def _request_preview(
+        self,
+        result: TranscriptionResult,
+        start_ms: Optional[int],
+        end_ms: Optional[int],
+        label: str,
+    ) -> None:
         if self.preview_player.prepared:
             try:
-                self.preview_player.play(result); self.preview_btn.config(text="暂停钢琴音色试听"); self.status_var.set("正在试听")
+                self.preview_player.play(result, start_ms=start_ms, end_ms=end_ms)
+                self.preview_btn.config(text="暂停钢琴音色试听")
+                self.status_var.set(f"正在试听{label}")
             except Exception as exc: messagebox.showerror("试听失败", str(exc), parent=self.win)
             return
-        self._preview_preparing = True; self.preview_btn.config(state="disabled", text="准备音色…")
+        self._preview_preparing = True
+        self._pending_preview = (result, start_ms, end_ms, label)
+        self.preview_btn.config(state="disabled", text="准备音色…")
         def worker() -> None:
             try:
-                self.preview_player.prepare(); self._after(self._finish_preview_prepare, result, None)
-            except Exception as exc: self._after(self._finish_preview_prepare, result, str(exc))
+                self.preview_player.prepare(); self._after(self._finish_preview_prepare, None)
+            except Exception as exc: self._after(self._finish_preview_prepare, str(exc))
         self._start_worker(worker)
 
-    def _finish_preview_prepare(self, result: TranscriptionResult, error: Optional[str]) -> None:
+    def preview_current(self) -> None:
+        result = self._current_result()
+        if not result or self.busy:
+            return
+        self._request_preview(result, self.playhead_ms, None, "当前进度")
+
+    def preview_refine_region(self) -> None:
+        result = self._current_result()
+        if not result or self.busy or self.refine_start_ms is None or self.refine_end_ms is None:
+            return
+        start, end = sorted((self.refine_start_ms, self.refine_end_ms))
+        self.playhead_ms = start
+        self._draw_transport()
+        self._request_preview(result, start, end, "所选精修区")
+
+    def _finish_preview_prepare(self, error: Optional[str]) -> None:
         self._preview_preparing = False
         if error:
             self.preview_btn.config(text="钢琴音色试听", state="normal"); messagebox.showerror("试听失败", error, parent=self.win); return
-        self.preview_player.play(result); self.preview_btn.config(text="暂停钢琴音色试听")
+        pending, self._pending_preview = self._pending_preview, None
+        if pending is None:
+            return
+        result, start, end, label = pending
+        try:
+            self.preview_player.play(result, start_ms=start, end_ms=end)
+            self.preview_btn.config(text="暂停钢琴音色试听")
+            self.status_var.set(f"正在试听{label}")
+        except Exception as exc:
+            self.preview_btn.config(text="钢琴音色试听", state="normal")
+            messagebox.showerror("试听失败", str(exc), parent=self.win)
 
     def stop_preview(self) -> None:
         self.preview_player.stop()
@@ -495,6 +624,14 @@ class TranscriptionDialog:
 
     def _preview_status(self, message: str) -> None:
         if not self.closed: self.status_var.set(message)
+
+    def _preview_position(self, time_ms: int) -> None:
+        self._after(self._update_preview_position, time_ms)
+
+    def _update_preview_position(self, time_ms: int) -> None:
+        if not self._transport_dragging:
+            self._set_playhead(time_ms)
+
     def _preview_finished(self) -> None:
         if not self.closed: self.win.after(0, self.stop_preview)
     def _preview_error(self, exc: Exception) -> None:
