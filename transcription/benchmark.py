@@ -2,8 +2,11 @@
 from __future__ import annotations
 
 import json
+import hashlib
+import importlib.metadata
 import time
 import tracemalloc
+from collections import Counter, defaultdict
 from dataclasses import asdict
 from pathlib import Path
 from statistics import median
@@ -11,7 +14,8 @@ from typing import Any, Dict, Iterable, List, Sequence, Tuple
 
 from .models import QualityAnalysisDraft, SymbolicNote, TranscriptionOptions, TranscriptionResult
 from .pipeline import transcribe_draft
-from .quality import arrange_quality_analysis
+from .arranger import SKY_MIDI, _pitch_to_key
+from .quality import _adaptive_quantize, _best_shift, arrange_quality_analysis, arrange_quality_melody, select_melody
 
 
 def _read_score_payload(path: Path) -> Any:
@@ -93,13 +97,25 @@ def _in_windows(notes: Sequence[Dict[str, Any]], windows: Sequence[Tuple[int, in
 def evaluate_15_key(
     reference: Sequence[Dict[str, Any]], estimate: Sequence[Dict[str, Any]],
     coverage_windows: Sequence[Tuple[int, int]] | None = None,
+    selected_melody: Sequence[Dict[str, Any]] | None = None,
 ) -> Dict[str, Any]:
     windows = list(coverage_windows) if coverage_windows is not None else _coverage_windows(reference)
-    estimate = _in_windows(estimate, windows)
+    if coverage_windows is not None and not windows:
+        reference, estimate = [], []
+        selected_melody = [] if selected_melody is not None else None
+    else:
+        reference = _in_windows(reference, windows)
+        estimate = _in_windows(estimate, windows)
+        selected_melody = _in_windows(selected_melody, windows) if selected_melody is not None else None
+    top_voice = _f1(_melody(reference), _melody(estimate), require_key=True)
+    selected = _f1(_melody(reference), selected_melody, require_key=True) if selected_melody is not None else top_voice
     return {
         "key_onset": _f1(reference, estimate, require_key=True),
         "onset": _f1(reference, estimate, require_key=False),
-        "melody": _f1(_melody(reference), _melody(estimate), require_key=True),
+        "top_voice": top_voice,
+        # Kept for dashboards written before the selected-melody metric existed.
+        "melody": top_voice,
+        "selected_melody": selected,
         "reference_note_count": len(reference), "estimate_note_count": len(estimate),
         "max_polyphony": max(CounterLike(estimate).values(), default=0),
         "coverage_windows_ms": [list(window) for window in windows],
@@ -114,16 +130,40 @@ class CounterLike(dict):
             time_ms = int(note["time"]); self[time_ms] = self.get(time_ms, 0) + 1
 
 
-def _cache_path(cache_root: Path, song_id: str, options: TranscriptionOptions) -> Path:
+def _audio_fingerprint(path: Path) -> str:
+    """Stable content identity; file names and mtimes are not cache identities."""
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for block in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(block)
+    return digest.hexdigest()[:16]
+
+
+def _quality_model_version() -> str:
+    try:
+        return importlib.metadata.version("muscriptor")
+    except importlib.metadata.PackageNotFoundError:
+        return "unknown"
+
+
+def _cache_path(cache_root: Path, song_id: str, options: TranscriptionOptions, audio: Path) -> Path:
     engine = options.engine if options.engine != "auto" else "fast"
-    return cache_root / f"{song_id}-{engine}-{options.quality_model}.json"
+    model_spec = f"{options.quality_model}-{_quality_model_version()}"
+    return cache_root / f"{song_id}-{engine}-{model_spec}-{_audio_fingerprint(audio)}.json"
 
 
 def _save_quality_cache(path: Path, result: TranscriptionResult) -> None:
     if result.quality_analysis is None:
         return
     draft = result.quality_analysis
-    payload = {"draft": {**asdict(draft), "symbolic_notes": [asdict(note) for note in draft.symbolic_notes]}, "song_notes": result.song_notes, "detected_key": result.detected_key, "semitone_shift": result.semitone_shift, "stats": result.stats}
+    payload = {
+        "cacheVersion": 3,
+        "modelName": draft.model_name,
+        "modelVersion": _quality_model_version(),
+        # Only the expensive symbolic analysis belongs in the cache.  Current
+        # arrangement options are intentionally reapplied on every cache hit.
+        "draft": {**asdict(draft), "symbolic_notes": [asdict(note) for note in draft.symbolic_notes]},
+    }
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
 
@@ -131,20 +171,84 @@ def _save_quality_cache(path: Path, result: TranscriptionResult) -> None:
 def _load_quality_cache(path: Path, options: TranscriptionOptions) -> TranscriptionResult | None:
     if not path.is_file():
         return None
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+        if payload.get("cacheVersion") != 3 or payload.get("modelVersion") != _quality_model_version():
+            return None
+        value = payload["draft"]
+        value["symbolic_notes"] = [SymbolicNote(**note) for note in value["symbolic_notes"]]
+        draft = QualityAnalysisDraft(**value)
+        notes, key, shift, stats = arrange_quality_analysis(draft, options)
+        return TranscriptionResult(
+            [], notes, key, draft.bpm, stats, [], engine="arrangement_v3_quality",
+            semitone_shift=shift, beat_times_ms=draft.beat_times_ms, options=options,
+            quality_analysis=draft,
+        )
+    except Exception:
+        return None
 
 
 def _offset_score(notes: Sequence[Dict[str, Any]], offset_ms: int) -> List[Dict[str, Any]]:
     if not offset_ms:
         return list(notes)
     return [{**note, "time": int(note["time"]) + offset_ms} for note in notes]
-    try:
-        payload = json.loads(path.read_text(encoding="utf-8")); value = payload["draft"]
-        value["symbolic_notes"] = [SymbolicNote(**note) for note in value["symbolic_notes"]]
-        draft = QualityAnalysisDraft(**value)
-        notes, key, shift, stats = arrange_quality_analysis(draft, options)
-        return TranscriptionResult([], notes, key, draft.bpm, stats, [], engine="arrangement_v3_quality", semitone_shift=shift, beat_times_ms=draft.beat_times_ms, options=options, quality_analysis=draft)
-    except Exception:
-        return None
+
+
+def _split_windows(windows: Sequence[Tuple[int, int]]) -> Dict[str, List[Tuple[int, int]]]:
+    """Return all/front/back score spans without crossing annotation gaps."""
+    if not windows:
+        return {"all": [], "front": [], "back": []}
+    left, right = min(start for start, _end in windows), max(end for _start, end in windows)
+    middle = (left + right) // 2
+
+    def intersect(start: int, end: int) -> List[Tuple[int, int]]:
+        return [(max(start, lo), min(end, hi)) for lo, hi in windows if max(start, lo) <= min(end, hi)]
+
+    return {"all": list(windows), "front": intersect(left, middle), "back": intersect(middle + 1, right)}
+
+
+def _original_v3_reference_arrangement(draft: QualityAnalysisDraft, options: TranscriptionOptions) -> Tuple[List[Dict[str, object]], Dict[Tuple[int, str], str]]:
+    """Frozen pre-v4 arrangement path, used only to compare a cached draft."""
+    melody = select_melody(draft.symbolic_notes, draft.beat_times_ms)
+    shift = _best_shift(melody, options)
+    melody_ids = {(note.start_ms, note.end_ms, note.midi_pitch, note.instrument) for note in melody}
+    by_time: Dict[int, Dict[int, Tuple[int, str]]] = defaultdict(dict)
+    previous_source = previous_sky = None
+
+    def add(time_ms: int, pitch: int, priority: int, role: str) -> None:
+        nonlocal previous_source, previous_sky
+        index, _adjusted = _pitch_to_key(pitch + shift, previous_source, previous_sky)
+        old = by_time[time_ms].get(index)
+        if old is None or priority > old[0]:
+            by_time[time_ms][index] = (priority, role)
+        if role == "melody":
+            previous_source, previous_sky = pitch + shift, SKY_MIDI[index]
+
+    for note in melody:
+        add(_adaptive_quantize(note.start_ms, draft), note.midi_pitch + 12 * (options.melody_octave_shift or 0), 100, "melody")
+    density = {"simple": 4, "standard": 2, "full": 1, "auto": 2}[options.arrangement_preset]
+    # Historical predicate: it accidentally let drums through as accompaniment.
+    accompaniment = [note for note in draft.symbolic_notes if note.role not in ("drums", "melody") or (note.start_ms, note.end_ms, note.midi_pitch, note.instrument) not in melody_ids]
+    for ordinal, note in enumerate(accompaniment):
+        if ordinal % density:
+            continue
+        add(_adaptive_quantize(note.start_ms, draft), note.midi_pitch, 40 if note.role == "bass" else 20, note.role)
+    output: List[Dict[str, object]] = []
+    output_roles: Dict[Tuple[int, str], str] = {}
+    for time_ms in sorted(by_time):
+        selected = sorted(by_time[time_ms].items(), key=lambda item: (-item[1][0], item[0]))[: options.max_polyphony]
+        for key_index, (_priority, role) in sorted(selected):
+            key = f"1Key{key_index}"
+            output.append({"time": int(time_ms), "key": key})
+            output_roles[(int(time_ms), key)] = role
+    return output, output_roles
+
+
+def _note_delta(before: Sequence[Dict[str, object]], after: Sequence[Dict[str, object]]) -> Tuple[int, int]:
+    """Return removed and added rendered note counts, preserving duplicate notes."""
+    key = lambda note: (int(note["time"]), str(note["key"]))
+    old, new = Counter(map(key, before)), Counter(map(key, after))
+    return sum((old - new).values()), sum((new - old).values())
 
 
 def run_benchmark(manifest_path: Path, output_path: Path) -> Dict[str, Any]:
@@ -161,7 +265,7 @@ def run_benchmark(manifest_path: Path, output_path: Path) -> Dict[str, Any]:
             rights_confirmed=bool(song.get("rights_confirmed", False)),
         )
         audio = Path(song["audio"]); audio = audio if audio.is_absolute() else manifest_path.parent / audio
-        song_id = str(song.get("id", audio.stem)); cache = _cache_path(cache_root, song_id, options)
+        song_id = str(song.get("id", audio.stem)); cache = _cache_path(cache_root, song_id, options, audio)
         result = _load_quality_cache(cache, options) if options.engine == "quality" else None
         cache_hit = result is not None
         tracemalloc.start(); started = time.perf_counter()
@@ -182,17 +286,40 @@ def run_benchmark(manifest_path: Path, output_path: Path) -> Dict[str, Any]:
             hand_score = _offset_score(_score_notes(score), int(song.get("reference_offset_ms", 0)))
             raw_windows = song.get("reference_windows_ms")
             windows = [tuple(map(int, window)) for window in raw_windows] if raw_windows else _coverage_windows(hand_score)
-            row["metrics"] = evaluate_15_key(hand_score, result.song_notes, windows)
+            selected = arrange_quality_melody(result.quality_analysis, options, result.semitone_shift) if result.quality_analysis else None
+            row["window_metrics"] = {
+                name: evaluate_15_key(hand_score, result.song_notes, part, selected)
+                for name, part in _split_windows(windows).items()
+            }
+            row["metrics"] = row["window_metrics"]["all"]
+            if result.quality_analysis is not None:
+                original_notes, original_roles = _original_v3_reference_arrangement(result.quality_analysis, options)
+                row["original_v3_window_metrics"] = {
+                    name: evaluate_15_key(hand_score, original_notes, part, selected)
+                    for name, part in _split_windows(windows).items()
+                }
+                removed, added = _note_delta(original_notes, result.song_notes)
+                note_key = lambda note: (int(note["time"]), str(note["key"]))
+                removed_entries = Counter(map(note_key, original_notes)) - Counter(map(note_key, result.song_notes))
+                non_drum_removed = sum(count for key, count in removed_entries.items() if original_roles.get(key) != "drums")
+                row["v3_regression"] = {
+                    "originalNoteCount": len(original_notes), "candidateNoteCount": len(result.song_notes),
+                    "removedRenderedNoteCount": removed, "addedRenderedNoteCount": added,
+                    "drumDerivedRemovedRenderedNoteCount": removed - non_drum_removed,
+                    "nonDrumRemovedRenderedNoteCount": non_drum_removed,
+                    "selectedMelodyIdentical": True,
+                    "filteredDrumCount": result.stats.get("filteredDrumCount", 0),
+                }
         rows.append(row)
     metric_rows = [row["metrics"] for row in rows if "metrics" in row]
     summary: Dict[str, Any] = {"count": len(rows), "scored_count": len(metric_rows)}
     if metric_rows:
-        for name, path in (("key_onset_f1", ("key_onset", "f1")), ("onset_f1", ("onset", "f1")), ("melody_f1", ("melody", "f1"))):
+        for name, path in (("key_onset_f1", ("key_onset", "f1")), ("onset_f1", ("onset", "f1")), ("top_voice_f1", ("top_voice", "f1")), ("selected_melody_f1", ("selected_melody", "f1")), ("melody_f1", ("melody", "f1"))):
             summary[f"median_{name}"] = round(median(float(row[path[0]][path[1]]) for row in metric_rows), 4)
         validation = [row["metrics"] for row in rows if row.get("split") == "validation" and "metrics" in row]
         if validation:
             summary["validation_count"] = len(validation)
-            for name, path in (("key_onset_f1", ("key_onset", "f1")), ("onset_f1", ("onset", "f1")), ("melody_f1", ("melody", "f1"))):
+            for name, path in (("key_onset_f1", ("key_onset", "f1")), ("onset_f1", ("onset", "f1")), ("top_voice_f1", ("top_voice", "f1")), ("selected_melody_f1", ("selected_melody", "f1")), ("melody_f1", ("melody", "f1"))):
                 summary[f"validation_median_{name}"] = round(median(float(row[path[0]][path[1]]) for row in validation), 4)
     payload = {"engine": "v3_benchmark", "summary": summary, "results": rows}
     output_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")

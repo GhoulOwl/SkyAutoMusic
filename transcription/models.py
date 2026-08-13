@@ -122,8 +122,8 @@ class TranscriptionOptions:
             raise ValueError(f"unsupported arrangement preset: {self.arrangement_preset}")
         if self.melody_octave_shift is not None and self.melody_octave_shift not in (-1, 0, 1):
             raise ValueError("melody_octave_shift must be -1, 0, 1, or None")
-        if not 2 <= int(self.max_polyphony) <= 5:
-            raise ValueError("max_polyphony must be in 2..5")
+        if not 2 <= int(self.max_polyphony) <= 10:
+            raise ValueError("max_polyphony must be in 2..10")
         if self.bpm_override is not None and not 40.0 <= float(self.bpm_override) <= 220.0:
             raise ValueError("bpm_override must be in 40..220")
         if self.meter not in ("auto", "4/4", "3/4", "6/8"):

@@ -1,13 +1,12 @@
 """Optional V3 whole-song transcription and melody-first Sky arrangement.
 
-The module deliberately imports MuScriptor only at runtime.  A normal V2
+The module deliberately imports MuScriptor only at runtime. A normal V2
 installation therefore remains usable offline and does not download model
 weights just because the application starts.
 """
 from __future__ import annotations
 
 import bisect
-import math
 import os
 import threading
 from collections import Counter, defaultdict
@@ -15,7 +14,7 @@ from dataclasses import replace
 from statistics import median
 from typing import Dict, Iterable, List, Optional, Sequence, Tuple
 
-from .arranger import SKY_MIDI, _pitch_to_key, detect_key, key_transpose
+from .arranger import SKY_MIDI, _pitch_to_key, key_transpose
 from .models import (
     CancelledError,
     Meter,
@@ -65,12 +64,14 @@ def _with_token(token: Optional[str]):
             self.old = os.environ.get("HF_TOKEN")
             if token:
                 os.environ["HF_TOKEN"] = token
+
         def __exit__(self, *_exc):
             if token:
                 if self.old is None:
                     os.environ.pop("HF_TOKEN", None)
                 else:
                     os.environ["HF_TOKEN"] = self.old
+
     return _Token()
 
 
@@ -142,7 +143,8 @@ def _extract_symbolic_events(model: object, path: str, cancel_event, progress_cb
             if start is None:
                 continue
             active.pop(int(getattr(start, "index")), None)
-            begin, end = int(round(float(getattr(start, "start_time")) * 1000)), int(round(float(getattr(event, "end_time")) * 1000))
+            begin = int(round(float(getattr(start, "start_time")) * 1000))
+            end = int(round(float(getattr(event, "end_time")) * 1000))
             if end > begin:
                 instrument = str(getattr(start, "instrument", "other"))
                 notes.append(SymbolicNote(begin, end, int(getattr(start, "pitch")), instrument, _role(instrument)))
@@ -158,8 +160,6 @@ def _timing_from_model(model: object, path: str, notes: Sequence[SymbolicNote], 
         grid = None
     beats = [int(round(float(value) * 1000)) for value in getattr(grid, "beats", [])] if grid is not None and getattr(grid, "beats", None) is not None else []
     if len(beats) < 2:
-        # There is no safe musical quantization without a beat tracker; retain
-        # detected note timing rather than inventing a 4/4 metronome.
         duration = max((note.end_ms for note in notes), default=1000)
         bpm = float(options.bpm_override or 120.0)
         step = int(round(60000.0 / bpm))
@@ -213,16 +213,21 @@ def _local_grid(beats: Sequence[int], time_ms: int, subdivisions: int) -> List[i
     return [int(round(left + (right - left) * unit / subdivisions)) for unit in range(subdivisions + 1)]
 
 
-def _adaptive_quantize(time_ms: int, draft: QualityAnalysisDraft) -> int:
+def _quantize_with_status(time_ms: int, draft: QualityAnalysisDraft) -> Tuple[int, bool]:
     if len(draft.beat_times_ms) < 2:
-        return time_ms
-    # The nearest 8th, triplet and sixteenth candidate is chosen locally; this
-    # naturally follows real tempo drift because every interval is independent.
+        return time_ms, False
     choices = [value for division in (2, 3, 4) for value in _local_grid(draft.beat_times_ms, time_ms, division)]
     candidate = min(choices, key=lambda value: (abs(value - time_ms), value))
     index = max(0, min(len(draft.beat_times_ms) - 2, bisect.bisect_right(draft.beat_times_ms, time_ms) - 1))
     beat = max(1, draft.beat_times_ms[index + 1] - draft.beat_times_ms[index])
-    return candidate if abs(candidate - time_ms) <= min(70, int(round(beat * .18))) else time_ms
+    if abs(candidate - time_ms) <= min(70, int(round(beat * .18))):
+        return candidate, True
+    return time_ms, False
+
+
+def _adaptive_quantize(time_ms: int, draft: QualityAnalysisDraft) -> int:
+    """The original local 8th/triplet/16th quantizer, kept as the sound baseline."""
+    return _quantize_with_status(time_ms, draft)[0]
 
 
 def _lead_cost(note: SymbolicNote, previous: Optional[SymbolicNote]) -> float:
@@ -245,7 +250,7 @@ def select_melody(notes: Sequence[SymbolicNote], beats: Sequence[int]) -> List[S
     grouped: Dict[int, List[SymbolicNote]] = defaultdict(list)
     for note in candidates:
         grouped[_adaptive_key(note.start_ms, beats)].append(note)
-    beats_per_window = 8  # two 4/4 bars; remains a compact continuity window in other meters.
+    beats_per_window = 8
     selected: List[SymbolicNote] = []
     previous: Optional[SymbolicNote] = None
     windows: Dict[int, List[List[SymbolicNote]]] = defaultdict(list)
@@ -260,29 +265,35 @@ def select_melody(notes: Sequence[SymbolicNote], beats: Sequence[int]) -> List[S
             row_scores, row_links = [], []
             for current in candidates_at_onset:
                 if row == 0:
-                    row_scores.append(_lead_cost(current, previous)); row_links.append(-1); continue
+                    row_scores.append(_lead_cost(current, previous))
+                    row_links.append(-1)
+                    continue
                 choices = [scores[-1][old] + _lead_cost(current, window[row - 1][old]) for old in range(len(window[row - 1]))]
                 best = max(range(len(choices)), key=choices.__getitem__)
-                row_scores.append(choices[best]); row_links.append(best)
-            scores.append(row_scores); links.append(row_links)
+                row_scores.append(choices[best])
+                row_links.append(best)
+            scores.append(row_scores)
+            links.append(row_links)
         if not scores:
             continue
         index = max(range(len(scores[-1])), key=scores[-1].__getitem__)
         chosen: List[SymbolicNote] = []
         for row in range(len(window) - 1, -1, -1):
-            chosen.append(window[row][index]); index = links[row][index]
-            if index < 0: break
+            chosen.append(window[row][index])
+            index = links[row][index]
+            if index < 0:
+                break
         for current in reversed(chosen):
             if previous and current.start_ms < previous.end_ms and current.midi_pitch != previous.midi_pitch:
                 continue
-            selected.append(current); previous = current
+            selected.append(current)
+            previous = current
     return selected
 
 
 def _adaptive_key(time_ms: int, beats: Sequence[int]) -> int:
     if len(beats) < 2:
         return time_ms
-    # 25 ms buckets coalesce tiny model timing jitter without losing rhythm.
     return int(round(time_ms / 25.0) * 25)
 
 
@@ -319,11 +330,45 @@ def _key_for_shift(shift: int) -> str:
     return "C major"
 
 
+def arrange_quality_melody(draft: QualityAnalysisDraft, options: TranscriptionOptions, forced_shift: Optional[int] = None) -> List[Dict[str, object]]:
+    """Return the exact selected/mapped melody path for evaluation only."""
+    melody = select_melody(draft.symbolic_notes, draft.beat_times_ms)
+    shift = _best_shift(melody, options) if forced_shift is None else forced_shift
+    notes: List[Dict[str, object]] = []
+    previous_source = previous_sky = None
+    for note in melody:
+        key, _ = _pitch_to_key(note.midi_pitch + shift + 12 * (options.melody_octave_shift or 0), previous_source, previous_sky)
+        notes.append({"time": _adaptive_quantize(note.start_ms, draft), "key": f"1Key{key}"})
+        previous_source, previous_sky = note.midi_pitch + shift + 12 * (options.melody_octave_shift or 0), SKY_MIDI[key]
+    return notes
+
+
+def _diagnose_arrangement(draft: QualityAnalysisDraft, song_notes: Sequence[Dict[str, object]]) -> List[Dict[str, object]]:
+    """Read-only timing diagnostics. They never feed back into arranging."""
+    duration = max([note.end_ms for note in draft.symbolic_notes] + [0])
+    starts = sorted(set([0] + [value for value in draft.bar_starts_ms if 0 <= value < duration]))
+    if not starts:
+        starts = [0]
+    ends = starts[1:] + [duration]
+    diagnostics: List[Dict[str, object]] = []
+    for start, end in zip(starts, ends):
+        raw = [note for note in draft.symbolic_notes if start <= note.start_ms < end and note.role != "drums"]
+        final_onsets = len({int(note["time"]) for note in song_notes if start <= int(note["time"]) < end})
+        unsnapped = sum(not _quantize_with_status(note.start_ms, draft)[1] for note in raw)
+        beats = max(1, sum(start <= beat < end for beat in draft.beat_times_ms))
+        score = (2 if len(raw) >= 8 and unsnapped / max(1, len(raw)) > .30 else 0) + (1 if len(raw) / beats > 8 else 0)
+        diagnostics.append({
+            "startMs": start, "endMs": end, "rawNoteCount": len(raw), "finalOnsetCount": final_onsets,
+            "unsnappedNoteCount": unsnapped, "suspicious": score >= 3,
+        })
+    return diagnostics
+
+
 def arrange_quality_analysis(draft: QualityAnalysisDraft, options: TranscriptionOptions, forced_shift: Optional[int] = None) -> Tuple[List[Dict[str, object]], str, int, Dict[str, object]]:
     melody = select_melody(draft.symbolic_notes, draft.beat_times_ms)
     shift = _best_shift(melody, options) if forced_shift is None else forced_shift
     melody_ids = {(note.start_ms, note.end_ms, note.midi_pitch, note.instrument) for note in melody}
-    by_time: Dict[int, Dict[int, Tuple[int, str]]] = defaultdict(dict)
+    by_time: Dict[int, Dict[int, Tuple[int, set[str]]]] = defaultdict(dict)
     previous_source = previous_sky = None
 
     def add(time_ms: int, pitch: int, priority: int, role: str) -> None:
@@ -331,7 +376,9 @@ def arrange_quality_analysis(draft: QualityAnalysisDraft, options: Transcription
         index, _ = _pitch_to_key(pitch + shift, previous_source, previous_sky)
         old = by_time[time_ms].get(index)
         if old is None or priority > old[0]:
-            by_time[time_ms][index] = (priority, role)
+            by_time[time_ms][index] = (priority, {role})
+        elif priority == old[0]:
+            old[1].add(role)
         if role == "melody":
             previous_source, previous_sky = pitch + shift, SKY_MIDI[index]
 
@@ -340,6 +387,9 @@ def arrange_quality_analysis(draft: QualityAnalysisDraft, options: Transcription
         add(time, note.midi_pitch + 12 * (options.melody_octave_shift or 0), 100, "melody")
 
     density = {"simple": 4, "standard": 2, "full": 1, "auto": 2}[options.arrangement_preset]
+    # Keep the original candidate stream, including drum positions, through
+    # sampling and max-polyphony selection. Removing drums earlier would free
+    # slots and let previously discarded non-drum notes enter the output.
     accompaniment = [note for note in draft.symbolic_notes if note.role not in ("drums", "melody") or (note.start_ms, note.end_ms, note.midi_pitch, note.instrument) not in melody_ids]
     for ordinal, note in enumerate(accompaniment):
         if ordinal % density:
@@ -352,17 +402,30 @@ def arrange_quality_analysis(draft: QualityAnalysisDraft, options: Transcription
     grouped: List[int] = []
     for time_ms in sorted(by_time):
         selected = sorted(by_time[time_ms].items(), key=lambda item: (-item[1][0], item[0]))[: options.max_polyphony]
-        if selected:
-            grouped.append(time_ms)
-        for key_index, (_priority, role) in sorted(selected):
+        emitted = 0
+        for key_index, (_priority, source_roles) in sorted(selected):
+            # A shared key survives whenever a non-drum source produced it;
+            # only entries derived exclusively from a drum source are removed.
+            if source_roles == {"drums"}:
+                continue
             song_notes.append({"time": int(time_ms), "key": f"1Key{key_index}"})
+            emitted += 1
+            role = next(role for role in source_roles if role != "drums")
             roles[role] += 1
+        if emitted:
+            grouped.append(time_ms)
+    diagnostics = _diagnose_arrangement(draft, song_notes)
     stats: Dict[str, object] = {
         "arranged_note_count": len(song_notes), "onset_count": len(grouped),
-        "chord_count": sum(len(by_time[time]) > 1 for time in grouped),
+        "chord_count": sum(sum(1 for note in song_notes if note["time"] == time) > 1 for time in grouped),
         "average_polyphony": round(len(song_notes) / max(1, len(grouped)), 3),
         "melody_note_count": roles["melody"], "qualitySymbolicCount": len(draft.symbolic_notes),
         "timingGridCount": len(draft.beat_times_ms), "timingConfidence": round(draft.timing_confidence, 3),
         "quantization": draft.quantization,
+        "filteredDrumCount": sum(note.role == "drums" for note in draft.symbolic_notes),
+        "unsnappedNoteCount": sum(not _quantize_with_status(note.start_ms, draft)[1] for note in draft.symbolic_notes if note.role != "drums"),
+        "barDiagnostics": diagnostics,
+        "suspiciousBarCount": sum(bool(item["suspicious"]) for item in diagnostics),
+        "qualityArrangerVersion": 4,
     }
     return song_notes, options.source_key or _key_for_shift(shift), shift, stats

@@ -122,7 +122,7 @@ class TranscriptionDialog:
         self.octave_box = ttk.Combobox(options, textvariable=self.octave_var, values=["自动", "-1", "0", "+1"], state="readonly", width=7)
         self.octave_box.grid(row=0, column=5, sticky="w", padx=4, pady=4)
         ttk.Label(options, text="最大复音").grid(row=1, column=0, sticky="e", padx=4, pady=4)
-        self.polyphony_box = ttk.Spinbox(options, from_=2, to=5, textvariable=self.polyphony_var, width=6, state="readonly")
+        self.polyphony_box = ttk.Spinbox(options, from_=2, to=10, textvariable=self.polyphony_var, width=6, state="readonly")
         self.polyphony_box.grid(row=1, column=1, sticky="w", padx=4, pady=4)
         ttk.Label(options, text="BPM 修正").grid(row=1, column=2, sticky="e", padx=4, pady=4)
         self.bpm_box = ttk.Combobox(options, textvariable=self.bpm_var, values=["自动", *map(str, range(40, 221, 5))], width=8)
@@ -157,7 +157,7 @@ class TranscriptionDialog:
         self.file_list.bind("<<ListboxSelect>>", self._on_selection)
         for path in self.files:
             self.file_list.insert(tk.END, f"… {self.source_labels[path]}")
-        ttk.Label(right, text="15 键时间线（蓝色：旋律区；灰色：伴奏区）").pack(anchor="w")
+        ttk.Label(right, text="15 键时间线（蓝色：旋律区；灰色：伴奏区；橙色：建议精修）").pack(anchor="w")
         self.transport = tk.Canvas(right, background="#F7F8FB", highlightthickness=1, highlightbackground="#D9DEE7", height=38, cursor="sb_h_double_arrow")
         self.transport.pack(fill="x", pady=(4, 0))
         self.transport.bind("<Configure>", lambda _event: self._draw_transport())
@@ -356,7 +356,13 @@ class TranscriptionDialog:
             self.polyphony_var.set(result.options.max_polyphony)
         self.engine_var.set(next(label for label, value in ENGINE_LABELS.items() if value == result.options.engine))
         self.quality_model_var.set(next(label for label, value in QUALITY_MODEL_LABELS.items() if value == result.options.quality_model))
-        self.stats_var.set(f"引擎：{result.engine}    调性：{result.detected_key}    BPM：{result.bpm:.1f}\n音符：{len(result.song_notes)}    落点：{stats.get('onset_count', 0)}    和弦：{stats.get('chord_count', 0)}    平均复音：{stats.get('average_polyphony', 0)}{confidence}{warning}")
+        quality_detail = ""
+        if result.quality_analysis is not None:
+            quality_detail = (
+                f"\n过滤鼓点：{stats.get('filteredDrumCount', 0)}    未吸附：{stats.get('unsnappedNoteCount', 0)}"
+                f"    建议精修小节：{stats.get('suspiciousBarCount', 0)}"
+            )
+        self.stats_var.set(f"引擎：{result.engine}    调性：{result.detected_key}    BPM：{result.bpm:.1f}\n音符：{len(result.song_notes)}    落点：{stats.get('onset_count', 0)}    和弦：{stats.get('chord_count', 0)}    平均复音：{stats.get('average_polyphony', 0)}{quality_detail}{confidence}{warning}")
         self._draw_timeline()
 
     def _draw_timeline(self) -> None:
@@ -379,6 +385,12 @@ class TranscriptionDialog:
             for bar in result.quality_analysis.bar_starts_ms:
                 x = left + (bar - start) / span * (width - left - right)
                 canvas.create_line(x, 0, x, height, fill="#D6DCE8", dash=(2, 2))
+            for item in result.stats.get("barDiagnostics", []):
+                if not item.get("suspicious"):
+                    continue
+                x0 = left + (int(item["startMs"]) - start) / span * (width - left - right)
+                x1 = left + (int(item["endMs"]) - start) / span * (width - left - right)
+                canvas.create_rectangle(x0, 0, x1, height, fill="#F5C85B", outline="", stipple="gray25")
         if self.refine_start_ms is not None and self.refine_end_ms is not None:
             lo, hi = sorted((self.refine_start_ms, self.refine_end_ms))
             x0 = left + (lo - start) / span * (width - left - right); x1 = left + (hi - start) / span * (width - left - right)
@@ -415,6 +427,11 @@ class TranscriptionDialog:
             for bar in result.quality_analysis.bar_starts_ms:
                 x = x0 + (bar - start) / span * (x1 - x0)
                 canvas.create_line(x, y - 8, x, y + 8, fill="#AAB4C6")
+            for item in result.stats.get("barDiagnostics", []):
+                if item.get("suspicious"):
+                    left_x = x0 + (int(item["startMs"]) - start) / span * (x1 - x0)
+                    right_x = x0 + (int(item["endMs"]) - start) / span * (x1 - x0)
+                    canvas.create_rectangle(left_x, y - 4, right_x, y + 4, fill="#F5C85B", outline="")
         if self.refine_start_ms is not None and self.refine_end_ms is not None:
             lo, hi = sorted((self.refine_start_ms, self.refine_end_ms))
             selection_left = x0 + (lo - start) / span * (x1 - x0)

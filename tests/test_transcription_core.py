@@ -39,10 +39,12 @@ class TestV2Options(unittest.TestCase):
 
     def test_v2_option_bounds(self):
         self.assertEqual(TranscriptionOptions().arrangement_preset, "auto")
-        for value in range(2, 6):
+        for value in range(2, 11):
             self.assertEqual(TranscriptionOptions(max_polyphony=value).max_polyphony, value)
         with self.assertRaises(ValueError):
             TranscriptionOptions(max_polyphony=1)
+        with self.assertRaises(ValueError):
+            TranscriptionOptions(max_polyphony=11)
         with self.assertRaises(ValueError):
             TranscriptionOptions(mode="stem_fusion")
 

@@ -259,6 +259,7 @@ def _metadata(result: TranscriptionResult) -> Dict[str, object]:
         quality = result.quality_analysis
         metadata.update({
             "analysisVersion": 3,
+            "qualityArrangerVersion": 4,
             "qualityModel": quality.model_name,
             "qualityDevice": quality.device,
             "timingBackend": quality.timing_backend,

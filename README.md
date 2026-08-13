@@ -92,16 +92,32 @@ matching hand-authored Sky JSON in `reference`, optional `id`, `split`
 legacy UTF-16 Sky JSON are both supported. A hand score may cover only part
 of a song: metrics automatically ignore generated notes outside its annotated
 intervals. Use `reference_offset_ms` when that excerpt starts later in the
-source, or `reference_windows_ms` for explicit source-time windows.
+source, or `reference_windows_ms` for explicit source-time windows. V3 rows
+also report whole-song, front-half and back-half metrics. `top_voice` is the
+highest rendered key at each onset; `selected_melody` is the arranger's actual
+Viterbi-selected melody. The legacy `melody` field remains an alias of
+`top_voice`.
 
 Keep the audio and hand score in ignored `golden_samples/`; use 10–20 songs
 and reserve at least three as `validation`. The report contains 60 ms
-key+onset F1, melody F1, onset-only F1, onset MAE, density, polyphony, elapsed
-time and peak Python allocation. Run V2 and V3 manifests separately, then
+key+onset F1, top-voice/selected-melody F1, onset-only F1, onset MAE, density,
+polyphony, elapsed time and peak Python allocation. Run V2 and V3 manifests separately, then
 compare validation medians before changing the app default.
 
 ```powershell
 python scripts/benchmark_transcription.py golden-manifest.json v2-report.json
+```
+
+For a V3 drum-only regression run, use the V3 manifest and then verify the
+report. The verifier's release gates are original/candidate melody identity and
+zero non-drum rendered-note changes. Whole/front/back `top_voice` and
+key+onset deltas remain in the report as drum-removal diagnostics: a reference
+score can coincidentally match an old drum leak, so those deltas are warnings
+rather than permission to restore percussion noise.
+
+```powershell
+python scripts/benchmark_transcription.py golden_samples/golden-manifest-v3.json golden_samples/v3-v4-golden-report.json
+python scripts/verify_v3_golden.py golden_samples/v3-v4-golden-report.json --output golden_samples/v3-v4-golden-verdict.json
 ```
 
 ## Packaging
