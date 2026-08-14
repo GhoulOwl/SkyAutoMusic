@@ -42,6 +42,12 @@ chord-template chain when melody or rhythm fidelity matters.
 
 Changing preset, key, octave or polyphony re-arranges the in-memory analysis; it does not run separation or pitch detection again. BPM/meter changes rerun audio analysis.
 
+### Model memory and drafts
+
+MuScriptor, Demucs and Basic Pitch remain ready while a transcription task is active, then release their in-memory model caches after three idle minutes. The next task reloads only the model it needs; downloaded model weights are never removed.
+
+Completed drafts are automatically stored in `Drafts/` next to the application and restored when the generation window is reopened. Local drafts retain their original source path; online drafts retain a managed copy of the downloaded audio. Right-click a draft to rename or delete it. Renaming changes the later exported score name and default filename, while deleting never removes a local source file or an already exported score.
+
 ## Development
 
 Install Python 3.10 dependencies on Windows:
@@ -108,16 +114,15 @@ compare validation medians before changing the app default.
 python scripts/benchmark_transcription.py golden-manifest.json v2-report.json
 ```
 
-For a V3 drum-only regression run, use the V3 manifest and then verify the
-report. The verifier's release gates are original/candidate melody identity and
-zero non-drum rendered-note changes. Whole/front/back `top_voice` and
-key+onset deltas remain in the report as drum-removal diagnostics: a reference
-score can coincidentally match an old drum leak, so those deltas are warnings
-rather than permission to restore percussion noise.
+For the historical V4 drum-only regression, retain its saved report and
+verdict. V5 changes melody selection intentionally to prioritize detected
+vocals, so compare a fresh V5 report with the V4 baseline instead. The V5 gate
+allows at most a 0.005 F1 decrease in overall and validation onset/selected-
+melody metrics, and rejects any per-song selected-melody recall drop.
 
 ```powershell
-python scripts/benchmark_transcription.py golden_samples/golden-manifest-v3.json golden_samples/v3-v4-golden-report.json
-python scripts/verify_v3_golden.py golden_samples/v3-v4-golden-report.json --output golden_samples/v3-v4-golden-verdict.json
+python scripts/benchmark_transcription.py golden_samples/golden-manifest-v3.json golden_samples/v5-vocal-golden-report.json
+python scripts/verify_v5_vocal.py golden_samples/v3-v4-golden-report.json golden_samples/v5-vocal-golden-report.json --output golden_samples/v5-vocal-golden-verdict.json
 ```
 
 ## Packaging

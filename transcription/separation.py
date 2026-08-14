@@ -11,6 +11,7 @@ from pathlib import Path
 from typing import Optional
 
 from .models import CancelledError, ProgressCallback, TranscriptionError
+from .model_runtime import model_runtime
 
 
 # The bundled checkpoint is retained for its well-tested vocal estimate.  V2
@@ -106,14 +107,33 @@ class TwoStemSeparator:
         return self._separator
 
     def prepare(self, progress_cb: Optional[ProgressCallback] = None) -> None:
+        with model_runtime.activity():
+            with self._lock:
+                if progress_cb:
+                    progress_cb("separate", 0.0, "正在校验人声/伴奏分离模型")
+                self._load(None)
+                if progress_cb:
+                    progress_cb("separate", 1.0, "人声/伴奏分离模型已就绪")
+
+    def release(self) -> bool:
+        """Discard the lazily cached Demucs Separator instance."""
         with self._lock:
-            if progress_cb:
-                progress_cb("separate", 0.0, "正在校验人声/伴奏分离模型")
-            self._load(None)
-            if progress_cb:
-                progress_cb("separate", 1.0, "人声/伴奏分离模型已就绪")
+            if self._separator is None:
+                return False
+            self._separator = None
+            return True
 
     def separate(
+        self,
+        input_path: str,
+        output_dir: str,
+        cancel_event: Optional[threading.Event] = None,
+        progress_cb: Optional[ProgressCallback] = None,
+    ) -> TwoStemAudio:
+        with model_runtime.activity():
+            return self._separate(input_path, output_dir, cancel_event, progress_cb)
+
+    def _separate(
         self,
         input_path: str,
         output_dir: str,
@@ -174,6 +194,7 @@ class TwoStemSeparator:
 
 
 _TWO_STEM_BACKEND = TwoStemSeparator()
+model_runtime.register("demucs", _TWO_STEM_BACKEND.release)
 
 
 def separate_audio(

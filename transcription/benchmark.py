@@ -1,6 +1,7 @@
 """Private golden-set benchmark for V2/V3 15-key arrangements."""
 from __future__ import annotations
 
+import bisect
 import json
 import hashlib
 import importlib.metadata
@@ -16,6 +17,13 @@ from .models import QualityAnalysisDraft, SymbolicNote, TranscriptionOptions, Tr
 from .pipeline import transcribe_draft
 from .arranger import SKY_MIDI, _pitch_to_key
 from .quality import _adaptive_quantize, _best_shift, arrange_quality_analysis, arrange_quality_melody, select_melody
+
+
+_V4_LEAD_PRIORITY = {
+    "voice": 8, "synth_lead": 7, "violin": 6, "flutes": 6,
+    "soprano_and_alto_sax": 5, "tenor_sax": 5, "clarinet": 5,
+    "oboe": 5, "trumpet": 5, "acoustic_piano": 4, "electric_piano": 4,
+}
 
 
 def _read_score_payload(path: Path) -> Any:
@@ -207,9 +215,74 @@ def _split_windows(windows: Sequence[Tuple[int, int]]) -> Dict[str, List[Tuple[i
     return {"all": list(windows), "front": intersect(left, middle), "back": intersect(middle + 1, right)}
 
 
+def _select_melody_v4(notes: Sequence[SymbolicNote], beats: Sequence[int]) -> List[SymbolicNote]:
+    """Frozen V4 lead selector used only as a benchmark baseline."""
+    candidates = [note for note in notes if note.role == "melody" and 45 <= note.midi_pitch <= 100]
+    if not candidates:
+        candidates = [note for note in notes if note.role != "drums" and 54 <= note.midi_pitch <= 96]
+    grouped: Dict[int, List[SymbolicNote]] = defaultdict(list)
+    for note in candidates:
+        onset = int(round(note.start_ms / 25.0) * 25) if len(beats) >= 2 else note.start_ms
+        grouped[onset].append(note)
+    windows: Dict[int, List[List[SymbolicNote]]] = defaultdict(list)
+    for onset in sorted(grouped):
+        beat_index = max(0, bisect.bisect_right(beats, onset) - 1) if beats else onset // 4000
+        row = sorted(grouped[onset], key=lambda note: (_V4_LEAD_PRIORITY.get(note.instrument, 0), note.end_ms - note.start_ms), reverse=True)[:8]
+        windows[beat_index // 8].append(row)
+    selected: List[SymbolicNote] = []
+    previous: SymbolicNote | None = None
+    for window in (windows[index] for index in sorted(windows)):
+        scores: List[List[float]] = []
+        links: List[List[int]] = []
+        for row_index, row in enumerate(window):
+            row_scores: List[float] = []
+            row_links: List[int] = []
+            for current in row:
+                value = 100.0 + 12.0 * _V4_LEAD_PRIORITY.get(current.instrument, 0) - abs(current.midi_pitch - 74) * .6
+                if row_index == 0:
+                    if previous:
+                        value -= abs(current.midi_pitch - previous.midi_pitch) * .55
+                        if current.instrument != previous.instrument:
+                            value -= 7.0
+                        if current.start_ms - previous.end_ms > 1400:
+                            value -= 3.0
+                    row_scores.append(value)
+                    row_links.append(-1)
+                    continue
+                choices: List[float] = []
+                for prior_index, prior in enumerate(window[row_index - 1]):
+                    transition = 100.0 + 12.0 * _V4_LEAD_PRIORITY.get(current.instrument, 0) - abs(current.midi_pitch - 74) * .6
+                    transition -= abs(current.midi_pitch - prior.midi_pitch) * .55
+                    if current.instrument != prior.instrument:
+                        transition -= 7.0
+                    if current.start_ms - prior.end_ms > 1400:
+                        transition -= 3.0
+                    choices.append(scores[-1][prior_index] + transition)
+                best = max(range(len(choices)), key=choices.__getitem__)
+                row_scores.append(choices[best])
+                row_links.append(best)
+            scores.append(row_scores)
+            links.append(row_links)
+        if not scores:
+            continue
+        index = max(range(len(scores[-1])), key=scores[-1].__getitem__)
+        chosen: List[SymbolicNote] = []
+        for row_index in range(len(window) - 1, -1, -1):
+            chosen.append(window[row_index][index])
+            index = links[row_index][index]
+            if index < 0:
+                break
+        for current in reversed(chosen):
+            if previous and current.start_ms < previous.end_ms and current.midi_pitch != previous.midi_pitch:
+                continue
+            selected.append(current)
+            previous = current
+    return selected
+
+
 def _original_v3_reference_arrangement(draft: QualityAnalysisDraft, options: TranscriptionOptions) -> Tuple[List[Dict[str, object]], Dict[Tuple[int, str], str]]:
-    """Frozen pre-v4 arrangement path, used only to compare a cached draft."""
-    melody = select_melody(draft.symbolic_notes, draft.beat_times_ms)
+    """Historical drum baseline using the frozen V4 lead selector."""
+    melody = _select_melody_v4(draft.symbolic_notes, draft.beat_times_ms)
     shift = _best_shift(melody, options)
     melody_ids = {(note.start_ms, note.end_ms, note.midi_pitch, note.instrument) for note in melody}
     by_time: Dict[int, Dict[int, Tuple[int, str]]] = defaultdict(dict)
@@ -307,7 +380,10 @@ def run_benchmark(manifest_path: Path, output_path: Path) -> Dict[str, Any]:
                     "removedRenderedNoteCount": removed, "addedRenderedNoteCount": added,
                     "drumDerivedRemovedRenderedNoteCount": removed - non_drum_removed,
                     "nonDrumRemovedRenderedNoteCount": non_drum_removed,
-                    "selectedMelodyIdentical": True,
+                    "selectedMelodyIdentical": (
+                        _select_melody_v4(result.quality_analysis.symbolic_notes, result.quality_analysis.beat_times_ms)
+                        == select_melody(result.quality_analysis.symbolic_notes, result.quality_analysis.beat_times_ms)
+                    ),
                     "filteredDrumCount": result.stats.get("filteredDrumCount", 0),
                 }
         rows.append(row)

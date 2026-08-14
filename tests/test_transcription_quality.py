@@ -13,7 +13,7 @@ from transcription.arranger import SKY_MIDI, _pitch_to_key, key_transpose
 from transcription.benchmark import _cache_path, _load_quality_cache, _save_quality_cache, _score_notes, evaluate_15_key
 from transcription.models import QualityAnalysisDraft, SymbolicNote, TranscriptionError, TranscriptionOptions, TranscriptionResult
 from transcription.pipeline import export_song_json, transcribe_draft
-from transcription.quality import _role, arrange_quality_analysis, resolve_quality_model, select_melody
+from transcription.quality import _role, arrange_quality_analysis, arrange_quality_melody, resolve_quality_model, select_melody
 
 
 def quality_draft():
@@ -205,6 +205,51 @@ class TestQualityArrangement(unittest.TestCase):
         self.assertEqual(select_melody(draft.symbolic_notes, draft.beat_times_ms), reference_selected)
         self.assertEqual(actual, expected)
 
+    def test_overlapping_voice_syllables_are_retained(self):
+        draft = quality_draft()
+        first = SymbolicNote(0, 450, 72, "voice", "melody")
+        second = SymbolicNote(250, 700, 74, "voice", "melody")
+        draft.symbolic_notes = [first, second]
+
+        self.assertEqual(select_melody(draft.symbolic_notes, draft.beat_times_ms), [first, second])
+
+    def test_voice_wins_same_onset_while_piano_remains_available_for_accompaniment(self):
+        draft = quality_draft()
+        first_voice = SymbolicNote(0, 400, 72, "voice", "melody")
+        second_voice = SymbolicNote(500, 900, 74, "voice", "melody")
+        draft.symbolic_notes = [
+            SymbolicNote(0, 900, 84, "acoustic_piano", "melody"), first_voice,
+            SymbolicNote(500, 1300, 86, "acoustic_piano", "melody"), second_voice,
+        ]
+
+        self.assertEqual(select_melody(draft.symbolic_notes, draft.beat_times_ms), [first_voice, second_voice])
+
+    def test_voice_collision_uses_original_onset_but_piano_keeps_quantized_timing(self):
+        draft = quality_draft()
+        options = TranscriptionOptions(engine="quality", rights_confirmed=True, source_key="C major")
+        first_voice = SymbolicNote(0, 100, 72, "voice", "melody")
+        second_voice = SymbolicNote(60, 160, 72, "voice", "melody")
+        draft.symbolic_notes = [first_voice, second_voice]
+        vocal_path = arrange_quality_melody(draft, options)
+        self.assertEqual([note["time"] for note in vocal_path], [0, 60])
+        vocal_notes, _key, _shift, _stats = arrange_quality_analysis(draft, options)
+        self.assertEqual([(note["time"], note["key"]) for note in vocal_notes], [(0, vocal_path[0]["key"]), (60, vocal_path[1]["key"])])
+
+        piano = quality_draft()
+        piano.symbolic_notes = [
+            SymbolicNote(0, 100, 72, "acoustic_piano", "melody"),
+            SymbolicNote(60, 160, 72, "acoustic_piano", "melody"),
+        ]
+        self.assertEqual([note["time"] for note in arrange_quality_melody(piano, options)], [0, 0])
+
+    def test_instrumental_lead_fills_gap_after_vocal_phrase(self):
+        draft = quality_draft()
+        voice = SymbolicNote(0, 300, 72, "voice", "melody")
+        piano = SymbolicNote(500, 900, 76, "acoustic_piano", "melody")
+        draft.symbolic_notes = [voice, piano]
+
+        self.assertEqual(select_melody(draft.symbolic_notes, draft.beat_times_ms), [voice, piano])
+
     def test_melody_survives_polyphony_limit_and_quantizes_small_error(self):
         notes, _key, _shift, stats = arrange_quality_analysis(quality_draft(), TranscriptionOptions(engine="quality", rights_confirmed=True, source_key="C major", max_polyphony=2, arrangement_preset="full"))
         by_time = {}
@@ -239,7 +284,8 @@ class TestQualityArrangement(unittest.TestCase):
                 data = json.load(handle)[0]
         metadata = data["_transcribe"]
         self.assertEqual(metadata["schemaVersion"], 3)
-        self.assertEqual(metadata["qualityArrangerVersion"], 4)
+        self.assertEqual(metadata["qualityArrangerVersion"], 5)
+        self.assertEqual(stats["qualityArrangerVersion"], 5)
         self.assertNotIn("onsetDelayMs", metadata)
         self.assertTrue(data["songNotes"])
 

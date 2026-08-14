@@ -22,6 +22,7 @@ from .models import (
     TranscriptionOptions,
     TranscriptionResult,
 )
+from .model_runtime import model_runtime
 from .quality import analyze_quality_audio, arrange_quality_analysis
 
 
@@ -36,6 +37,18 @@ def _notify(callback: Optional[ProgressCallback], stage: str, fraction: float, m
 
 
 def transcribe_draft(
+    path: str,
+    options: Optional[TranscriptionOptions] = None,
+    cancel_event: Optional[threading.Event] = None,
+    progress_cb: Optional[ProgressCallback] = None,
+    workspace_dir: Optional[str] = None,
+) -> TranscriptionResult:
+    """Run one complete job as a single model-runtime activity."""
+    with model_runtime.activity():
+        return _transcribe_draft(path, options, cancel_event, progress_cb, workspace_dir)
+
+
+def _transcribe_draft(
     path: str,
     options: Optional[TranscriptionOptions] = None,
     cancel_event: Optional[threading.Event] = None,
@@ -163,6 +176,20 @@ def refine_region(
     cancel_event: Optional[threading.Event] = None,
     progress_cb: Optional[ProgressCallback] = None,
 ) -> TranscriptionResult:
+    """Refine one region without allowing the shared model cache to go idle."""
+    with model_runtime.activity():
+        return _refine_region(result, source_path, start_ms, end_ms, options, cancel_event, progress_cb)
+
+
+def _refine_region(
+    result: TranscriptionResult,
+    source_path: str,
+    start_ms: int,
+    end_ms: int,
+    options: Optional[TranscriptionOptions] = None,
+    cancel_event: Optional[threading.Event] = None,
+    progress_cb: Optional[ProgressCallback] = None,
+) -> TranscriptionResult:
     """Re-transcribe one bar-aligned V3 region while keeping the song grid fixed.
 
     The selected range gets one bar of audio context on each side, but only the
@@ -259,7 +286,7 @@ def _metadata(result: TranscriptionResult) -> Dict[str, object]:
         quality = result.quality_analysis
         metadata.update({
             "analysisVersion": 3,
-            "qualityArrangerVersion": 4,
+            "qualityArrangerVersion": 5,
             "qualityModel": quality.model_name,
             "qualityDevice": quality.device,
             "timingBackend": quality.timing_backend,

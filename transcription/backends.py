@@ -13,6 +13,7 @@ from .models import (
     ProgressCallback,
     TranscriptionError,
 )
+from .model_runtime import model_runtime
 
 
 AUDIO_EXTS = {".mp3", ".wav", ".flac", ".ogg", ".m4a", ".aac"}
@@ -360,7 +361,27 @@ class BasicPitchBackend:
             raise TranscriptionError(f"Basic Pitch ONNX 模型加载失败: {exc}") from exc
         return self._model
 
+    def release(self) -> bool:
+        """Drop the cached Basic Pitch ONNX runtime."""
+        with self._lock:
+            if self._model is None:
+                return False
+            self._model = None
+            return True
+
     def transcribe(
+        self,
+        path: str,
+        sensitivity: str = "normal",
+        cancel_event: Optional[threading.Event] = None,
+        progress_cb: Optional[ProgressCallback] = None,
+        min_midi: int = 36,
+        max_midi: int = 96,
+    ) -> BackendOutput:
+        with model_runtime.activity():
+            return self._transcribe(path, sensitivity, cancel_event, progress_cb, min_midi, max_midi)
+
+    def _transcribe(
         self,
         path: str,
         sensitivity: str = "normal",
@@ -456,6 +477,7 @@ class BasicPitchBackend:
 
 
 _BASIC_PITCH_BACKEND = BasicPitchBackend()
+model_runtime.register("basic_pitch", _BASIC_PITCH_BACKEND.release)
 
 
 def transcribe_polyphonic(

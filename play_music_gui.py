@@ -1600,6 +1600,7 @@ class MusicGUI:
             accent=self.accent,
             on_saved=self._refresh_music_after_generation,
             auth_file=resource_path("netease_auth.json"),
+            draft_dir=resource_path("Drafts"),
         )
 
     def _refresh_music_after_generation(self, output_path=None):
@@ -1629,8 +1630,13 @@ class MusicGUI:
         if getattr(self, "audio_preview", None):
             self.audio_preview.close()
         dialog = getattr(self, "_transcription_dialog", None)
-        if dialog is not None:
-            dialog.close()
+        if dialog is not None and not dialog.close():
+            return
+        try:
+            from transcription.model_runtime import model_runtime
+            model_runtime.shutdown()
+        except Exception:
+            pass
         self._release_game_topmost()
         # 保存窗口大小和位置
         try:

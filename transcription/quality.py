@@ -15,6 +15,7 @@ from statistics import median
 from typing import Dict, Iterable, List, Optional, Sequence, Tuple
 
 from .arranger import SKY_MIDI, _pitch_to_key, key_transpose
+from .model_runtime import model_runtime
 from .models import (
     CancelledError,
     Meter,
@@ -35,6 +36,18 @@ _LEAD_PRIORITY = {
     "oboe": 5, "trumpet": 5, "acoustic_piano": 4, "electric_piano": 4,
 }
 _BASS_INSTRUMENTS = {"acoustic_bass", "electric_bass", "contrabass", "tuba", "bassoon"}
+
+
+def release_quality_models() -> bool:
+    """Drop cached MuScriptor instances after the shared idle timeout."""
+    with _MODEL_LOCK:
+        if not _MODELS:
+            return False
+        _MODELS.clear()
+        return True
+
+
+model_runtime.register("muscriptor", release_quality_models)
 
 
 def choose_quality_device() -> str:
@@ -102,14 +115,15 @@ def prepare_quality_model(
     requested_model: str = "auto", token: Optional[str] = None,
     progress_cb: Optional[ProgressCallback] = None,
 ) -> Tuple[str, str]:
-    device = choose_quality_device()
-    model_name = resolve_quality_model(requested_model, device)
-    if progress_cb:
-        progress_cb("quality", 0.0, f"正在准备 MuScriptor {model_name} 模型")
-    _load_model(model_name, device, token)
-    if progress_cb:
-        progress_cb("quality", 1.0, f"MuScriptor {model_name} 模型已就绪")
-    return model_name, device
+    with model_runtime.activity():
+        device = choose_quality_device()
+        model_name = resolve_quality_model(requested_model, device)
+        if progress_cb:
+            progress_cb("quality", 0.0, f"正在准备 MuScriptor {model_name} 模型")
+        _load_model(model_name, device, token)
+        if progress_cb:
+            progress_cb("quality", 1.0, f"MuScriptor {model_name} 模型已就绪")
+        return model_name, device
 
 
 def _role(instrument: str) -> str:
@@ -188,21 +202,22 @@ def _timing_from_model(model: object, path: str, notes: Sequence[SymbolicNote], 
 def analyze_quality_audio(path: str, options: TranscriptionOptions, cancel_event=None, progress_cb: Optional[ProgressCallback] = None, token: Optional[str] = None, beam_size: int = 1) -> Tuple[QualityAnalysisDraft, List[NoteEvent]]:
     if not options.rights_confirmed:
         raise TranscriptionError("高质量模式需要确认：你拥有输入音频及生成乐谱所需的权利。")
-    device = choose_quality_device()
-    model_name = resolve_quality_model(options.quality_model, device)
-    if progress_cb:
-        progress_cb("quality", .01, f"正在加载 MuScriptor {model_name}")
-    model = _load_model(model_name, device, token)
-    symbolic = _extract_symbolic_events(model, path, cancel_event, progress_cb, beam_size=beam_size)
-    if not symbolic:
-        raise TranscriptionError("高质量模型未识别到可用音符")
-    beats, downbeats, bars, bpm, meter, confidence = _timing_from_model(model, path, symbolic, options)
-    duration = max(note.end_ms for note in symbolic) / 1000.0
-    draft = QualityAnalysisDraft(duration, symbolic, beats, downbeats, bars, bpm, meter, confidence, model_name, device)
-    events = [NoteEvent(note.start_ms, note.end_ms, note.midi_pitch, 1.0, f"quality:{note.instrument}") for note in symbolic if note.role != "drums"]
-    if progress_cb:
-        progress_cb("quality", 1.0, "整曲音符、节拍与重拍识别完成")
-    return draft, events
+    with model_runtime.activity():
+        device = choose_quality_device()
+        model_name = resolve_quality_model(options.quality_model, device)
+        if progress_cb:
+            progress_cb("quality", .01, f"正在加载 MuScriptor {model_name}")
+        model = _load_model(model_name, device, token)
+        symbolic = _extract_symbolic_events(model, path, cancel_event, progress_cb, beam_size=beam_size)
+        if not symbolic:
+            raise TranscriptionError("高质量模型未识别到可用音符")
+        beats, downbeats, bars, bpm, meter, confidence = _timing_from_model(model, path, symbolic, options)
+        duration = max(note.end_ms for note in symbolic) / 1000.0
+        draft = QualityAnalysisDraft(duration, symbolic, beats, downbeats, bars, bpm, meter, confidence, model_name, device)
+        events = [NoteEvent(note.start_ms, note.end_ms, note.midi_pitch, 1.0, f"quality:{note.instrument}") for note in symbolic if note.role != "drums"]
+        if progress_cb:
+            progress_cb("quality", 1.0, "整曲音符、节拍与重拍识别完成")
+        return draft, events
 
 
 def _local_grid(beats: Sequence[int], time_ms: int, subdivisions: int) -> List[int]:
@@ -257,6 +272,11 @@ def select_melody(notes: Sequence[SymbolicNote], beats: Sequence[int]) -> List[S
     for onset in sorted(grouped):
         beat_index = max(0, bisect.bisect_right(beats, onset) - 1) if beats else onset // 4000
         candidates_at_onset = sorted(grouped[onset], key=lambda note: (_LEAD_PRIORITY.get(note.instrument, 0), note.end_ms - note.start_ms), reverse=True)[:8]
+        voice_candidates = [note for note in candidates_at_onset if note.instrument == "voice"]
+        # A detected vocal onset is the song lead.  Other instruments at this
+        # same onset remain available to the accompaniment pass below.
+        if voice_candidates:
+            candidates_at_onset = voice_candidates
         windows[beat_index // beats_per_window].append(candidates_at_onset)
     for window in (windows[index] for index in sorted(windows)):
         scores: List[List[float]] = []
@@ -284,7 +304,11 @@ def select_melody(notes: Sequence[SymbolicNote], beats: Sequence[int]) -> List[S
             if index < 0:
                 break
         for current in reversed(chosen):
-            if previous and current.start_ms < previous.end_ms and current.midi_pitch != previous.midi_pitch:
+            # MuScriptor commonly lets sung-note tails overlap the following
+            # syllable.  Preserve the newer vocal onset; retain the historical
+            # guard for instrumental leads so piano-only arrangements are
+            # unchanged.
+            if previous and current.start_ms < previous.end_ms and current.midi_pitch != previous.midi_pitch and current.instrument != "voice":
                 continue
             selected.append(current)
             previous = current
@@ -330,17 +354,38 @@ def _key_for_shift(shift: int) -> str:
     return "C major"
 
 
+def _map_quality_melody(
+    melody: Sequence[SymbolicNote], draft: QualityAnalysisDraft, options: TranscriptionOptions, shift: int,
+) -> List[Tuple[SymbolicNote, int, int]]:
+    """Map the selected lead once for both rendering and benchmark scoring."""
+    mapped: List[Tuple[SymbolicNote, int, int]] = []
+    voice_positions = set()
+    previous_source = previous_sky = None
+    octave = 12 * (options.melody_octave_shift or 0)
+    for note in melody:
+        pitch = note.midi_pitch + shift + octave
+        key, _ = _pitch_to_key(pitch, previous_source, previous_sky)
+        time_ms = _adaptive_quantize(note.start_ms, draft)
+        # Adjacent syllables can snap to the same 15-key onset.  Keep their
+        # distinct attacks by falling back to the model's source time.  This
+        # deliberately applies only to vocals; instrumental timing retains its
+        # established quantization behavior.
+        if note.instrument == "voice" and (time_ms, key) in voice_positions:
+            source_position = (note.start_ms, key)
+            if source_position not in voice_positions:
+                time_ms = note.start_ms
+        if note.instrument == "voice":
+            voice_positions.add((time_ms, key))
+        mapped.append((note, time_ms, key))
+        previous_source, previous_sky = pitch, SKY_MIDI[key]
+    return mapped
+
+
 def arrange_quality_melody(draft: QualityAnalysisDraft, options: TranscriptionOptions, forced_shift: Optional[int] = None) -> List[Dict[str, object]]:
     """Return the exact selected/mapped melody path for evaluation only."""
     melody = select_melody(draft.symbolic_notes, draft.beat_times_ms)
     shift = _best_shift(melody, options) if forced_shift is None else forced_shift
-    notes: List[Dict[str, object]] = []
-    previous_source = previous_sky = None
-    for note in melody:
-        key, _ = _pitch_to_key(note.midi_pitch + shift + 12 * (options.melody_octave_shift or 0), previous_source, previous_sky)
-        notes.append({"time": _adaptive_quantize(note.start_ms, draft), "key": f"1Key{key}"})
-        previous_source, previous_sky = note.midi_pitch + shift + 12 * (options.melody_octave_shift or 0), SKY_MIDI[key]
-    return notes
+    return [{"time": time_ms, "key": f"1Key{key}"} for _note, time_ms, key in _map_quality_melody(melody, draft, options, shift)]
 
 
 def _diagnose_arrangement(draft: QualityAnalysisDraft, song_notes: Sequence[Dict[str, object]]) -> List[Dict[str, object]]:
@@ -382,9 +427,17 @@ def arrange_quality_analysis(draft: QualityAnalysisDraft, options: Transcription
         if role == "melody":
             previous_source, previous_sky = pitch + shift, SKY_MIDI[index]
 
-    for note in melody:
-        time = _adaptive_quantize(note.start_ms, draft)
-        add(time, note.midi_pitch + 12 * (options.melody_octave_shift or 0), 100, "melody")
+    mapped_melody = _map_quality_melody(melody, draft, options, shift)
+    for note, time_ms, index in mapped_melody:
+        old = by_time[time_ms].get(index)
+        if old is None or old[0] < 100:
+            by_time[time_ms][index] = (100, {"melody"})
+        elif old[0] == 100:
+            old[1].add("melody")
+    if mapped_melody:
+        last_note, _last_time, last_index = mapped_melody[-1]
+        previous_source = last_note.midi_pitch + shift + 12 * (options.melody_octave_shift or 0)
+        previous_sky = SKY_MIDI[last_index]
 
     density = {"simple": 4, "standard": 2, "full": 1, "auto": 2}[options.arrangement_preset]
     # Keep the original candidate stream, including drum positions, through
@@ -426,6 +479,6 @@ def arrange_quality_analysis(draft: QualityAnalysisDraft, options: Transcription
         "unsnappedNoteCount": sum(not _quantize_with_status(note.start_ms, draft)[1] for note in draft.symbolic_notes if note.role != "drums"),
         "barDiagnostics": diagnostics,
         "suspiciousBarCount": sum(bool(item["suspicious"]) for item in diagnostics),
-        "qualityArrangerVersion": 4,
+        "qualityArrangerVersion": 5,
     }
     return song_notes, options.source_key or _key_for_shift(shift), shift, stats

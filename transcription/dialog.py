@@ -5,17 +5,19 @@ import os
 import tempfile
 import threading
 import tkinter as tk
+import uuid
 import webbrowser
 from dataclasses import replace
-from tkinter import filedialog, messagebox, ttk
+from tkinter import filedialog, messagebox, simpledialog, ttk
 from typing import Callable, Dict, List, Optional, Sequence
 
 from .arranger import NOTE_NAMES
 from .backends import is_midi_file
+from .draft_store import DraftRecord, DraftStore
 from .models import CancelledError, SourceMetadata, TranscriptionOptions, TranscriptionResult
 from .netease import NetEaseClient, NetEaseTrack
 from .netease_auth import CookieValidationResult, NetEaseCookieStore, parse_netscape_cookies, serialize_netscape_cookies, validate_cookie_account
-from .pipeline import cleanup_result_artifacts, export_song_json, next_available_path, rearrange_draft, refine_region, suggested_output_stem, transcribe_draft
+from .pipeline import cleanup_result_artifacts, export_song_json, next_available_path, rearrange_draft, refine_region, sanitize_filename_stem, suggested_output_stem, transcribe_draft
 from .preview import PreviewPlayer
 from .quality import choose_quality_device, prepare_quality_model, resolve_quality_model
 
@@ -37,14 +39,23 @@ class TranscriptionDialog:
         accent: str = "#4F8CFF",
         on_saved: Optional[Callable[[str], None]] = None,
         auth_file: Optional[str] = None,
+        draft_dir: Optional[str] = None,
         netease_client: Optional[NetEaseClient] = None,
         **_legacy_kwargs: object,
     ) -> None:
-        self.parent, self.files, self.output_dir = parent, list(files), output_dir
+        self.parent, self.files, self.output_dir = parent, [], output_dir
         self.accent, self.on_saved = accent, on_saved or (lambda _path: None)
         self.results: Dict[str, TranscriptionResult] = {}
         self.errors: Dict[str, str] = {}
-        self.source_labels: Dict[str, str] = {path: os.path.basename(path) for path in self.files}
+        self.source_paths: Dict[str, str] = {}
+        self.source_labels: Dict[str, str] = {}
+        self.draft_records: Dict[str, DraftRecord] = {}
+        self.unpersisted_drafts: set[str] = set()
+        self.draft_load_warnings: List[str] = []
+        self.draft_store = DraftStore(draft_dir or os.path.join(os.path.dirname(os.path.abspath(output_dir)), "Drafts"))
+        for path in files:
+            self._append_item(path, self._initial_draft_name(path))
+        self._restore_drafts()
         self.cancel_event = threading.Event()
         self.preview_player = PreviewPlayer(
             on_status=self._preview_status,
@@ -89,6 +100,8 @@ class TranscriptionDialog:
         self.query_var = tk.StringVar()
         self.cookie_status_var = tk.StringVar(value=self.cookie_store.load_validation().message)
         self._build_widgets()
+        if self.draft_load_warnings:
+            self.status_var.set("；".join(self.draft_load_warnings))
         if self.files:
             self.win.after(100, self.generate_all)
 
@@ -156,8 +169,10 @@ class TranscriptionDialog:
         self.file_list = tk.Listbox(left, exportselection=False)
         self.file_list.pack(fill="both", expand=True, pady=(4, 0))
         self.file_list.bind("<<ListboxSelect>>", self._on_selection)
-        for path in self.files:
-            self.file_list.insert(tk.END, f"… {self.source_labels[path]}")
+        self.file_list.bind("<Button-3>", self._on_draft_right_click)
+        self.file_list.bind("<Control-Button-1>", self._on_draft_right_click)
+        for draft_id in self.files:
+            self.file_list.insert(tk.END, self._list_text(draft_id))
         ttk.Label(right, text="15 键时间线（蓝色：旋律区；灰色：伴奏区；橙色：建议精修）").pack(anchor="w")
         self.transport = tk.Canvas(right, background="#F7F8FB", highlightthickness=1, highlightbackground="#D9DEE7", height=38, cursor="sb_h_double_arrow")
         self.transport.pack(fill="x", pady=(4, 0))
@@ -201,6 +216,71 @@ class TranscriptionDialog:
     def _local_summary(self) -> str:
         return "尚未选择本地文件" if not self.files else f"已选择 {len(self.files)} 个文件"
 
+    def _append_item(self, source_path: str, label: str, draft_id: Optional[str] = None) -> str:
+        identifier = draft_id or uuid.uuid4().hex
+        self.files.append(identifier)
+        self.source_paths[identifier] = os.path.abspath(source_path) if source_path else ""
+        self.source_labels[identifier] = label
+        return identifier
+
+    @staticmethod
+    def _initial_draft_name(source_path: str) -> str:
+        filename = os.path.basename(source_path)
+        stem, _suffix = os.path.splitext(filename)
+        return stem or filename or "未命名草稿"
+
+    def _restore_drafts(self) -> None:
+        records, warnings = self.draft_store.load_all()
+        self.draft_load_warnings = warnings
+        for record in records:
+            self._append_item(record.source_path, record.name, record.id)
+            self.results[record.id] = record.result
+            self.draft_records[record.id] = record
+
+    def _list_text(self, draft_id: str) -> str:
+        label = self.source_labels.get(draft_id, "未命名草稿")
+        if draft_id in self.results:
+            marker = "⚠ " if draft_id in self.unpersisted_drafts else "✓ "
+            return f"{marker}{label} · {len(self.results[draft_id].song_notes)} 音"
+        if draft_id in self.errors:
+            return f"✗ {label}"
+        return f"… {label}"
+
+    def _source_path(self, draft_id: str) -> str:
+        return self.source_paths.get(draft_id, "")
+
+    def _persist_draft(self, draft_id: str, result: TranscriptionResult) -> None:
+        record = self.draft_records.get(draft_id)
+        source_path = self._source_path(draft_id)
+        if record is None:
+            record = DraftStore.new_record(self.source_labels.get(draft_id, "未命名草稿"), source_path, result, draft_id)
+        else:
+            record.name = self.source_labels.get(draft_id, record.name)
+            record.result = result
+            if record.source_kind == "external":
+                record.source_path = source_path
+        managed_source = None
+        if record.source_kind == "managed":
+            managed_source = None
+        elif result.source is not None and result.source.platform == "netease":
+            managed_source = source_path
+        try:
+            self.draft_store.upsert(record, managed_source=managed_source)
+        except Exception as exc:
+            self.unpersisted_drafts.add(draft_id)
+            self.status_var.set(f"草稿暂存失败：{exc}")
+            return
+        self.draft_records[draft_id] = record
+        self.source_paths[draft_id] = record.source_path
+        self.unpersisted_drafts.discard(draft_id)
+
+    def _refresh_list_item(self, draft_id: str) -> None:
+        if draft_id not in self.files:
+            return
+        index = self._file_index(draft_id)
+        self.file_list.delete(index)
+        self.file_list.insert(index, self._list_text(draft_id))
+
     def _options(self) -> TranscriptionOptions:
         octave = None if self.octave_var.get() == "自动" else int(self.octave_var.get())
         bpm = None if self.bpm_var.get() == "自动" else float(self.bpm_var.get())
@@ -214,13 +294,12 @@ class TranscriptionDialog:
 
     def choose_local_files(self) -> None:
         paths = filedialog.askopenfilenames(parent=self.win, title="选择音频或 MIDI", filetypes=[("支持的文件", "*.mp3 *.wav *.flac *.ogg *.m4a *.aac *.mid *.midi"), ("所有文件", "*.*")])
-        added = [path for path in paths if path not in self.files]
+        added = list(paths)
         if not added:
             return
-        self.files.extend(added)
         for path in added:
-            self.source_labels[path] = os.path.basename(path)
-            self.file_list.insert(tk.END, f"… {self.source_labels[path]}")
+            draft_id = self._append_item(path, self._initial_draft_name(path))
+            self.file_list.insert(tk.END, self._list_text(draft_id))
         self.local_summary.config(text=self._local_summary())
         self.generate_all()
 
@@ -257,37 +336,44 @@ class TranscriptionDialog:
             return
         self.cancel_event = threading.Event(); self._set_busy(True); self.progress_var.set(0.0)
         options = self._options()
-        pending = list(self.files)
+        pending = [draft_id for draft_id in self.files if draft_id not in self.results and draft_id not in self.errors]
+        if not pending:
+            self._set_busy(False)
+            return
         def worker() -> None:
-            for index, path in enumerate(pending):
+            for index, draft_id in enumerate(pending):
                 if self.cancel_event.is_set():
                     break
+                source_path = self._source_path(draft_id)
                 def progress(stage: str, fraction: float, message: str, _index=index) -> None:
                     weights = {"decode": (0.0, .05), "separate": (.05, .45), "timing": (.50, .10), "melody": (.60, .15), "harmony": (.75, .10), "structure": (.85, .05), "quality": (.05, .85), "arrange": (.90, .10), "refine": (.05, .90)}
                     start, weight = weights.get(stage, (0.0, 1.0))
-                    self._after(self._apply_progress, (_index + start + weight * fraction) / len(pending), message, self.source_labels.get(path, os.path.basename(path)))
+                    self._after(self._apply_progress, (_index + start + weight * fraction) / len(pending), message, self.source_labels.get(draft_id, os.path.basename(source_path)))
                 try:
-                    result = transcribe_draft(path, options, self.cancel_event, progress, self._temp_root.name)
-                    self._after(self._record_result, path, result, None)
+                    result = transcribe_draft(source_path, options, self.cancel_event, progress, self._temp_root.name)
+                    self._after(self._record_result, draft_id, result, None)
                 except CancelledError:
                     break
                 except Exception as exc:
-                    self._after(self._record_result, path, None, str(exc))
+                    self._after(self._record_result, draft_id, None, str(exc))
             self._after(self._finish_batch, self.cancel_event.is_set())
         self._start_worker(worker)
 
     def regenerate_current(self) -> None:
-        if self.busy or not (path := self._selected_path()) or not (previous := self.results.get(path)):
+        if self.busy or not (draft_id := self._selected_path()) or not (previous := self.results.get(draft_id)):
             return
         options = self._options(); self.cancel_event = threading.Event(); self._set_busy(True)
         def worker() -> None:
             try:
                 requires_analysis = options.bpm_override != previous.options.bpm_override or options.meter != previous.options.meter
                 if previous.analysis is not None and not requires_analysis:
-                    result = rearrange_draft(previous, options, self.cancel_event, lambda _s, f, m: self._after(self._apply_progress, f, m, self.source_labels[path]))
+                    result = rearrange_draft(previous, options, self.cancel_event, lambda _s, f, m: self._after(self._apply_progress, f, m, self.source_labels[draft_id]))
                 else:
-                    result = transcribe_draft(path, options, self.cancel_event, lambda _s, f, m: self._after(self._apply_progress, f, m, self.source_labels[path]), self._temp_root.name)
-                self._after(self._record_result, path, result, None)
+                    source_path = self._source_path(draft_id)
+                    if not os.path.isfile(source_path):
+                        raise RuntimeError("原始音频已不可用；仍可修改编配参数或导出草稿，但不能重新分析。")
+                    result = transcribe_draft(source_path, options, self.cancel_event, lambda _s, f, m: self._after(self._apply_progress, f, m, self.source_labels[draft_id]), self._temp_root.name)
+                self._after(self._record_result, draft_id, result, None)
                 self._after(self._finish_regenerate, None)
             except Exception as exc:
                 self._after(self._finish_regenerate, str(exc))
@@ -296,21 +382,22 @@ class TranscriptionDialog:
     def _apply_progress(self, fraction: float, message: str, detail: str) -> None:
         self.progress_var.set(max(0.0, min(1.0, fraction))); self.status_var.set(message); self.detail_var.set(detail)
 
-    def _file_index(self, path: str) -> int:
-        return self.files.index(path)
+    def _file_index(self, draft_id: str) -> int:
+        return self.files.index(draft_id)
 
-    def _record_result(self, path: str, result: Optional[TranscriptionResult], error: Optional[str]) -> None:
-        index = self._file_index(path)
+    def _record_result(self, draft_id: str, result: Optional[TranscriptionResult], error: Optional[str]) -> None:
+        index = self._file_index(draft_id)
         if result is None:
-            self.errors[path] = error or "未知错误"; text = f"✗ {self.source_labels[path]}"
+            self.errors[draft_id] = error or "未知错误"
         else:
-            previous = self.results.get(path)
-            self.results[path] = result; self.errors.pop(path, None); text = f"✓ {self.source_labels[path]} · {len(result.song_notes)} 音"
+            previous = self.results.get(draft_id)
+            self.results[draft_id] = result; self.errors.pop(draft_id, None)
             if previous and previous.artifact_root and previous.artifact_root != result.artifact_root:
                 cleanup_result_artifacts(previous)
-        self.file_list.delete(index); self.file_list.insert(index, text)
+            self._persist_draft(draft_id, result)
+        self._refresh_list_item(draft_id)
         if not self.file_list.curselection():
-            self.file_list.selection_set(index); self.file_list.activate(index); self._show_path(path)
+            self.file_list.selection_set(index); self.file_list.activate(index); self._show_path(draft_id)
 
     def _finish_batch(self, cancelled: bool) -> None:
         self._set_busy(False); self.detail_var.set("")
@@ -331,15 +418,15 @@ class TranscriptionDialog:
         return self.files[int(selection[0])] if selection and int(selection[0]) < len(self.files) else None
 
     def _current_result(self) -> Optional[TranscriptionResult]:
-        path = self._selected_path()
-        if path and self.refinement_candidate and self.refinement_candidate[0] == path:
+        draft_id = self._selected_path()
+        if draft_id and self.refinement_candidate and self.refinement_candidate[0] == draft_id:
             return self.refinement_candidate[1]
-        return self.results.get(path) if path else None
+        return self.results.get(draft_id) if draft_id else None
 
     def _on_selection(self, _event=None) -> None:
         self.refine_start_ms = self.refine_end_ms = None
         self.playhead_ms = 0
-        if path := self._selected_path(): self._show_path(path)
+        if draft_id := self._selected_path(): self._show_path(draft_id)
         self._set_busy(self.busy)
 
     def _show_path(self, path: str) -> None:
@@ -540,39 +627,45 @@ class TranscriptionDialog:
         button.config(command=start)
 
     def refine_current(self) -> None:
-        path = self._selected_path(); current = self.results.get(path or "")
-        if self.busy or not path or not current or current.quality_analysis is None or self.refine_start_ms is None or self.refine_end_ms is None:
+        draft_id = self._selected_path(); current = self.results.get(draft_id or "")
+        if self.busy or not draft_id or not current or current.quality_analysis is None or self.refine_start_ms is None or self.refine_end_ms is None:
+            return
+        source_path = self._source_path(draft_id)
+        if not os.path.isfile(source_path):
+            messagebox.showerror("片段精修失败", "原始音频已不可用；暂存草稿仍可试听、重新编配和导出。", parent=self.win)
             return
         self.cancel_event = threading.Event(); self._set_busy(True)
         start, end, options = self.refine_start_ms, self.refine_end_ms, self._options()
         def worker() -> None:
             try:
-                candidate = refine_region(current, path, start, end, options, self.cancel_event, lambda _s, f, m: self._after(self._apply_progress, f, m, self.source_labels[path]))
-                self._after(self._finish_refinement, path, candidate, None)
+                candidate = refine_region(current, source_path, start, end, options, self.cancel_event, lambda _s, f, m: self._after(self._apply_progress, f, m, self.source_labels[draft_id]))
+                self._after(self._finish_refinement, draft_id, candidate, None)
             except Exception as exc:
-                self._after(self._finish_refinement, path, None, str(exc))
+                self._after(self._finish_refinement, draft_id, None, str(exc))
         self._start_worker(worker)
 
-    def _finish_refinement(self, path: str, candidate: Optional[TranscriptionResult], error: Optional[str]) -> None:
+    def _finish_refinement(self, draft_id: str, candidate: Optional[TranscriptionResult], error: Optional[str]) -> None:
         self._set_busy(False)
         if error or candidate is None:
             self.status_var.set(error or "片段精修失败")
             if error != "转写已取消": messagebox.showerror("片段精修失败", error or "未知错误", parent=self.win)
             return
-        self.refinement_candidate = (path, candidate)
+        self.refinement_candidate = (draft_id, candidate)
         self.status_var.set("已生成精修试听，确认后才会替换当前草稿")
-        self._set_busy(False); self._show_path(path)
+        self._set_busy(False); self._show_path(draft_id)
 
     def accept_refinement(self) -> None:
         if not self.refinement_candidate:
             return
-        path, candidate = self.refinement_candidate; previous = self.results.get(path)
-        self.results[path] = candidate; self.refinement_candidate = None
+        draft_id, candidate = self.refinement_candidate; previous = self.results.get(draft_id)
+        self.results[draft_id] = candidate; self.refinement_candidate = None
         if previous and previous.artifact_root and previous.artifact_root != candidate.artifact_root:
             cleanup_result_artifacts(previous)
+        self._persist_draft(draft_id, candidate)
+        self._refresh_list_item(draft_id)
         self.refine_start_ms = self.refine_end_ms = None
         self.status_var.set("已接受片段精修")
-        self._set_busy(False); self._show_path(path)
+        self._set_busy(False); self._show_path(draft_id)
 
     def discard_refinement(self) -> None:
         if not self.refinement_candidate:
@@ -726,27 +819,134 @@ class TranscriptionDialog:
     def _add_online_result(self, path: str, track: NetEaseTrack, result: Optional[TranscriptionResult], error: Optional[str]) -> None:
         self._set_busy(False)
         if result is None: self.status_var.set(error or "在线草稿失败"); messagebox.showerror("在线草稿失败", error or "未知错误", parent=self.win); return
-        self.files.append(path); self.source_labels[path] = track.display_name; self.file_list.insert(tk.END, f"✓ {track.display_name} · {len(result.song_notes)} 音"); self.results[path] = result
-        index = len(self.files) - 1; self.file_list.selection_clear(0, tk.END); self.file_list.selection_set(index); self._show_path(path); self.progress_var.set(1.0)
+        draft_id = self._append_item(path, track.display_name)
+        self.results[draft_id] = result
+        self._persist_draft(draft_id, result)
+        self.file_list.insert(tk.END, self._list_text(draft_id))
+        index = len(self.files) - 1; self.file_list.selection_clear(0, tk.END); self.file_list.selection_set(index); self._show_path(draft_id); self.progress_var.set(1.0)
+
+    def _on_draft_right_click(self, event: tk.Event) -> None:
+        if self.busy:
+            return
+        index = self.file_list.nearest(event.y)
+        if index < 0 or index >= len(self.files):
+            return
+        self.file_list.selection_clear(0, tk.END)
+        self.file_list.selection_set(index)
+        self.file_list.activate(index)
+        draft_id = self.files[index]
+        self._show_path(draft_id)
+        menu = tk.Menu(self.file_list, tearoff=0)
+        state = "normal" if draft_id in self.results else "disabled"
+        menu.add_command(label="重命名草稿…", state=state, command=lambda: self._rename_draft(draft_id))
+        menu.add_command(label="删除草稿…", state=state, command=lambda: self._delete_draft(draft_id))
+        try:
+            menu.tk_popup(event.x_root, event.y_root)
+        finally:
+            menu.grab_release()
+
+    def _rename_draft(self, draft_id: str) -> None:
+        if self.busy or draft_id not in self.results:
+            return
+        previous = self.source_labels.get(draft_id, "")
+        previous_record_name = self.draft_records[draft_id].name if draft_id in self.draft_records else previous
+        name = simpledialog.askstring("重命名草稿", "草稿名称：", initialvalue=previous, parent=self.win)
+        if name is None:
+            return
+        try:
+            cleaned = " ".join(name.split())
+            if not cleaned:
+                raise ValueError("草稿名称不能为空")
+            self.source_labels[draft_id] = cleaned[:180]
+            self._persist_draft(draft_id, self.results[draft_id])
+            if draft_id in self.unpersisted_drafts:
+                self.source_labels[draft_id] = previous
+                raise OSError("草稿暂存失败，名称未修改")
+        except Exception as exc:
+            self.source_labels[draft_id] = previous
+            if draft_id in self.draft_records:
+                self.draft_records[draft_id].name = previous_record_name
+            messagebox.showerror("重命名失败", str(exc), parent=self.win)
+            return
+        self._refresh_list_item(draft_id)
+        self.status_var.set(f"已重命名草稿：{cleaned[:180]}")
+
+    def _delete_draft(self, draft_id: str, confirm: bool = True) -> bool:
+        if self.busy or draft_id not in self.files:
+            return False
+        name = self.source_labels.get(draft_id, "草稿")
+        if confirm and not messagebox.askyesno(
+            "删除草稿", f"确定删除草稿“{name}”吗？\n不会删除本地原始音频或已保存曲谱。", parent=self.win,
+        ):
+            return False
+        record = self.draft_records.get(draft_id)
+        if record is not None:
+            try:
+                self.draft_store.delete(record)
+            except Exception as exc:
+                messagebox.showerror("删除草稿失败", str(exc), parent=self.win)
+                return False
+        result = self.results.get(draft_id)
+        if result is not None:
+            cleanup_result_artifacts(result)
+        index = self._file_index(draft_id)
+        self.file_list.delete(index)
+        self.files.pop(index)
+        self.results.pop(draft_id, None); self.errors.pop(draft_id, None)
+        self.source_paths.pop(draft_id, None); self.source_labels.pop(draft_id, None)
+        self.draft_records.pop(draft_id, None); self.unpersisted_drafts.discard(draft_id)
+        if self.refinement_candidate and self.refinement_candidate[0] == draft_id:
+            self.refinement_candidate = None
+        if self.files:
+            next_index = min(index, len(self.files) - 1)
+            self.file_list.selection_set(next_index)
+            self._show_path(self.files[next_index])
+        else:
+            self.timeline.delete("all"); self.transport.delete("all"); self.stats_var.set("尚未生成草稿")
+        self._set_busy(False)
+        self.status_var.set(f"已删除草稿：{name}")
+        return True
 
     def save_current(self) -> None:
-        if not (path := self._selected_path()) or not (result := self.results.get(path)): return
-        stem = suggested_output_stem(result); output = next_available_path(self.output_dir, stem)
-        try: export_song_json(result, output, self.source_labels.get(path, stem)); self.on_saved(output); self.status_var.set(f"已保存：{os.path.basename(output)}")
-        except Exception as exc: messagebox.showerror("保存失败", str(exc), parent=self.win)
+        if not (draft_id := self._selected_path()) or not (result := self.results.get(draft_id)):
+            return
+        name = self.source_labels.get(draft_id, suggested_output_stem(result))
+        stem = sanitize_filename_stem(name); output = next_available_path(self.output_dir, stem)
+        try:
+            export_song_json(result, output, name); self.on_saved(output); self.status_var.set(f"已保存：{os.path.basename(output)}")
+        except Exception as exc:
+            messagebox.showerror("保存失败", str(exc), parent=self.win)
+            return
+        if messagebox.askyesno("删除草稿", "曲谱已保存，是否删除此暂存草稿？\n不会删除本地原始音频或已保存曲谱。", parent=self.win):
+            self._delete_draft(draft_id, confirm=False)
 
     def save_all(self) -> None:
-        for path, result in list(self.results.items()):
+        saved: List[str] = []
+        for draft_id, result in list(self.results.items()):
             try:
-                output = next_available_path(self.output_dir, suggested_output_stem(result)); export_song_json(result, output, self.source_labels.get(path, os.path.basename(path))); self.on_saved(output)
-            except Exception as exc: messagebox.showerror("保存失败", f"{os.path.basename(path)}：{exc}", parent=self.win); return
-        self.status_var.set(f"已保存 {len(self.results)} 份乐谱")
+                name = self.source_labels.get(draft_id, suggested_output_stem(result))
+                output = next_available_path(self.output_dir, sanitize_filename_stem(name)); export_song_json(result, output, name); self.on_saved(output)
+                saved.append(draft_id)
+            except Exception as exc:
+                messagebox.showerror("保存失败", f"{self.source_labels.get(draft_id, draft_id)}：{exc}", parent=self.win)
+                return
+        self.status_var.set(f"已保存 {len(saved)} 份乐谱")
+        if saved and messagebox.askyesno("删除草稿", f"已保存 {len(saved)} 份曲谱，是否删除这些暂存草稿？\n不会删除本地原始音频或已保存曲谱。", parent=self.win):
+            for draft_id in list(saved):
+                if draft_id in self.files:
+                    self._delete_draft(draft_id, confirm=False)
 
     def cancel(self) -> None:
         self.cancel_event.set(); self.status_var.set("正在取消…")
 
-    def close(self) -> None:
-        if self.closed: return
+    def close(self) -> bool:
+        if self.closed:
+            return True
+        if self.unpersisted_drafts and not messagebox.askyesno(
+            "未暂存草稿", "有草稿未能自动暂存，关闭后这些修改会丢失。仍要关闭吗？", parent=self.win,
+        ):
+            return False
         self.closed = True; self.cancel_event.set(); self.preview_player.close()
         for result in self.results.values(): cleanup_result_artifacts(result)
         self._temp_root.cleanup(); self.win.destroy()
+        return True
