@@ -122,7 +122,7 @@ class TranscriptionDialog:
         self.octave_box = ttk.Combobox(options, textvariable=self.octave_var, values=["自动", "-1", "0", "+1"], state="readonly", width=7)
         self.octave_box.grid(row=0, column=5, sticky="w", padx=4, pady=4)
         ttk.Label(options, text="最大复音").grid(row=1, column=0, sticky="e", padx=4, pady=4)
-        self.polyphony_box = ttk.Spinbox(options, from_=2, to=10, textvariable=self.polyphony_var, width=6, state="readonly")
+        self.polyphony_box = ttk.Spinbox(options, from_=1, to=5, textvariable=self.polyphony_var, width=6, state="readonly")
         self.polyphony_box.grid(row=1, column=1, sticky="w", padx=4, pady=4)
         ttk.Label(options, text="BPM 修正").grid(row=1, column=2, sticky="e", padx=4, pady=4)
         self.bpm_box = ttk.Combobox(options, textvariable=self.bpm_var, values=["自动", *map(str, range(40, 221, 5))], width=8)
