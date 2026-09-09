@@ -182,6 +182,7 @@ class Transcriber:
             quality = result.quality_analysis
             metadata.update({
                 "analysisVersion": 3,
+                "qualityArrangerVersion": 6,
                 "qualityModel": quality.model_name,
                 "qualityDevice": quality.device,
                 "timingBackend": quality.timing_backend,

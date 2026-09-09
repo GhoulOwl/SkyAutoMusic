@@ -8,7 +8,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from transcription.draft_store import DraftStore
 from transcription.models import (
-    AnalysisDraft, ChordSpan, MelodyNote, NoteEvent, QualityAnalysisDraft,
+    AnalysisDraft, ChordSpan, LeadSegment, MelodyNote, NoteEvent, QualityAnalysisDraft,
     Section, SourceMetadata, SymbolicNote, TempoMap, TranscriptionOptions,
     TranscriptionResult,
 )
@@ -39,15 +39,16 @@ def _quality_result():
         duration_sec=2.0, symbolic_notes=[SymbolicNote(0, 250, 72, "voice", "melody")],
         beat_times_ms=[0, 500, 1000], downbeat_times_ms=[0], bar_starts_ms=[0], bpm=120,
         meter="4/4", timing_confidence=.9, model_name="small", device="cpu",
-        refined_regions=[(0, 1000)],
+        refined_regions=[(0, 1000)], timing_diagnostics={"regularity": .8},
+        lead_segments=[LeadSegment(0, 250, "vocal", .9)],
     )
     return TranscriptionResult(
         events=[NoteEvent(0, 250, 72, 1.0, "quality:voice")],
         song_notes=[{"time": 0, "key": "1Key7"}], detected_key="C major", bpm=120,
-        stats={"qualityArrangerVersion": 5}, warnings=[], engine="arrangement_v3_quality",
+        stats={"qualityArrangerVersion": 6}, warnings=[], engine="arrangement_v3_quality",
         source_file="online.mp3", options=TranscriptionOptions(engine="quality", rights_confirmed=True),
         source=SourceMetadata(platform="netease", title="Online", artists=("Artist",), source_id="42"),
-        quality_analysis=quality,
+        quality_analysis=quality, note_roles={"0:1Key7": "melody"},
     )
 
 
@@ -85,6 +86,9 @@ class TestDraftStore(unittest.TestCase):
             self.assertFalse(warnings)
             self.assertTrue(records[0].source_available)
             self.assertEqual(records[0].result.quality_analysis.refined_regions, [(0, 1000)])
+            self.assertEqual(records[0].result.quality_analysis.timing_diagnostics, {"regularity": .8})
+            self.assertEqual(records[0].result.quality_analysis.lead_segments, [LeadSegment(0, 250, "vocal", .9)])
+            self.assertEqual(records[0].result.note_roles, {"0:1Key7": "melody"})
             store.delete(records[0])
             self.assertFalse(os.path.exists(managed_path))
             self.assertTrue(os.path.exists(source))

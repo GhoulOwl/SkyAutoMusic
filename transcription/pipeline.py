@@ -23,7 +23,7 @@ from .models import (
     TranscriptionResult,
 )
 from .model_runtime import model_runtime
-from .quality import analyze_quality_audio, arrange_quality_analysis
+from .quality import analyze_quality_audio, arrange_quality_analysis_with_roles
 
 
 def _check_cancel(cancel_event: Optional[threading.Event]) -> None:
@@ -83,7 +83,7 @@ def _transcribe_draft(
         quality, raw_events = analyze_quality_audio(path, options, cancel_event, progress_cb)
         _check_cancel(cancel_event)
         _notify(progress_cb, "arrange", 0.0, "正在进行旋律优先 15 键编配")
-        notes, key, shift, stats = arrange_quality_analysis(quality, options)
+        notes, note_roles, key, shift, stats = arrange_quality_analysis_with_roles(quality, options)
         if not notes:
             raise TranscriptionError("高质量分析完成，但没有生成可用的 15 键音符")
         stats.update({"duration_sec": round(quality.duration_sec, 3), "backend_event_count": len(raw_events)})
@@ -92,7 +92,7 @@ def _transcribe_draft(
             events=raw_events, song_notes=notes, detected_key=key, bpm=quality.bpm,
             stats=stats, warnings=[], engine="arrangement_v3_quality", source_file=os.path.basename(path),
             semitone_shift=shift, beat_times_ms=list(quality.beat_times_ms), options=options,
-            source=source, quality_analysis=quality,
+            source=source, quality_analysis=quality, note_roles=note_roles,
         )
 
     analysis, raw_events, artifact_root, model, warnings = analyze_audio(
@@ -135,7 +135,7 @@ def rearrange_draft(
     if result.quality_analysis is not None:
         if options.bpm_override is not None or options.meter != "auto":
             raise TranscriptionError("高质量草稿的 BPM 或拍号修正需要重新生成当前歌曲")
-        notes, key, shift, stats = arrange_quality_analysis(result.quality_analysis, options)
+        notes, note_roles, key, shift, stats = arrange_quality_analysis_with_roles(result.quality_analysis, options)
         _check_cancel(cancel_event)
         _notify(progress_cb, "arrange", 1.0, "高质量草稿重新编配完成")
         return TranscriptionResult(
@@ -143,7 +143,7 @@ def rearrange_draft(
             stats={**result.stats, **stats}, warnings=list(result.warnings), engine="arrangement_v3_quality",
             source_file=result.source_file, semitone_shift=shift, beat_times_ms=list(result.quality_analysis.beat_times_ms),
             options=options, source=result.source, quality_analysis=result.quality_analysis,
-            artifact_root=result.artifact_root,
+            artifact_root=result.artifact_root, note_roles=note_roles,
         )
     if result.analysis is None:
         notes, key, shift, octave, stats = arrange_events(result.events, replace(options, mode="midi"), result.bpm, result.beat_times_ms)
@@ -243,8 +243,11 @@ def _refine_region(
     offset = context_start
     replacement = [replace(note, start_ms=note.start_ms + offset, end_ms=note.end_ms + offset) for note in local.symbolic_notes if core_start <= note.start_ms + offset < core_end]
     retained = [note for note in quality.symbolic_notes if not (core_start <= note.start_ms < core_end)]
-    updated = replace(quality, symbolic_notes=sorted(retained + replacement, key=lambda note: (note.start_ms, note.midi_pitch)), refined_regions=[*quality.refined_regions, (core_start, core_end)])
-    notes, key, shift, stats = arrange_quality_analysis(updated, active_options, forced_shift=result.semitone_shift)
+    updated = replace(
+        quality, symbolic_notes=sorted(retained + replacement, key=lambda note: (note.start_ms, note.midi_pitch)),
+        refined_regions=[*quality.refined_regions, (core_start, core_end)],
+    )
+    notes, note_roles, key, shift, stats = arrange_quality_analysis_with_roles(updated, active_options, forced_shift=result.semitone_shift)
     if progress_cb:
         progress_cb("refine", 1.0, "片段精修完成，等待确认替换")
     return TranscriptionResult(
@@ -252,6 +255,7 @@ def _refine_region(
         stats={**result.stats, **stats}, warnings=list(result.warnings), engine="arrangement_v3_quality",
         source_file=result.source_file, semitone_shift=shift, beat_times_ms=list(updated.beat_times_ms),
         options=active_options, source=result.source, quality_analysis=updated, artifact_root=root,
+        note_roles=note_roles,
     )
 
 
@@ -286,13 +290,19 @@ def _metadata(result: TranscriptionResult) -> Dict[str, object]:
         quality = result.quality_analysis
         metadata.update({
             "analysisVersion": 3,
-            "qualityArrangerVersion": 5,
+            "qualityArrangerVersion": 8,
             "qualityModel": quality.model_name,
             "qualityDevice": quality.device,
             "timingBackend": quality.timing_backend,
+            "timingDiagnostics": dict(quality.timing_diagnostics),
             "quantization": quality.quantization,
             "meter": quality.meter,
             "refinedRegions": [list(region) for region in quality.refined_regions],
+            "leadSegments": [
+                {"startMs": segment.start_ms, "endMs": segment.end_ms, "source": segment.source,
+                 "confidence": segment.confidence}
+                for segment in quality.lead_segments
+            ],
             "confidence": {"timing": round(quality.timing_confidence, 3)},
         })
     return metadata

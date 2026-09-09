@@ -19,7 +19,7 @@ from .netease import NetEaseClient, NetEaseTrack
 from .netease_auth import CookieValidationResult, NetEaseCookieStore, parse_netscape_cookies, serialize_netscape_cookies, validate_cookie_account
 from .pipeline import cleanup_result_artifacts, export_song_json, next_available_path, rearrange_draft, refine_region, sanitize_filename_stem, suggested_output_stem, transcribe_draft
 from .preview import PreviewPlayer
-from .quality import choose_quality_device, prepare_quality_model, resolve_quality_model
+from .quality import arrange_quality_melody, choose_quality_device, prepare_quality_model, resolve_quality_model
 
 
 PRESET_LABELS = {"自动编配": "auto", "简洁": "simple", "标准": "standard", "丰满": "full"}
@@ -173,7 +173,7 @@ class TranscriptionDialog:
         self.file_list.bind("<Control-Button-1>", self._on_draft_right_click)
         for draft_id in self.files:
             self.file_list.insert(tk.END, self._list_text(draft_id))
-        ttk.Label(right, text="15 键时间线（蓝色：旋律区；灰色：伴奏区；橙色：建议精修）").pack(anchor="w")
+        ttk.Label(right, text="15 键时间线（浅蓝：人声主线；浅紫：器乐主线；蓝色：旋律；灰色：伴奏；橙色：建议精修）").pack(anchor="w")
         self.transport = tk.Canvas(right, background="#F7F8FB", highlightthickness=1, highlightbackground="#D9DEE7", height=38, cursor="sb_h_double_arrow")
         self.transport.pack(fill="x", pady=(4, 0))
         self.transport.bind("<Configure>", lambda _event: self._draw_transport())
@@ -447,8 +447,19 @@ class TranscriptionDialog:
         quality_detail = ""
         if result.quality_analysis is not None:
             quality_detail = (
-                f"\n过滤鼓点：{stats.get('filteredDrumCount', 0)}    未吸附：{stats.get('unsnappedNoteCount', 0)}"
+                f"\n旋律：{stats.get('melody_note_count', 0)}    伴奏：{stats.get('accompaniment_note_count', 0)}"
+                f"    旋律占比：{float(stats.get('melody_note_ratio', 0)):.0%}"
+                f"    未选旋律过滤：{stats.get('filtered_unselected_melody_count', 0)}"
+                f"    密集伴奏过滤：{stats.get('filtered_dense_accompaniment_count', 0)}"
+                f"\n低节拍保护：{'已开启' if stats.get('low_timing_protection') else '未开启'}"
+                f"    节拍：{stats.get('timingBackend', '—')}    未吸附：{stats.get('unsnappedNoteCount', 0)}"
+                f"\n主线分段：人声 {stats.get('vocalLeadSegmentCount', 0)} · 器乐 {stats.get('instrumentalLeadSegmentCount', 0)}"
+                f"    复用原曲织体：{stats.get('reused_source_texture_count', 0)}"
                 f"    建议精修小节：{stats.get('suspiciousBarCount', 0)}"
+                f"\n和声推断：{stats.get('harmonic_key', '—')} · 调性置信度 {float(stats.get('harmonic_key_confidence', 0)):.0%}"
+                f" · 和弦 {stats.get('inferred_chord_count', 0)} / 落点 {stats.get('harmonic_anchor_count', 0)}"
+                f"\n伴奏来源：模型 {stats.get('source_accompaniment_count', 0)} · 推断 {stats.get('generated_accompaniment_count', 0)}"
+                f" · 预算 {stats.get('accompaniment_budget_used', 0)}/{stats.get('accompaniment_budget', 0)}"
             )
         self.stats_var.set(f"引擎：{result.engine}    调性：{result.detected_key}    BPM：{result.bpm:.1f}\n音符：{len(result.song_notes)}    落点：{stats.get('onset_count', 0)}    和弦：{stats.get('chord_count', 0)}    平均复音：{stats.get('average_polyphony', 0)}{quality_detail}{confidence}{warning}")
         self._draw_timeline()
@@ -470,6 +481,11 @@ class TranscriptionDialog:
                 x = left + (section.start_ms - start) / span * (width - left - right)
                 canvas.create_line(x, 0, x, height, fill="#D6DCE8", dash=(2, 2))
         if result.quality_analysis:
+            for segment in result.quality_analysis.lead_segments:
+                x0 = left + (segment.start_ms - start) / span * (width - left - right)
+                x1 = left + (segment.end_ms - start) / span * (width - left - right)
+                fill = "#DDEEFF" if segment.source == "vocal" else "#EEE3FF"
+                canvas.create_rectangle(x0, 0, x1, height, fill=fill, outline="", stipple="gray25")
             for bar in result.quality_analysis.bar_starts_ms:
                 x = left + (bar - start) / span * (width - left - right)
                 canvas.create_line(x, 0, x, height, fill="#D6DCE8", dash=(2, 2))
@@ -483,9 +499,21 @@ class TranscriptionDialog:
             lo, hi = sorted((self.refine_start_ms, self.refine_end_ms))
             x0 = left + (lo - start) / span * (width - left - right); x1 = left + (hi - start) / span * (width - left - right)
             canvas.create_rectangle(x0, 0, x1, height, fill="#FFF4C2", outline="#E8B931", stipple="gray25")
+        roles = dict(result.note_roles)
+        if not roles and result.quality_analysis is not None:
+            # Older persisted drafts did not store rendered roles. Recreate the
+            # locked V5 melody set for an accurate, read-only fallback.
+            roles = {
+                f"{int(note['time'])}:{note['key']}": "melody"
+                for note in arrange_quality_melody(
+                    result.quality_analysis, result.options, result.semitone_shift,
+                )
+            }
         for note in result.song_notes:
             key = int(str(note["key"])[4:]); display = 14 - key; x = left + (int(note["time"]) - start) / span * (width - left - right)
-            canvas.create_rectangle(x - 1.5, display * row + 2, x + 2.5, (display + 1) * row - 2, fill=self.accent if key >= 7 else "#98A6BA", outline="")
+            role = roles.get(f"{int(note['time'])}:{note['key']}")
+            fill = self.accent if role == "melody" else "#98A6BA"
+            canvas.create_rectangle(x - 1.5, display * row + 2, x + 2.5, (display + 1) * row - 2, fill=fill, outline="")
         self._draw_transport()
 
     @staticmethod

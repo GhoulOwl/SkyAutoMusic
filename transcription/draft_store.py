@@ -14,6 +14,7 @@ from typing import Any, Dict, Iterable, List, Optional
 from .models import (
     AnalysisDraft,
     ChordSpan,
+    LeadSegment,
     MelodyNote,
     NoteEvent,
     QualityAnalysisDraft,
@@ -23,6 +24,7 @@ from .models import (
     TempoMap,
     TranscriptionOptions,
     TranscriptionResult,
+    VocalEvidence,
 )
 
 
@@ -81,6 +83,9 @@ def _result_to_dict(result: TranscriptionResult) -> Dict[str, Any]:
             "device": value.device, "timing_backend": value.timing_backend,
             "quantization": value.quantization,
             "refined_regions": [list(item) for item in value.refined_regions],
+            "timing_diagnostics": dict(value.timing_diagnostics),
+            "lead_segments": [item.__dict__ for item in value.lead_segments],
+            "vocal_evidence": [item.__dict__ for item in value.vocal_evidence],
         }
     source = None
     if result.source is not None:
@@ -96,7 +101,7 @@ def _result_to_dict(result: TranscriptionResult) -> Dict[str, Any]:
         "semitone_shift": result.semitone_shift, "octave_shift": result.octave_shift,
         "beat_times_ms": list(result.beat_times_ms), "options": result.options.__dict__,
         "source": source, "analysis": analysis, "quality_analysis": quality,
-        "separation_model": result.separation_model,
+        "separation_model": result.separation_model, "note_roles": dict(result.note_roles),
     }
 
 
@@ -137,6 +142,9 @@ def _result_from_dict(value: Dict[str, Any]) -> TranscriptionResult:
             device=str(quality_value["device"]), timing_backend=str(quality_value.get("timing_backend", "beat_this")),
             quantization=str(quality_value.get("quantization", "adaptive_8th_triplet_16th")),
             refined_regions=[tuple(map(int, item)) for item in quality_value.get("refined_regions", [])],
+            timing_diagnostics=dict(quality_value.get("timing_diagnostics", {})),
+            lead_segments=[LeadSegment(**item) for item in quality_value.get("lead_segments", [])],
+            vocal_evidence=[VocalEvidence(**item) for item in quality_value.get("vocal_evidence", [])],
         )
     return TranscriptionResult(
         events=[NoteEvent(**item) for item in value.get("events", [])], song_notes=list(value.get("song_notes", [])),
@@ -146,6 +154,7 @@ def _result_from_dict(value: Dict[str, Any]) -> TranscriptionResult:
         octave_shift=int(value.get("octave_shift", 0)), beat_times_ms=[int(item) for item in value.get("beat_times_ms", [])],
         options=TranscriptionOptions(**dict(value.get("options", {}))), source=source, analysis=analysis,
         quality_analysis=quality, separation_model=str(value.get("separation_model", "")),
+        note_roles={str(key): str(role) for key, role in dict(value.get("note_roles", {})).items()},
     )
 
 

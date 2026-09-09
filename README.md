@@ -21,6 +21,17 @@ instrument-aware notes first, uses Beat This! beats/downbeats for timing, then
 performs melody-first 15-key reduction. This avoids V2's source-separation and
 chord-template chain when melody or rhythm fidelity matters.
 
+V8 reads Beat This! directly, so expressive tempo changes no longer fail a
+whole-song fixed-tempo check. If beat tracking is unavailable, it preserves
+MuScriptor's original note attacks instead of snapping them to a synthetic
+120 BPM grid. Lead selection is phrase-aware: detected vocals lead while they
+are active, short breaths remain silent, and a coherent BGM line can lead only
+in a clear instrumental passage. `simple` stays melody-only; `standard` and
+`auto` reuse supported bass, piano, guitar or string texture from the source
+and keep accompaniment below one third of the melody. Inferred chords are a
+last-resort option for `full` only.
+
+
 - Windows CPU defaults to MuScriptor Small; CUDA and Apple Silicon default to Medium.
 - On first use, accept MuScriptor's CC BY-NC model terms at Hugging Face and use
   a temporary Hugging Face token in the in-app setup dialog. Tokens are never

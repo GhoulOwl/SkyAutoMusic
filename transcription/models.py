@@ -75,12 +75,56 @@ class SymbolicNote:
     midi_pitch: int
     instrument: str
     role: SymbolicRole = "other"
+    # MuScriptor currently does not expose a calibrated confidence.  Evidence
+    # recovered from the separated vocal stem does, so keep it nullable rather
+    # than pretending every symbolic event has the same certainty.
+    confidence: Optional[float] = None
+    source: str = "muscriptor"
 
     def __post_init__(self) -> None:
         if self.start_ms < 0 or self.end_ms <= self.start_ms:
             raise ValueError("symbolic note must have a positive interval")
         if not 0 <= self.midi_pitch <= 127:
             raise ValueError("symbolic MIDI pitch must be in 0..127")
+        if self.confidence is not None and not 0.0 <= float(self.confidence) <= 1.0:
+            raise ValueError("symbolic note confidence must be in 0..1")
+
+
+@dataclass(frozen=True)
+class VocalEvidence:
+    """One vocal-stem observation used to repair, never invent, a lead note."""
+
+    start_ms: int
+    end_ms: int
+    midi_pitch: Optional[int]
+    confidence: Optional[float]
+    activity: Literal["present", "uncertain", "absent"]
+    source: str = "pyin"
+    onset_ms: Optional[int] = None
+
+    def __post_init__(self) -> None:
+        if self.start_ms < 0 or self.end_ms <= self.start_ms:
+            raise ValueError("vocal evidence must have a positive interval")
+        if self.midi_pitch is not None and not 0 <= self.midi_pitch <= 127:
+            raise ValueError("vocal evidence pitch must be in 0..127")
+        if self.confidence is not None and not 0.0 <= float(self.confidence) <= 1.0:
+            raise ValueError("vocal evidence confidence must be in 0..1")
+
+
+@dataclass(frozen=True)
+class LeadSegment:
+    """One reviewed span of the rendered lead, independent of source instrument."""
+
+    start_ms: int
+    end_ms: int
+    source: Literal["vocal", "instrumental", "silence"]
+    confidence: Optional[float] = None
+
+    def __post_init__(self) -> None:
+        if self.start_ms < 0 or self.end_ms <= self.start_ms:
+            raise ValueError("lead segment must have a positive interval")
+        if self.source not in ("vocal", "instrumental", "silence"):
+            raise ValueError("unsupported lead segment source")
 
 
 @dataclass
@@ -100,6 +144,14 @@ class QualityAnalysisDraft:
     timing_backend: str = "beat_this"
     quantization: str = "adaptive_8th_triplet_16th"
     refined_regions: List[Tuple[int, int]] = field(default_factory=list)
+    # These diagnostics are intentionally optional so V3/V7 drafts written by
+    # earlier builds remain readable without silently changing their notes.
+    timing_diagnostics: Dict[str, Any] = field(default_factory=dict)
+    lead_segments: List[LeadSegment] = field(default_factory=list)
+    vocal_evidence: List[VocalEvidence] = field(default_factory=list)
+    # Versioned independently from the draft schema so a conservative arranger
+    # can discard experimental promoted notes saved by an earlier build.
+    vocal_evidence_version: int = 0
 
 
 @dataclass(frozen=True)
@@ -226,3 +278,6 @@ class TranscriptionResult:
     quality_analysis: Optional[QualityAnalysisDraft] = field(default=None, repr=False)
     separation_model: str = ""
     artifact_root: str = field(default="", repr=False)
+    # Private rendered-note roles used by the transcription review UI. Keys are
+    # stable "{time}:1Key{index}" identities; exported Sky JSON remains unchanged.
+    note_roles: Dict[str, str] = field(default_factory=dict, repr=False)

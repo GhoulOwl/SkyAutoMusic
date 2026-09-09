@@ -4,6 +4,7 @@ import os
 import sys
 import tempfile
 import unittest
+from unittest.mock import patch
 from collections import defaultdict
 from pathlib import Path
 
@@ -13,7 +14,7 @@ from transcription.arranger import SKY_MIDI, _pitch_to_key, key_transpose
 from transcription.benchmark import _cache_path, _load_quality_cache, _save_quality_cache, _score_notes, evaluate_15_key
 from transcription.models import QualityAnalysisDraft, SymbolicNote, TranscriptionError, TranscriptionOptions, TranscriptionResult
 from transcription.pipeline import export_song_json, transcribe_draft
-from transcription.quality import _role, arrange_quality_analysis, arrange_quality_melody, resolve_quality_model, select_melody
+from transcription.quality import _role, _timing_from_model, arrange_quality_analysis, arrange_quality_analysis_with_roles, arrange_quality_melody, resolve_quality_model, select_melody, select_melody_with_segments
 
 
 def quality_draft():
@@ -29,6 +30,30 @@ def quality_draft():
         ],
         beat_times_ms=[0, 500, 1000, 1500, 2000, 2500, 3000, 3500, 4000],
         downbeat_times_ms=[0, 2000, 4000], bar_starts_ms=[0, 2000, 4000],
+        bpm=120.0, meter="4/4", timing_confidence=.9, model_name="small", device="cpu",
+    )
+
+
+def reliable_budget_draft():
+    """Eight 4/4 bars with enough material for every V7 budget."""
+    notes = []
+    for bar in range(8):
+        start = bar * 2000
+        for beat in range(4):
+            time = start + beat * 500
+            notes.append(SymbolicNote(time, time + 360, 76 + (beat % 2) * 2, "voice", "melody"))
+        notes.append(SymbolicNote(start, start + 700, 48, "acoustic_bass", "bass"))
+        notes.append(SymbolicNote(start + 1000, start + 1700, 64, "acoustic_guitar", "harmony"))
+    # These deliberately have unique times/keys, so a leaked source would be visible.
+    notes.extend([
+        SymbolicNote(250, 850, 84, "acoustic_piano", "melody"),
+        SymbolicNote(750, 760, 36, "drums", "drums"),
+        SymbolicNote(1250, 1850, 67, "percussion_fx", "other"),
+    ])
+    beats = list(range(0, 16001, 500))
+    return QualityAnalysisDraft(
+        duration_sec=16.0, symbolic_notes=notes, beat_times_ms=beats,
+        downbeat_times_ms=list(range(0, 16001, 2000)), bar_starts_ms=list(range(0, 16001, 2000)),
         bpm=120.0, meter="4/4", timing_confidence=.9, model_name="small", device="cpu",
     )
 
@@ -158,38 +183,44 @@ class TestQualityArrangement(unittest.TestCase):
             with self.assertRaisesRegex(TranscriptionError, "确认"):
                 transcribe_draft(source, TranscriptionOptions(engine="quality"))
 
-    def test_original_v3_reference_matches_without_drums_for_all_presets(self):
-        for preset in ("simple", "standard", "full", "auto"):
-            options = TranscriptionOptions(engine="quality", rights_confirmed=True, source_key="C major", arrangement_preset=preset, max_polyphony=2)
-            expected, expected_melody = _reference_arrange(quality_draft(), options)
-            actual, _key, _shift, stats = arrange_quality_analysis(quality_draft(), options)
-            self.assertEqual(actual, expected)
-            self.assertEqual(select_melody(quality_draft().symbolic_notes, quality_draft().beat_times_ms), expected_melody)
-            self.assertEqual(stats["filteredDrumCount"], 0)
+    def test_v7_presets_lock_melody_and_increase_density_when_safe_candidates_exist(self):
+        draft = reliable_budget_draft()
+        counts = {}
+        for preset in ("simple", "standard", "auto", "full"):
+            options = TranscriptionOptions(engine="quality", rights_confirmed=True, source_key="C major", arrangement_preset=preset, max_polyphony=3)
+            notes, roles, _key, shift, stats = arrange_quality_analysis_with_roles(draft, options)
+            mapped = {(int(note["time"]), str(note["key"])) for note in arrange_quality_melody(draft, options, shift)}
+            rendered = {(int(note["time"]), str(note["key"])) for note in notes}
+            self.assertTrue(mapped <= rendered)
+            self.assertTrue(all(role in ("melody", "bass", "harmony") for role in roles.values()))
+            self.assertLessEqual(stats["accompaniment_note_count"], stats["melody_note_count"])
+            if preset == "simple":
+                self.assertEqual(stats["accompaniment_note_count"], 0)
+            if preset == "auto":
+                self.assertGreaterEqual(stats["melody_note_ratio"], .75)
+            counts[preset] = stats["accompaniment_note_count"]
+        self.assertLess(counts["simple"], counts["standard"])
+        self.assertLess(counts["standard"], counts["auto"])
+        self.assertLess(counts["auto"], counts["full"])
 
-    def test_only_drum_derived_output_is_removed(self):
-        clean = quality_draft()
-        clean.symbolic_notes = [
-            SymbolicNote(0, 300, 48, "acoustic_bass", "bass"),
-            SymbolicNote(500, 800, 55, "acoustic_guitar", "harmony"),
-            SymbolicNote(1000, 1300, 60, "acoustic_guitar", "harmony"),
-        ]
-        noisy = quality_draft()
-        noisy.symbolic_notes = [
-            clean.symbolic_notes[0],
-            SymbolicNote(250, 350, 36, "drums", "drums"),
-            clean.symbolic_notes[1],
-            SymbolicNote(750, 850, 38, "drums", "drums"),
-            clean.symbolic_notes[2],
-        ]
-        for preset in ("simple", "standard", "full", "auto"):
-            options = TranscriptionOptions(engine="quality", rights_confirmed=True, source_key="C major", arrangement_preset=preset)
-            expected, _melody = _reference_arrange(noisy, options)
-            expected = [note for note in expected if note["time"] not in (250, 750)]
-            actual, _key, _shift, stats = arrange_quality_analysis(noisy, options)
-            self.assertEqual(actual, expected)
-            self.assertEqual(select_melody(noisy.symbolic_notes, noisy.beat_times_ms), _melody)
-            self.assertEqual(stats["filteredDrumCount"], 2)
+    def test_source_texture_can_support_vocal_while_drums_and_other_never_render(self):
+        draft = reliable_budget_draft()
+        options = TranscriptionOptions(engine="quality", rights_confirmed=True, source_key="C major", arrangement_preset="full")
+        _notes, roles, _key, _shift, stats = arrange_quality_analysis_with_roles(draft, options)
+        self.assertGreater(stats["reused_source_texture_count"], 0)
+        self.assertGreater(stats["filteredDrumCount"], 0)
+        self.assertGreater(stats["filtered_other_count"], 0)
+        self.assertNotIn("other", roles.values())
+        self.assertNotIn("drums", roles.values())
+
+    def test_locked_melody_survives_every_valid_polyphony(self):
+        draft = reliable_budget_draft()
+        for polyphony in range(2, 11):
+            options = TranscriptionOptions(engine="quality", rights_confirmed=True, source_key="C major", arrangement_preset="full", max_polyphony=polyphony)
+            notes, _roles, _key, shift, _stats = arrange_quality_analysis_with_roles(draft, options)
+            expected = {(int(note["time"]), str(note["key"])) for note in arrange_quality_melody(draft, options, shift)}
+            actual = {(int(note["time"]), str(note["key"])) for note in notes}
+            self.assertTrue(expected <= actual, polyphony)
 
     def test_original_path_covers_piano_short_notes_leaps_and_fallback(self):
         draft = quality_draft()
@@ -199,8 +230,9 @@ class TestQualityArrangement(unittest.TestCase):
             SymbolicNote(1000, 1400, 56, "acoustic_piano", "melody"),
             SymbolicNote(1500, 1950, 79, "acoustic_piano", "melody"),
         ]
-        expected, reference_selected = _reference_arrange(draft, TranscriptionOptions(engine="quality", rights_confirmed=True, source_key="C major"))
-        actual, _key, _shift, _stats = arrange_quality_analysis(draft, TranscriptionOptions(engine="quality", rights_confirmed=True, source_key="C major"))
+        options = TranscriptionOptions(engine="quality", rights_confirmed=True, source_key="C major", arrangement_preset="simple")
+        expected, reference_selected = _reference_arrange(draft, options)
+        actual, _key, _shift, _stats = arrange_quality_analysis(draft, options)
         self.assertEqual(_role("acoustic_piano"), "melody")
         self.assertEqual(select_melody(draft.symbolic_notes, draft.beat_times_ms), reference_selected)
         self.assertEqual(actual, expected)
@@ -242,13 +274,39 @@ class TestQualityArrangement(unittest.TestCase):
         ]
         self.assertEqual([note["time"] for note in arrange_quality_melody(piano, options)], [0, 0])
 
-    def test_instrumental_lead_fills_gap_after_vocal_phrase(self):
+    def test_short_vocal_breath_remains_silent_before_instrumental_takeover(self):
         draft = quality_draft()
         voice = SymbolicNote(0, 300, 72, "voice", "melody")
         piano = SymbolicNote(500, 900, 76, "acoustic_piano", "melody")
         draft.symbolic_notes = [voice, piano]
 
-        self.assertEqual(select_melody(draft.symbolic_notes, draft.beat_times_ms), [voice, piano])
+        selected, segments = select_melody_with_segments(draft.symbolic_notes, draft.beat_times_ms)
+        self.assertEqual(selected, [voice])
+        self.assertEqual([segment.source for segment in segments], ["vocal"])
+
+        later = SymbolicNote(1600, 2000, 76, "acoustic_piano", "melody")
+        self.assertEqual(select_melody([voice, later], draft.beat_times_ms), [voice, later])
+
+    def test_direct_beat_tracker_keeps_variable_grid_and_scales_override(self):
+        tracker = lambda _path: ([.0, .5, 1.03, 1.50, 2.04], [.0, 2.04])
+        options = TranscriptionOptions(engine="quality", rights_confirmed=True, bpm_override=100, meter="4/4")
+        with patch("transcription.quality._beat_tracker", return_value=tracker):
+            beats, downbeats, bars, bpm, meter, confidence, backend, diagnostics = _timing_from_model(object(), "song.wav", [], options)
+        self.assertEqual(backend, "beat_this_direct")
+        self.assertEqual(meter, "4/4")
+        self.assertEqual(bpm, 100)
+        self.assertGreater(confidence, .5)
+        self.assertEqual(downbeats, bars)
+        self.assertEqual(diagnostics["rawBeatCount"], 5)
+        self.assertNotEqual(beats[2] - beats[1], beats[3] - beats[2])
+
+    def test_fallback_grid_does_not_quantize_note_attacks(self):
+        draft = quality_draft()
+        draft.timing_backend = "fixed_grid_fallback"
+        draft.timing_confidence = .13
+        draft.symbolic_notes = [SymbolicNote(61, 400, 72, "voice", "melody")]
+        notes = arrange_quality_melody(draft, TranscriptionOptions(engine="quality", rights_confirmed=True))
+        self.assertEqual(notes[0]["time"], 61)
 
     def test_melody_survives_polyphony_limit_and_quantizes_small_error(self):
         notes, _key, _shift, stats = arrange_quality_analysis(quality_draft(), TranscriptionOptions(engine="quality", rights_confirmed=True, source_key="C major", max_polyphony=2, arrangement_preset="full"))
@@ -259,13 +317,64 @@ class TestQualityArrangement(unittest.TestCase):
         self.assertTrue(all(len(keys) <= 2 for keys in by_time.values()))
         self.assertEqual(stats["melody_note_count"], 3)
 
-    def test_quality_arrangement_allows_ten_notes_at_one_onset(self):
-        draft = quality_draft()
-        draft.symbolic_notes = [SymbolicNote(0, 400, pitch, "acoustic_guitar", "harmony") for pitch in SKY_MIDI[:10]]
-        notes, _key, _shift, _stats = arrange_quality_analysis(
-            draft, TranscriptionOptions(engine="quality", rights_confirmed=True, source_key="C major", arrangement_preset="full", max_polyphony=10)
+    def test_dense_thousands_are_filtered_before_bar_and_global_budgets(self):
+        draft = reliable_budget_draft()
+        for index in range(3000):
+            time = 100 + (index % 20) * 10
+            draft.symbolic_notes.append(SymbolicNote(time, time + 300, 60 + (index % 12), "acoustic_guitar", "harmony"))
+        options = TranscriptionOptions(engine="quality", rights_confirmed=True, source_key="C major", arrangement_preset="full", max_polyphony=3)
+        notes, _key, _shift, stats = arrange_quality_analysis(draft, options)
+        self.assertGreater(
+            stats["filtered_dense_accompaniment_count"] + stats["filtered_duplicate_accompaniment_count"],
+            1000,
         )
-        self.assertEqual(len([note for note in notes if note["time"] == 0]), 10)
+        self.assertLessEqual(stats["accompaniment_note_count"], int(stats["melody_note_count"] * .50))
+        self.assertLessEqual(len(notes), stats["melody_note_count"] + int(stats["melody_note_count"] * .50))
+
+    def test_low_timing_protection_attaches_v7_support_to_melody_onsets(self):
+        draft = reliable_budget_draft()
+        draft.timing_confidence = .13
+        draft.timing_backend = "fixed_120_fallback"
+        counts = {}
+        for preset in ("simple", "standard", "auto", "full"):
+            options = TranscriptionOptions(engine="quality", rights_confirmed=True, source_key="C major", arrangement_preset=preset, max_polyphony=3)
+            notes, roles, _key, shift, stats = arrange_quality_analysis_with_roles(draft, options)
+            self.assertTrue(stats["low_timing_protection"])
+            melody_times = {int(note["time"]) for note in notes if roles[f"{int(note['time'])}:{note['key']}"] == "melody"}
+            accompaniment_times = {int(note["time"]) for note in notes if roles[f"{int(note['time'])}:{note['key']}"] != "melody"}
+            self.assertTrue(accompaniment_times <= melody_times)
+            self.assertTrue(all(role in ("melody", "bass", "harmony") for role in roles.values()))
+            counts[preset] = stats["accompaniment_note_count"]
+            if preset == "simple":
+                self.assertEqual(stats["accompaniment_note_count"], 0)
+            if preset == "full":
+                self.assertGreater(stats["generated_accompaniment_count"], 0)
+        self.assertLess(counts["simple"], counts["standard"])
+        self.assertLess(counts["standard"], counts["auto"])
+        self.assertLess(counts["auto"], counts["full"])
+
+    def test_v7_infers_safe_chords_from_melody_without_source_accompaniment(self):
+        draft = quality_draft()
+        draft.timing_confidence = .13
+        draft.timing_backend = "fixed_120_fallback"
+        draft.symbolic_notes = [
+            SymbolicNote(time, time + 340, pitch, "voice", "melody")
+            for time, pitch in ((0, 72), (500, 76), (1000, 79), (1500, 76), (2000, 72), (2500, 74))
+        ]
+        options = TranscriptionOptions(engine="quality", rights_confirmed=True, source_key="C major", arrangement_preset="full", max_polyphony=3)
+        notes, roles, _key, _shift, stats = arrange_quality_analysis_with_roles(draft, options)
+        melody_times = {int(note["time"]) for note in notes if roles[f"{int(note['time'])}:{note['key']}"] == "melody"}
+        for note in notes:
+            role = roles[f"{int(note['time'])}:{note['key']}"]
+            if role == "melody":
+                continue
+            self.assertIn(int(note["time"]), melody_times)
+            lead_keys = [int(item["key"].replace("1Key", "")) for item in notes if int(item["time"]) == int(note["time"]) and roles[f"{int(item['time'])}:{item['key']}"] == "melody"]
+            self.assertTrue(any(2 <= lead - int(note["key"].replace("1Key", "")) <= 10 for lead in lead_keys))
+        self.assertEqual(stats["harmonic_key"], "C major")
+        self.assertEqual(stats["source_accompaniment_count"], 0)
+        self.assertGreater(stats["generated_accompaniment_count"], 0)
+        self.assertLessEqual(stats["accompaniment_note_count"], stats["melody_note_count"] // 2)
 
     def test_device_model_defaults(self):
         self.assertEqual(resolve_quality_model("auto", "cpu"), "small")
@@ -284,8 +393,8 @@ class TestQualityArrangement(unittest.TestCase):
                 data = json.load(handle)[0]
         metadata = data["_transcribe"]
         self.assertEqual(metadata["schemaVersion"], 3)
-        self.assertEqual(metadata["qualityArrangerVersion"], 5)
-        self.assertEqual(stats["qualityArrangerVersion"], 5)
+        self.assertEqual(metadata["qualityArrangerVersion"], 8)
+        self.assertEqual(stats["qualityArrangerVersion"], 8)
         self.assertNotIn("onsetDelayMs", metadata)
         self.assertTrue(data["songNotes"])
 

@@ -13,10 +13,10 @@ from pathlib import Path
 from statistics import median
 from typing import Any, Dict, Iterable, List, Sequence, Tuple
 
-from .models import QualityAnalysisDraft, SymbolicNote, TranscriptionOptions, TranscriptionResult
+from .models import LeadSegment, QualityAnalysisDraft, SymbolicNote, TranscriptionOptions, TranscriptionResult
 from .pipeline import transcribe_draft
 from .arranger import SKY_MIDI, _pitch_to_key
-from .quality import _adaptive_quantize, _best_shift, arrange_quality_analysis, arrange_quality_melody, select_melody
+from .quality import _adaptive_quantize, _best_shift, arrange_quality_analysis_with_roles, arrange_quality_melody, select_melody
 
 
 _V4_LEAD_PRIORITY = {
@@ -165,7 +165,7 @@ def _save_quality_cache(path: Path, result: TranscriptionResult) -> None:
         return
     draft = result.quality_analysis
     payload = {
-        "cacheVersion": 3,
+        "cacheVersion": 4,
         "modelName": draft.model_name,
         "modelVersion": _quality_model_version(),
         # Only the expensive symbolic analysis belongs in the cache.  Current
@@ -181,16 +181,17 @@ def _load_quality_cache(path: Path, options: TranscriptionOptions) -> Transcript
         return None
     try:
         payload = json.loads(path.read_text(encoding="utf-8"))
-        if payload.get("cacheVersion") != 3 or payload.get("modelVersion") != _quality_model_version():
+        if payload.get("cacheVersion") != 4 or payload.get("modelVersion") != _quality_model_version():
             return None
         value = payload["draft"]
         value["symbolic_notes"] = [SymbolicNote(**note) for note in value["symbolic_notes"]]
+        value["lead_segments"] = [LeadSegment(**segment) for segment in value.get("lead_segments", [])]
         draft = QualityAnalysisDraft(**value)
-        notes, key, shift, stats = arrange_quality_analysis(draft, options)
+        notes, note_roles, key, shift, stats = arrange_quality_analysis_with_roles(draft, options)
         return TranscriptionResult(
             [], notes, key, draft.bpm, stats, [], engine="arrangement_v3_quality",
             semitone_shift=shift, beat_times_ms=draft.beat_times_ms, options=options,
-            quality_analysis=draft,
+            quality_analysis=draft, note_roles=note_roles,
         )
     except Exception:
         return None
