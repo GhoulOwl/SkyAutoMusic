@@ -107,11 +107,13 @@ class PreviewPlayer:
         on_finished: Optional[Callable[[], None]] = None,
         on_error: Optional[Callable[[Exception], None]] = None,
         on_position: Optional[Callable[[int], None]] = None,
+        on_played: Optional[Callable[[list[str]], None]] = None,
     ) -> None:
         self.on_status = on_status or (lambda _message: None)
         self.on_finished = on_finished or (lambda: None)
         self.on_error = on_error or (lambda _exc: None)
         self.on_position = on_position or (lambda _time_ms: None)
+        self.on_played = on_played or (lambda _keys: None)
         self.controller = controller or AudioPreviewController(
             on_error=self._handle_error
         )
@@ -120,6 +122,7 @@ class PreviewPlayer:
             update_status=self._handle_status,
             update_finished=self._handle_finished,
             update_note=self._handle_note,
+            update_played=self._handle_played,
         )
         self._times: list[int] = []
 
@@ -200,6 +203,9 @@ class PreviewPlayer:
     def _handle_note(self, _index, time_ms, _notes) -> None:
         if time_ms is not None:
             self.on_position(int(time_ms))
+
+    def _handle_played(self, keys: list[str]) -> None:
+        self.on_played(list(keys))
 
     def _handle_error(self, exc: Exception) -> None:
         self.on_error(exc)

@@ -83,6 +83,27 @@ class TestMusicPlayer(unittest.TestCase):
         self.assertEqual(player.state, PlaybackState.STOPPED)
         self.assertEqual(finished, [])
 
+    def test_actual_note_callback_excludes_seeks_and_simulated_misses(self):
+        keys = FakeKeyController()
+        played = []
+        player = MusicPlayer(keys, update_played=lambda notes: played.append(tuple(notes)))
+        player.START_DELAY = 0
+        player.NOTE_HOLD = 0
+        player.simulate = True
+        player.miss_prob = 1.0
+
+        self.assertTrue(player.start({0: ["1Key4"]}, [0]))
+        player.thread.join(timeout=1)
+
+        self.assertEqual(played, [])
+
+        player = MusicPlayer(keys, update_played=lambda notes: played.append(tuple(notes)))
+        player.START_DELAY = 0
+        player.NOTE_HOLD = 0
+        self.assertTrue(player.start({0: ["1Key4", "1Key5"]}, [0]))
+        player.thread.join(timeout=1)
+        self.assertEqual(played, [("1Key4", "1Key5")])
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -28,6 +28,7 @@ class MusicPlayer:
         update_total=None,
         update_progress=None,
         update_note=None,
+        update_played=None,
         update_finished=None,
     ):
         self.key_controller = key_controller
@@ -36,6 +37,9 @@ class MusicPlayer:
         self.update_total = update_total or (lambda sec: None)
         self.update_progress = update_progress or (lambda frac: None)
         self.update_note = update_note or (lambda idx, t_ms, notes: None)
+        # Fired only after keys are actually sent to the controller.  This is
+        # deliberately separate from update_note, which also reports seeks.
+        self.update_played = update_played or (lambda notes: None)
         # 演奏自然结束（非用户停止）时回调，供 UI 重置到"就绪"态
         self.update_finished = update_finished or (lambda: None)
         self.state = PlaybackState.STOPPED
@@ -172,6 +176,7 @@ class MusicPlayer:
         held = list(notes)
         self._held_keys = held
         self.key_controller.press_keys(held)
+        self.update_played(held)
         hold = self.NOTE_HOLD
         if self.simulate:
             hold *= random.uniform(0.7, 1.4)

@@ -62,9 +62,15 @@ class TranscriptionDialog:
             on_finished=self._preview_finished,
             on_error=self._preview_error,
             on_position=self._preview_position,
+            on_played=self._preview_notes_played,
         )
         self._preview_preparing = False
-        self._pending_preview: Optional[tuple[TranscriptionResult, Optional[int], Optional[int], str]] = None
+        self._pending_preview: Optional[tuple[int, TranscriptionResult, Optional[int], Optional[int], str]] = None
+        self._preview_session = 0
+        self._highlighted_keys: set[int] = set()
+        self._key_title_items: Dict[int, int] = {}
+        self._key_row_items: Dict[int, int] = {}
+        self._key_highlight_timers: Dict[int, str] = {}
         self._temp_root = tempfile.TemporaryDirectory(prefix="sky-arrangement-drafts-")
         self.cookie_store = NetEaseCookieStore(auth_file or os.path.join(os.path.dirname(os.path.abspath(output_dir)), "netease_auth.json"))
         self.netease_client = netease_client or NetEaseClient()
@@ -173,7 +179,13 @@ class TranscriptionDialog:
         self.file_list.bind("<Control-Button-1>", self._on_draft_right_click)
         for draft_id in self.files:
             self.file_list.insert(tk.END, self._list_text(draft_id))
-        ttk.Label(right, text="15 键时间线（浅蓝：人声主线；浅紫：器乐主线；蓝色：旋律；灰色：伴奏；橙色：建议精修）").pack(anchor="w")
+        timeline_header = ttk.Frame(right)
+        timeline_header.pack(fill="x")
+        ttk.Label(timeline_header, text="15 键时间线（浅蓝：人声主线；浅紫：器乐主线；蓝色：旋律；灰色：伴奏；橙色：建议精修）").pack(side="left", anchor="w")
+        self.stop_preview_btn = ttk.Button(timeline_header, text="停止", command=self.stop_preview, state="disabled", width=7)
+        self.stop_preview_btn.pack(side="right", padx=(6, 0))
+        self.preview_btn = ttk.Button(timeline_header, text="试听", command=self.preview_current, state="disabled", style="Accent.TButton", width=9)
+        self.preview_btn.pack(side="right")
         self.transport = tk.Canvas(right, background="#F7F8FB", highlightthickness=1, highlightbackground="#D9DEE7", height=38, cursor="sb_h_double_arrow")
         self.transport.pack(fill="x", pady=(4, 0))
         self.transport.bind("<Configure>", lambda _event: self._draw_transport())
@@ -186,14 +198,14 @@ class TranscriptionDialog:
         self.timeline.bind("<ButtonPress-1>", self._begin_refine_selection)
         self.timeline.bind("<B1-Motion>", self._update_refine_selection)
         self.timeline.bind("<ButtonRelease-1>", self._finish_refine_selection)
-        ttk.Label(right, textvariable=self.stats_var, justify="left", foreground="#555").pack(fill="x", anchor="w")
+        self.stats_label = ttk.Label(right, textvariable=self.stats_var, justify="left", foreground="#555", wraplength=620)
+        self.stats_label.pack(fill="x", anchor="w")
+        right.bind("<Configure>", lambda event: self.stats_label.config(wraplength=max(260, event.width - 8)), add="+")
 
         actions = ttk.Frame(self.win)
         actions.pack(fill="x", padx=12, pady=(6, 12))
         self.regenerate_btn = ttk.Button(actions, text="应用参数", command=self.regenerate_current, state="disabled")
         self.regenerate_btn.pack(side="left", padx=(0, 6))
-        self.preview_btn = ttk.Button(actions, text="钢琴音色试听", command=self.preview_current, state="disabled")
-        self.preview_btn.pack(side="left", padx=6)
         self.region_preview_btn = ttk.Button(actions, text="试听所选精修区", command=self.preview_refine_region, state="disabled")
         self.region_preview_btn.pack(side="left", padx=6)
         self.refine_btn = ttk.Button(actions, text="精修所选小节", command=self.refine_current, state="disabled")
@@ -202,7 +214,6 @@ class TranscriptionDialog:
         self.accept_refine_btn.pack(side="left", padx=6)
         self.discard_refine_btn = ttk.Button(actions, text="放弃精修", command=self.discard_refinement, state="disabled")
         self.discard_refine_btn.pack(side="left", padx=6)
-        ttk.Button(actions, text="停止试听", command=self.stop_preview).pack(side="left", padx=6)
         self.save_btn = ttk.Button(actions, text="保存当前", command=self.save_current, state="disabled")
         self.save_btn.pack(side="right", padx=6)
         self.save_all_btn = ttk.Button(actions, text="保存全部", command=self.save_all, state="disabled")
@@ -316,7 +327,7 @@ class TranscriptionDialog:
         state = "disabled" if busy else "normal"
         current = self._current_result()
         self.regenerate_btn.config(state="disabled" if busy or current is None else "normal")
-        self.preview_btn.config(state="disabled" if busy or current is None else "normal")
+        self._sync_preview_controls()
         can_refine = current is not None and current.quality_analysis is not None and self.refine_start_ms is not None and self.refine_end_ms is not None and self.refinement_candidate is None
         can_preview_region = current is not None and current.quality_analysis is not None and self.refine_start_ms is not None and self.refine_end_ms is not None
         self.refine_btn.config(state="normal" if not busy and can_refine else "disabled")
@@ -330,6 +341,24 @@ class TranscriptionDialog:
         self.bpm_box.config(state="disabled" if busy else "normal")
         self.rights_check.config(state="disabled" if busy else "normal")
         self.model_setup_btn.config(state="disabled" if busy else "normal")
+
+    def _sync_preview_controls(self) -> None:
+        if self.closed:
+            return
+        current = self._current_result()
+        state = self.preview_player.state.name
+        if self._preview_preparing:
+            self.preview_btn.config(text="准备中…", state="disabled")
+            self.stop_preview_btn.config(state="normal")
+        elif state == "PLAYING":
+            self.preview_btn.config(text="暂停", state="normal" if not self.busy else "disabled")
+            self.stop_preview_btn.config(state="normal")
+        elif state == "PAUSED":
+            self.preview_btn.config(text="继续", state="normal" if not self.busy else "disabled")
+            self.stop_preview_btn.config(state="normal")
+        else:
+            self.preview_btn.config(text="试听", state="normal" if current is not None and not self.busy else "disabled")
+            self.stop_preview_btn.config(state="disabled")
 
     def generate_all(self) -> None:
         if self.busy or not self.files:
@@ -424,6 +453,7 @@ class TranscriptionDialog:
         return self.results.get(draft_id) if draft_id else None
 
     def _on_selection(self, _event=None) -> None:
+        self.stop_preview()
         self.refine_start_ms = self.refine_end_ms = None
         self.playhead_ms = 0
         if draft_id := self._selected_path(): self._show_path(draft_id)
@@ -465,7 +495,7 @@ class TranscriptionDialog:
         self._draw_timeline()
 
     def _draw_timeline(self) -> None:
-        canvas = self.timeline; canvas.delete("all"); result = self._current_result()
+        canvas = self.timeline; canvas.delete("all"); self._key_title_items.clear(); self._key_row_items.clear(); result = self._current_result()
         if not result or not result.song_notes:
             self._draw_transport()
             return
@@ -474,8 +504,15 @@ class TranscriptionDialog:
         row = height / 15.0; span = max(1, end - start)
         for key in range(15):
             display = 14 - key; y0, y1 = display * row, (display + 1) * row
-            canvas.create_rectangle(0, y0, width, y1, fill="#F7F9FC" if key % 2 else "#FFF", outline="")
-            canvas.create_text(5, (y0 + y1) / 2, text=f"K{key}", anchor="w", fill="#667")
+            self._key_row_items[key] = canvas.create_rectangle(
+                0, y0, width, y1,
+                fill="#DDF5E3" if key in self._highlighted_keys else self._key_row_fill(key), outline="",
+            )
+            self._key_title_items[key] = canvas.create_text(
+                5, (y0 + y1) / 2, text=f"K{key}", anchor="w",
+                fill="#2F8F4E" if key in self._highlighted_keys else "#667",
+                font=("TkDefaultFont", 9, "bold" if key in self._highlighted_keys else "normal"),
+            )
         if result.analysis:
             for section in result.analysis.sections:
                 x = left + (section.start_ms - start) / span * (width - left - right)
@@ -710,25 +747,34 @@ class TranscriptionDialog:
         end_ms: Optional[int],
         label: str,
     ) -> None:
+        self.stop_preview()
+        self._preview_session += 1
+        session = self._preview_session
         if self.preview_player.prepared:
             try:
                 self.preview_player.play(result, start_ms=start_ms, end_ms=end_ms)
-                self.preview_btn.config(text="暂停钢琴音色试听")
+                self._sync_preview_controls()
                 self.status_var.set(f"正在试听{label}")
             except Exception as exc: messagebox.showerror("试听失败", str(exc), parent=self.win)
             return
         self._preview_preparing = True
-        self._pending_preview = (result, start_ms, end_ms, label)
-        self.preview_btn.config(state="disabled", text="准备音色…")
+        self._pending_preview = (session, result, start_ms, end_ms, label)
+        self._sync_preview_controls()
         def worker() -> None:
             try:
-                self.preview_player.prepare(); self._after(self._finish_preview_prepare, None)
-            except Exception as exc: self._after(self._finish_preview_prepare, str(exc))
+                self.preview_player.prepare(); self._after(self._finish_preview_prepare, session, None)
+            except Exception as exc: self._after(self._finish_preview_prepare, session, str(exc))
         self._start_worker(worker)
 
     def preview_current(self) -> None:
+        if self.busy:
+            return
+        if self.preview_player.state.name == "PLAYING":
+            self.preview_player.pause_or_resume(); self._clear_key_highlights(); self.status_var.set("试听已暂停"); self._sync_preview_controls(); return
+        if self.preview_player.state.name == "PAUSED":
+            self.preview_player.pause_or_resume(); self.status_var.set("正在继续试听"); self._sync_preview_controls(); return
         result = self._current_result()
-        if not result or self.busy:
+        if not result:
             return
         self._request_preview(result, self.playhead_ms, None, "当前进度")
 
@@ -741,25 +787,35 @@ class TranscriptionDialog:
         self._draw_transport()
         self._request_preview(result, start, end, "所选精修区")
 
-    def _finish_preview_prepare(self, error: Optional[str]) -> None:
+    def _finish_preview_prepare(self, session: int, error: Optional[str]) -> None:
+        if session != self._preview_session:
+            return
         self._preview_preparing = False
         if error:
-            self.preview_btn.config(text="钢琴音色试听", state="normal"); messagebox.showerror("试听失败", error, parent=self.win); return
+            self._pending_preview = None; self._sync_preview_controls(); messagebox.showerror("试听失败", error, parent=self.win); return
         pending, self._pending_preview = self._pending_preview, None
         if pending is None:
+            self._sync_preview_controls()
             return
-        result, start, end, label = pending
+        pending_session, result, start, end, label = pending
+        if pending_session != self._preview_session:
+            self._sync_preview_controls()
+            return
         try:
             self.preview_player.play(result, start_ms=start, end_ms=end)
-            self.preview_btn.config(text="暂停钢琴音色试听")
+            self._sync_preview_controls()
             self.status_var.set(f"正在试听{label}")
         except Exception as exc:
-            self.preview_btn.config(text="钢琴音色试听", state="normal")
+            self._sync_preview_controls()
             messagebox.showerror("试听失败", str(exc), parent=self.win)
 
     def stop_preview(self) -> None:
+        self._preview_session += 1
+        self._preview_preparing = False
+        self._pending_preview = None
         self.preview_player.stop()
-        if not self.closed: self.preview_btn.config(text="钢琴音色试听", state="normal" if self._current_result() and not self.busy else "disabled")
+        self._clear_key_highlights()
+        self._sync_preview_controls()
 
     def _preview_status(self, message: str) -> None:
         if not self.closed: self.status_var.set(message)
@@ -774,7 +830,53 @@ class TranscriptionDialog:
     def _preview_finished(self) -> None:
         if not self.closed: self.win.after(0, self.stop_preview)
     def _preview_error(self, exc: Exception) -> None:
-        if not self.closed: self.win.after(0, lambda: messagebox.showerror("试听失败", str(exc), parent=self.win))
+        if not self.closed:
+            self.win.after(0, self.stop_preview)
+            self.win.after(0, lambda: messagebox.showerror("试听失败", str(exc), parent=self.win))
+
+    def _preview_notes_played(self, keys: list[str]) -> None:
+        self._after(self._highlight_played_keys, keys)
+
+    def _highlight_played_keys(self, keys: list[str]) -> None:
+        if self.closed or self.preview_player.state.name != "PLAYING":
+            return
+        for value in keys:
+            try:
+                key = int(value[4:])
+            except (TypeError, ValueError):
+                continue
+            if not 0 <= key < 15:
+                continue
+            self._highlighted_keys.add(key)
+            if timer := self._key_highlight_timers.pop(key, None):
+                self.win.after_cancel(timer)
+            if item := self._key_title_items.get(key):
+                self.timeline.itemconfigure(item, fill="#2F8F4E", font=("TkDefaultFont", 9, "bold"))
+            if row := self._key_row_items.get(key):
+                self.timeline.itemconfigure(row, fill="#DDF5E3")
+            self._key_highlight_timers[key] = self.win.after(150, self._clear_key_highlight, key)
+
+    def _clear_key_highlight(self, key: int) -> None:
+        self._key_highlight_timers.pop(key, None)
+        self._highlighted_keys.discard(key)
+        if item := self._key_title_items.get(key):
+            self.timeline.itemconfigure(item, fill="#667", font=("TkDefaultFont", 9, "normal"))
+        if row := self._key_row_items.get(key):
+            self.timeline.itemconfigure(row, fill=self._key_row_fill(key))
+
+    def _clear_key_highlights(self) -> None:
+        for timer in self._key_highlight_timers.values():
+            self.win.after_cancel(timer)
+        self._key_highlight_timers.clear()
+        self._highlighted_keys.clear()
+        for item in self._key_title_items.values():
+            self.timeline.itemconfigure(item, fill="#667", font=("TkDefaultFont", 9, "normal"))
+        for key, item in self._key_row_items.items():
+            self.timeline.itemconfigure(item, fill=self._key_row_fill(key))
+
+    @staticmethod
+    def _key_row_fill(key: int) -> str:
+        return "#F7F9FC" if key % 2 else "#FFF"
 
     def edit_cookie(self) -> None:
         window = tk.Toplevel(self.win); window.title("网易云 Cookie"); window.transient(self.win); window.geometry("700x420")
@@ -857,7 +959,8 @@ class TranscriptionDialog:
         if self.busy:
             return
         index = self.file_list.nearest(event.y)
-        if index < 0 or index >= len(self.files):
+        bounds = self.file_list.bbox(index) if index >= 0 else None
+        if index < 0 or index >= len(self.files) or not bounds or not (bounds[1] <= event.y < bounds[1] + bounds[3]):
             return
         self.file_list.selection_clear(0, tk.END)
         self.file_list.selection_set(index)
@@ -865,9 +968,8 @@ class TranscriptionDialog:
         draft_id = self.files[index]
         self._show_path(draft_id)
         menu = tk.Menu(self.file_list, tearoff=0)
-        state = "normal" if draft_id in self.results else "disabled"
-        menu.add_command(label="重命名草稿…", state=state, command=lambda: self._rename_draft(draft_id))
-        menu.add_command(label="删除草稿…", state=state, command=lambda: self._delete_draft(draft_id))
+        menu.add_command(label="重命名草稿…", state="normal" if draft_id in self.results else "disabled", command=lambda: self._rename_draft(draft_id))
+        menu.add_command(label="删除草稿…", command=lambda: self._delete_draft(draft_id))
         try:
             menu.tk_popup(event.x_root, event.y_root)
         finally:
@@ -907,6 +1009,8 @@ class TranscriptionDialog:
             "删除草稿", f"确定删除草稿“{name}”吗？\n不会删除本地原始音频或已保存曲谱。", parent=self.win,
         ):
             return False
+        if draft_id == self._selected_path():
+            self.stop_preview()
         record = self.draft_records.get(draft_id)
         if record is not None:
             try:
@@ -974,6 +1078,7 @@ class TranscriptionDialog:
             "未暂存草稿", "有草稿未能自动暂存，关闭后这些修改会丢失。仍要关闭吗？", parent=self.win,
         ):
             return False
+        self._clear_key_highlights()
         self.closed = True; self.cancel_event.set(); self.preview_player.close()
         for result in self.results.values(): cleanup_result_artifacts(result)
         self._temp_root.cleanup(); self.win.destroy()
