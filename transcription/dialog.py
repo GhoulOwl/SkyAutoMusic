@@ -20,12 +20,15 @@ from .netease_auth import CookieValidationResult, NetEaseCookieStore, parse_nets
 from .pipeline import cleanup_result_artifacts, export_song_json, next_available_path, rearrange_draft, refine_region, sanitize_filename_stem, suggested_output_stem, transcribe_draft
 from .preview import PreviewPlayer
 from .quality import arrange_quality_melody, choose_quality_device, prepare_quality_model, resolve_quality_model
+from .model_download import modelscope_model_url
 
 
 PRESET_LABELS = {"自动编配": "auto", "简洁": "simple", "标准": "standard", "丰满": "full"}
 METER_LABELS = {"自动": "auto", "4/4": "4/4", "3/4": "3/4", "6/8": "6/8"}
 ENGINE_LABELS = {"自动（当前为快速）": "auto", "快速（离线）": "fast", "高质量（MuScriptor）": "quality"}
-QUALITY_MODEL_LABELS = {"自动选择": "auto", "Small（CPU）": "small", "Medium（GPU / Apple 芯片）": "medium"}
+QUALITY_MODEL_LABELS = {"自动选择": "auto", "Small（CPU）": "small", "Small（GPU）": "small", "Medium（GPU / Apple 芯片）": "medium", "Large": "large"}
+QUALITY_DEVICE_LABELS = {"自动选择": "auto", "Small（CPU）": "cpu", "Small（GPU）": "gpu", "Medium（GPU / Apple 芯片）": "auto", "Large": "auto"}
+DOWNLOAD_SOURCE_LABELS = {"自动（魔搭优先）": "auto", "仅魔搭社区": "modelscope", "仅 Hugging Face": "huggingface"}
 
 
 class TranscriptionDialog:
@@ -41,6 +44,8 @@ class TranscriptionDialog:
         auth_file: Optional[str] = None,
         draft_dir: Optional[str] = None,
         netease_client: Optional[NetEaseClient] = None,
+        quality_download_source: str = "auto",
+        on_quality_download_source_changed: Optional[Callable[[str], None]] = None,
         **_legacy_kwargs: object,
     ) -> None:
         self.parent, self.files, self.output_dir = parent, [], output_dir
@@ -74,6 +79,7 @@ class TranscriptionDialog:
         self._temp_root = tempfile.TemporaryDirectory(prefix="sky-arrangement-drafts-")
         self.cookie_store = NetEaseCookieStore(auth_file or os.path.join(os.path.dirname(os.path.abspath(output_dir)), "netease_auth.json"))
         self.netease_client = netease_client or NetEaseClient()
+        self._on_quality_download_source_changed = on_quality_download_source_changed or (lambda _source: None)
         self.search_tracks: List[NetEaseTrack] = []
         self.busy = False
         self.closed = False
@@ -98,6 +104,7 @@ class TranscriptionDialog:
         self.meter_var = tk.StringVar(value="自动")
         self.engine_var = tk.StringVar(value="高质量（MuScriptor）")
         self.quality_model_var = tk.StringVar(value="Medium（GPU / Apple 芯片）")
+        self.quality_download_source_var = tk.StringVar(value=next((label for label, value in DOWNLOAD_SOURCE_LABELS.items() if value == quality_download_source), "自动（魔搭优先）"))
         self.rights_var = tk.BooleanVar(value=True)
         self.status_var = tk.StringVar(value="选择音频后生成草稿")
         self.detail_var = tk.StringVar(value="")
@@ -300,6 +307,8 @@ class TranscriptionDialog:
             source_key=None if self.key_var.get() == "自动" else self.key_var.get(), melody_octave_shift=octave,
             max_polyphony=int(self.polyphony_var.get()), bpm_override=bpm, meter=METER_LABELS[self.meter_var.get()],
             engine=ENGINE_LABELS[self.engine_var.get()], quality_model=QUALITY_MODEL_LABELS[self.quality_model_var.get()],
+            quality_device=QUALITY_DEVICE_LABELS[self.quality_model_var.get()],
+            quality_download_source=DOWNLOAD_SOURCE_LABELS[self.quality_download_source_var.get()],
             rights_confirmed=bool(self.rights_var.get()),
         )
 
@@ -473,7 +482,13 @@ class TranscriptionDialog:
             self.octave_var.set("自动" if result.options.melody_octave_shift is None else f"{result.options.melody_octave_shift:+d}".replace("+0", "0"))
             self.polyphony_var.set(result.options.max_polyphony)
         self.engine_var.set(next(label for label, value in ENGINE_LABELS.items() if value == result.options.engine))
-        self.quality_model_var.set(next(label for label, value in QUALITY_MODEL_LABELS.items() if value == result.options.quality_model))
+        desired = result.options.quality_model
+        if desired == "small" and result.options.quality_device == "cpu":
+            self.quality_model_var.set("Small（CPU）")
+        elif desired == "small" and result.options.quality_device == "gpu":
+            self.quality_model_var.set("Small（GPU）")
+        else:
+            self.quality_model_var.set(next(label for label, value in QUALITY_MODEL_LABELS.items() if value == desired))
         quality_detail = ""
         if result.quality_analysis is not None:
             quality_detail = (
@@ -661,26 +676,36 @@ class TranscriptionDialog:
             return
         window = tk.Toplevel(self.win); window.title("配置高质量模型"); window.transient(self.win); window.resizable(False, False)
         requested = QUALITY_MODEL_LABELS[self.quality_model_var.get()]
-        model_name = resolve_quality_model(requested, choose_quality_device())
-        model_url = f"https://huggingface.co/MuScriptor/muscriptor-{model_name}"
+        device_preference = QUALITY_DEVICE_LABELS[self.quality_model_var.get()]
+        model_name = resolve_quality_model(requested, choose_quality_device(device_preference))
+        source = DOWNLOAD_SOURCE_LABELS[self.quality_download_source_var.get()]
+        model_url = modelscope_model_url(model_name) if source != "huggingface" else f"https://huggingface.co/MuScriptor/muscriptor-{model_name}"
         ttk.Label(window, text=(
-            "打开模型页后，如显示“granted access”，说明许可已就绪；无需再次授权。\n"
-            "否则先同意共享联系信息与非商用条件，再创建一个 Read Token 用于本次下载。\n"
-            "Token 只在本次下载期间使用，不会保存到配置或乐谱中。"
+            "自动模式会优先从魔搭社区下载，失败后改用 Hugging Face。\n"
+            "仅使用 Hugging Face 时，请先接受许可；Token 只在本次下载期间使用，不会保存。"
         ), justify="left").pack(padx=14, pady=(14, 8))
         links = ttk.Frame(window); links.pack(pady=(0, 4))
-        ttk.Button(links, text=f"打开 MuScriptor {model_name.title()} 条件页", command=lambda: webbrowser.open(model_url)).pack(side="left", padx=4)
+        ttk.Button(links, text=f"打开 MuScriptor {model_name.title()} 模型页", command=lambda: webbrowser.open(model_url)).pack(side="left", padx=4)
+        ttk.Button(links, text="打开魔搭社区", command=lambda: webbrowser.open(modelscope_model_url(model_name))).pack(side="left", padx=4)
+        ttk.Button(links, text="打开 Hugging Face", command=lambda: webbrowser.open(f"https://huggingface.co/MuScriptor/muscriptor-{model_name}")).pack(side="left", padx=4)
         ttk.Button(links, text="创建 Read Token", command=lambda: webbrowser.open("https://huggingface.co/settings/tokens/new?tokenType=read")).pack(side="left", padx=4)
         token_var = tk.StringVar()
+        source_row = ttk.Frame(window); source_row.pack(fill="x", padx=14, pady=(4, 0))
+        ttk.Label(source_row, text="下载地址").pack(side="left")
+        source_box = ttk.Combobox(source_row, textvariable=self.quality_download_source_var, values=list(DOWNLOAD_SOURCE_LABELS), state="readonly", width=22)
+        source_box.pack(side="left", padx=(8, 0))
+        source_box.bind("<<ComboboxSelected>>", lambda _event: self._on_quality_download_source_changed(DOWNLOAD_SOURCE_LABELS[self.quality_download_source_var.get()]))
         row = ttk.Frame(window); row.pack(fill="x", padx=14, pady=6)
         ttk.Label(row, text="临时 HF Token（可留空）").pack(side="left")
         ttk.Entry(row, textvariable=token_var, show="•", width=32).pack(side="left", padx=(8, 0))
         button = ttk.Button(window, text="下载并验证"); button.pack(pady=(4, 14))
         def start() -> None:
+            selected_source = DOWNLOAD_SOURCE_LABELS[self.quality_download_source_var.get()]
+            self._on_quality_download_source_changed(selected_source)
             button.config(state="disabled", text="正在准备…")
             def worker() -> None:
                 try:
-                    name, device = prepare_quality_model(requested, token_var.get().strip() or None)
+                    name, device = prepare_quality_model(requested, token_var.get().strip() or None, device_preference=device_preference, download_source=selected_source)
                     self._after(done, f"MuScriptor {name} 已在 {device} 就绪", None)
                 except Exception as exc:
                     self._after(done, "", str(exc))

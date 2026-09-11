@@ -14,7 +14,7 @@ from transcription.arranger import SKY_MIDI, _pitch_to_key, key_transpose
 from transcription.benchmark import _cache_path, _load_quality_cache, _save_quality_cache, _score_notes, evaluate_15_key
 from transcription.models import QualityAnalysisDraft, SymbolicNote, TranscriptionError, TranscriptionOptions, TranscriptionResult
 from transcription.pipeline import export_song_json, transcribe_draft
-from transcription.quality import _role, _timing_from_model, arrange_quality_analysis, arrange_quality_analysis_with_roles, arrange_quality_melody, resolve_quality_model, select_melody, select_melody_with_segments
+from transcription.quality import _role, _timing_from_model, arrange_quality_analysis, arrange_quality_analysis_with_roles, arrange_quality_melody, choose_quality_device, resolve_quality_model, select_melody, select_melody_with_segments
 
 
 def quality_draft():
@@ -380,6 +380,12 @@ class TestQualityArrangement(unittest.TestCase):
         self.assertEqual(resolve_quality_model("auto", "cpu"), "small")
         self.assertEqual(resolve_quality_model("auto", "mps"), "medium")
         self.assertEqual(resolve_quality_model("small", "cuda"), "small")
+        self.assertEqual(TranscriptionOptions(quality_model="large").quality_model, "large")
+        self.assertEqual(TranscriptionOptions(quality_device="cpu").quality_device, "cpu")
+
+    def test_cpu_preference_never_selects_accelerator(self):
+        with patch("torch.cuda.is_available", return_value=True):
+            self.assertEqual(choose_quality_device("cpu"), "cpu")
 
     def test_v3_export_metadata_keeps_song_schema(self):
         draft = quality_draft()

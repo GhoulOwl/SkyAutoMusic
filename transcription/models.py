@@ -10,7 +10,9 @@ TranscriptionMode = Literal["audio_arrangement", "midi"]
 Meter = Literal["auto", "4/4", "3/4", "6/8"]
 LeadSource = Literal["vocal", "instrumental", "chords_only"]
 TranscriptionEngine = Literal["auto", "fast", "quality"]
-QualityModel = Literal["auto", "small", "medium"]
+QualityModel = Literal["auto", "small", "medium", "large"]
+QualityDevice = Literal["auto", "cpu", "gpu"]
+QualityDownloadSource = Literal["auto", "modelscope", "huggingface"]
 SymbolicRole = Literal["melody", "bass", "harmony", "other", "drums"]
 SourcePlatform = Literal["local", "netease"]
 ProgressCallback = Callable[[str, float, str], None]
@@ -165,6 +167,8 @@ class TranscriptionOptions:
     meter: Meter = "auto"
     engine: TranscriptionEngine = "auto"
     quality_model: QualityModel = "auto"
+    quality_device: QualityDevice = "auto"
+    quality_download_source: QualityDownloadSource = "auto"
     rights_confirmed: bool = False
 
     def __post_init__(self) -> None:
@@ -182,8 +186,12 @@ class TranscriptionOptions:
             raise ValueError(f"unsupported meter: {self.meter}")
         if self.engine not in ("auto", "fast", "quality"):
             raise ValueError(f"unsupported transcription engine: {self.engine}")
-        if self.quality_model not in ("auto", "small", "medium"):
+        if self.quality_model not in ("auto", "small", "medium", "large"):
             raise ValueError(f"unsupported quality model: {self.quality_model}")
+        if self.quality_device not in ("auto", "cpu", "gpu"):
+            raise ValueError(f"unsupported quality device: {self.quality_device}")
+        if self.quality_download_source not in ("auto", "modelscope", "huggingface"):
+            raise ValueError(f"unsupported quality download source: {self.quality_download_source}")
 
 
 @dataclass(frozen=True)

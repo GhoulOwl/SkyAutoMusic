@@ -1601,7 +1601,12 @@ class MusicGUI:
             on_saved=self._refresh_music_after_generation,
             auth_file=resource_path("netease_auth.json"),
             draft_dir=resource_path("Drafts"),
+            quality_download_source=self.config.get("quality_download_source", "auto"),
+            on_quality_download_source_changed=self._set_quality_download_source,
         )
+
+    def _set_quality_download_source(self, source):
+        self.config["quality_download_source"] = source
 
     def _refresh_music_after_generation(self, output_path=None):
         """保存草稿后立即刷新乐谱列表。"""

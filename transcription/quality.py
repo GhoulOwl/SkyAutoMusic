@@ -18,6 +18,7 @@ from typing import Dict, Iterable, List, Optional, Sequence, Tuple
 from .arranger import MAJOR_PROFILE, MINOR_PROFILE, SKY_MIDI, _pitch_to_key, key_transpose, parse_key
 from .analysis import CHORD_INTERVALS
 from .model_runtime import model_runtime
+from .model_download import DownloadSource, download_model
 from .models import (
     CancelledError,
     LeadSegment,
@@ -91,14 +92,14 @@ def release_quality_models() -> bool:
 model_runtime.register("muscriptor", release_quality_models)
 
 
-def choose_quality_device() -> str:
+def choose_quality_device(preference: str = "auto") -> str:
     """Choose the fastest local backend without making CUDA/MPS mandatory."""
     try:
         import torch
-        if bool(getattr(torch.cuda, "is_available", lambda: False)()):
+        if preference != "cpu" and bool(getattr(torch.cuda, "is_available", lambda: False)()):
             return "cuda"
         mps = getattr(getattr(torch, "backends", object()), "mps", None)
-        if mps is not None and bool(mps.is_available()):
+        if preference != "cpu" and mps is not None and bool(mps.is_available()):
             return "mps"
     except Exception:
         pass
@@ -129,7 +130,8 @@ def _with_token(token: Optional[str]):
     return _Token()
 
 
-def _load_model(model_name: str, device: str, token: Optional[str] = None) -> object:
+def _load_model(model_name: str, device: str, token: Optional[str] = None,
+                download_source: DownloadSource = "auto", progress_cb: Optional[ProgressCallback] = None) -> object:
     key = (model_name, device)
     with _MODEL_LOCK:
         if key in _MODELS:
@@ -141,8 +143,8 @@ def _load_model(model_name: str, device: str, token: Optional[str] = None) -> ob
                 "高质量模式未安装。请安装 muscriptor==0.3.0 与 beat-this==1.1.0。"
             ) from exc
         try:
-            with _with_token(token):
-                model = TranscriptionModel.load_model(model_name, device=device)
+            weights = download_model(model_name, download_source, token, lambda message: _notify(progress_cb, "quality", .02, message))
+            model = TranscriptionModel.load_model(weights, device=device)
         except Exception as exc:
             message = str(exc)
             if "gated" in message.lower() or "401" in message or "403" in message:
@@ -154,14 +156,17 @@ def _load_model(model_name: str, device: str, token: Optional[str] = None) -> ob
 
 def prepare_quality_model(
     requested_model: str = "auto", token: Optional[str] = None,
-    progress_cb: Optional[ProgressCallback] = None,
+    progress_cb: Optional[ProgressCallback] = None, device_preference: str = "auto",
+    download_source: DownloadSource = "auto",
 ) -> Tuple[str, str]:
     with model_runtime.activity():
-        device = choose_quality_device()
+        device = choose_quality_device(device_preference)
+        if device_preference == "gpu" and device == "cpu":
+            raise TranscriptionError("未检测到 CUDA 或 Apple 芯片加速设备，请选择 Small（CPU）。")
         model_name = resolve_quality_model(requested_model, device)
         if progress_cb:
             progress_cb("quality", 0.0, f"正在准备 MuScriptor {model_name} 模型")
-        _load_model(model_name, device, token)
+        _load_model(model_name, device, token, download_source, progress_cb)
         if progress_cb:
             progress_cb("quality", 1.0, f"MuScriptor {model_name} 模型已就绪")
         return model_name, device
@@ -319,11 +324,13 @@ def analyze_quality_audio(path: str, options: TranscriptionOptions, cancel_event
     if not options.rights_confirmed:
         raise TranscriptionError("高质量模式需要确认：你拥有输入音频及生成乐谱所需的权利。")
     with model_runtime.activity():
-        device = choose_quality_device()
+        device = choose_quality_device(options.quality_device)
+        if options.quality_device == "gpu" and device == "cpu":
+            raise TranscriptionError("未检测到 CUDA 或 Apple 芯片加速设备，请选择 Small（CPU）。")
         model_name = resolve_quality_model(options.quality_model, device)
         if progress_cb:
             progress_cb("quality", .01, f"正在加载 MuScriptor {model_name}")
-        model = _load_model(model_name, device, token)
+        model = _load_model(model_name, device, token, options.quality_download_source, progress_cb)
         symbolic = _extract_symbolic_events(model, path, cancel_event, progress_cb, beam_size=beam_size)
         if not symbolic:
             raise TranscriptionError("高质量模型未识别到可用音符")
