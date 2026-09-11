@@ -93,8 +93,11 @@ class TranscriptionDialog:
         self.win.title("生成乐谱")
         self.win.transient(parent)
         self.win.protocol("WM_DELETE_WINDOW", self.close)
-        self.win.minsize(780, 620)
-        self.win.geometry("980x820")
+        self.win.minsize(780, 480)
+        # Leave a little room for the window manager chrome on smaller displays.
+        initial_width = min(980, max(780, self.win.winfo_screenwidth() - 80))
+        initial_height = min(820, max(480, self.win.winfo_screenheight() - 100))
+        self.win.geometry(f"{initial_width}x{initial_height}")
 
         self.preset_var = tk.StringVar(value="自动编配")
         self.key_var = tk.StringVar(value="自动")
@@ -119,7 +122,45 @@ class TranscriptionDialog:
             self.win.after(100, self.generate_all)
 
     def _build_widgets(self) -> None:
-        notebook = ttk.Notebook(self.win)
+        # The action bar belongs directly to the dialog so save/cancel actions
+        # remain reachable even when the rest of the dialog must scroll.
+        actions = ttk.Frame(self.win)
+        actions.pack(side="bottom", fill="x", padx=12, pady=(6, 12))
+        edit_actions = ttk.Frame(actions)
+        edit_actions.pack(fill="x")
+        save_actions = ttk.Frame(actions)
+        save_actions.pack(fill="x", pady=(6, 0))
+
+        self.regenerate_btn = ttk.Button(edit_actions, text="应用参数", command=self.regenerate_current, state="disabled")
+        self.regenerate_btn.pack(side="left", padx=(0, 6))
+        self.region_preview_btn = ttk.Button(edit_actions, text="试听所选精修区", command=self.preview_refine_region, state="disabled")
+        self.region_preview_btn.pack(side="left", padx=6)
+        self.refine_btn = ttk.Button(edit_actions, text="精修所选小节", command=self.refine_current, state="disabled")
+        self.refine_btn.pack(side="left", padx=6)
+        self.accept_refine_btn = ttk.Button(edit_actions, text="接受精修", command=self.accept_refinement, state="disabled")
+        self.accept_refine_btn.pack(side="left", padx=6)
+        self.discard_refine_btn = ttk.Button(edit_actions, text="放弃精修", command=self.discard_refinement, state="disabled")
+        self.discard_refine_btn.pack(side="left", padx=6)
+        ttk.Button(save_actions, text="取消", command=self.cancel).pack(side="right", padx=6)
+        self.save_all_btn = ttk.Button(save_actions, text="保存全部", command=self.save_all, state="disabled")
+        self.save_all_btn.pack(side="right", padx=6)
+        self.save_btn = ttk.Button(save_actions, text="保存当前", command=self.save_current, state="disabled")
+        self.save_btn.pack(side="right", padx=6)
+
+        scroll_shell = ttk.Frame(self.win)
+        scroll_shell.pack(side="top", fill="both", expand=True)
+        self._content_canvas = tk.Canvas(scroll_shell, highlightthickness=0, borderwidth=0)
+        content_scrollbar = ttk.Scrollbar(scroll_shell, orient="vertical", command=self._content_canvas.yview)
+        self._content_canvas.configure(yscrollcommand=content_scrollbar.set)
+        content_scrollbar.pack(side="right", fill="y")
+        self._content_canvas.pack(side="left", fill="both", expand=True)
+        body = ttk.Frame(self._content_canvas)
+        self._content_body = body
+        self._content_window = self._content_canvas.create_window((0, 0), window=body, anchor="nw")
+        body.bind("<Configure>", self._update_content_scrollregion)
+        self._content_canvas.bind("<Configure>", self._resize_content_window)
+
+        notebook = ttk.Notebook(body)
         notebook.pack(fill="x", padx=12, pady=(12, 6))
         local = ttk.Frame(notebook, padding=10)
         online = ttk.Frame(notebook, padding=10)
@@ -136,7 +177,7 @@ class TranscriptionDialog:
         ttk.Label(online, textvariable=self.cookie_status_var, foreground="#666").grid(row=1, column=0, columnspan=3, sticky="w", pady=(7, 0))
         online.columnconfigure(0, weight=1)
 
-        options = ttk.LabelFrame(self.win, text="钢琴编配", padding=10)
+        options = ttk.LabelFrame(body, text="钢琴编配", padding=10)
         options.pack(fill="x", padx=12, pady=6)
         ttk.Label(options, text="预设").grid(row=0, column=0, sticky="e", padx=4, pady=4)
         self.preset_box = ttk.Combobox(options, textvariable=self.preset_var, values=list(PRESET_LABELS), state="readonly", width=10)
@@ -168,13 +209,13 @@ class TranscriptionDialog:
         self.model_setup_btn = ttk.Button(options, text="配置/下载高质量模型…", command=self.configure_quality_model)
         self.model_setup_btn.grid(row=3, column=4, columnspan=2, sticky="w", padx=4, pady=4)
 
-        progress = ttk.Frame(self.win)
+        progress = ttk.Frame(body)
         progress.pack(fill="x", padx=12, pady=6)
         ttk.Label(progress, textvariable=self.status_var).pack(anchor="w")
         ttk.Progressbar(progress, maximum=1.0, variable=self.progress_var).pack(fill="x", pady=4)
         ttk.Label(progress, textvariable=self.detail_var, foreground="#666").pack(anchor="w")
 
-        content = ttk.Panedwindow(self.win, orient=tk.HORIZONTAL)
+        content = ttk.Panedwindow(body, orient=tk.HORIZONTAL)
         content.pack(fill="both", expand=True, padx=12, pady=6)
         left, right = ttk.Frame(content, width=240), ttk.Frame(content)
         content.add(left, weight=1); content.add(right, weight=3)
@@ -209,27 +250,67 @@ class TranscriptionDialog:
         self.stats_label.pack(fill="x", anchor="w")
         right.bind("<Configure>", lambda event: self.stats_label.config(wraplength=max(260, event.width - 8)), add="+")
 
-        actions = ttk.Frame(self.win)
-        actions.pack(fill="x", padx=12, pady=(6, 12))
-        self.regenerate_btn = ttk.Button(actions, text="应用参数", command=self.regenerate_current, state="disabled")
-        self.regenerate_btn.pack(side="left", padx=(0, 6))
-        self.region_preview_btn = ttk.Button(actions, text="试听所选精修区", command=self.preview_refine_region, state="disabled")
-        self.region_preview_btn.pack(side="left", padx=6)
-        self.refine_btn = ttk.Button(actions, text="精修所选小节", command=self.refine_current, state="disabled")
-        self.refine_btn.pack(side="left", padx=6)
-        self.accept_refine_btn = ttk.Button(actions, text="接受精修", command=self.accept_refinement, state="disabled")
-        self.accept_refine_btn.pack(side="left", padx=6)
-        self.discard_refine_btn = ttk.Button(actions, text="放弃精修", command=self.discard_refinement, state="disabled")
-        self.discard_refine_btn.pack(side="left", padx=6)
-        self.save_btn = ttk.Button(actions, text="保存当前", command=self.save_current, state="disabled")
-        self.save_btn.pack(side="right", padx=6)
-        self.save_all_btn = ttk.Button(actions, text="保存全部", command=self.save_all, state="disabled")
-        self.save_all_btn.pack(side="right", padx=6)
-        ttk.Button(actions, text="取消", command=self.cancel).pack(side="right", padx=6)
-
         self.online_list = tk.Listbox(online, height=7, exportselection=False)
         self.online_list.grid(row=2, column=0, columnspan=3, sticky="ew", pady=(8, 4))
         ttk.Button(online, text="生成所选在线草稿", command=self.generate_online_draft).grid(row=3, column=0, sticky="w")
+        self._install_content_scroll_bindings(body)
+
+    def _update_content_scrollregion(self, _event: tk.Event) -> None:
+        self._content_canvas.configure(scrollregion=self._content_canvas.bbox("all"))
+
+    def _resize_content_window(self, event: tk.Event) -> None:
+        # Give the main pane available extra height, but never compress its
+        # requested timeline height when the dialog itself becomes shorter.
+        self._content_canvas.itemconfigure(
+            self._content_window,
+            width=event.width,
+            height=max(event.height, self._content_body.winfo_reqheight()),
+        )
+
+    def _install_content_scroll_bindings(self, body: tk.Misc) -> None:
+        """Use a private bindtag so this dialog never changes scrolling elsewhere."""
+        self._scroll_bindtag = f"TranscriptionDialogScroll{self.win.winfo_id()}"
+        self.win.bind_class(self._scroll_bindtag, "<MouseWheel>", self._on_content_mousewheel)
+        self.win.bind_class(self._scroll_bindtag, "<Button-4>", lambda _event: self._scroll_content(-1))
+        self.win.bind_class(self._scroll_bindtag, "<Button-5>", lambda _event: self._scroll_content(1))
+        self.win.bind_class(self._scroll_bindtag, "<FocusIn>", self._scroll_focused_widget_into_view, add="+")
+
+        def add_tag(widget: tk.Misc) -> None:
+            tags = widget.bindtags()
+            if self._scroll_bindtag not in tags:
+                widget.bindtags((self._scroll_bindtag, *tags))
+            for child in widget.winfo_children():
+                add_tag(child)
+
+        add_tag(body)
+
+    def _on_content_mousewheel(self, event: tk.Event) -> Optional[str]:
+        # Native list controls and comboboxes keep their own wheel behaviour.
+        if isinstance(event.widget, (tk.Listbox, ttk.Combobox, ttk.Spinbox)):
+            return None
+        delta = -1 if event.delta > 0 else 1
+        return self._scroll_content(delta * max(1, abs(event.delta) // 120))
+
+    def _scroll_content(self, amount: int) -> str:
+        self._content_canvas.yview_scroll(amount, "units")
+        return "break"
+
+    def _scroll_focused_widget_into_view(self, event: tk.Event) -> None:
+        self.win.after_idle(lambda: self._ensure_widget_visible(event.widget))
+
+    def _ensure_widget_visible(self, widget: tk.Misc) -> None:
+        if self.closed or not widget.winfo_exists():
+            return
+        try:
+            top = widget.winfo_rooty() - self._content_canvas.winfo_rooty()
+            bottom = top + widget.winfo_height()
+            height = self._content_canvas.winfo_height()
+        except tk.TclError:
+            return
+        if top < 0:
+            self._content_canvas.yview_scroll(top // 20 - 1, "units")
+        elif bottom > height:
+            self._content_canvas.yview_scroll((bottom - height) // 20 + 1, "units")
 
     def _local_summary(self) -> str:
         return "尚未选择本地文件" if not self.files else f"已选择 {len(self.files)} 个文件"
@@ -1105,6 +1186,14 @@ class TranscriptionDialog:
             return False
         self._clear_key_highlights()
         self.closed = True; self.cancel_event.set(); self.preview_player.close()
+        self._remove_content_scroll_bindings()
         for result in self.results.values(): cleanup_result_artifacts(result)
         self._temp_root.cleanup(); self.win.destroy()
         return True
+
+    def _remove_content_scroll_bindings(self) -> None:
+        tag = getattr(self, "_scroll_bindtag", None)
+        if not tag:
+            return
+        for sequence in ("<MouseWheel>", "<Button-4>", "<Button-5>", "<FocusIn>"):
+            self.win.unbind_class(tag, sequence)
