@@ -33,6 +33,7 @@ last-resort option for `full` only.
 
 
 - Windows CPU defaults to MuScriptor Small; CUDA and Apple Silicon default to Medium.
+- When a Windows user explicitly selects a CUDA model, the setup dialog detects an NVIDIA GPU and can install the matching CUDA PyTorch runtime automatically. Restart the app once after that one-time runtime installation, then download the model.
 - On first use, accept MuScriptor's CC BY-NC model terms at Hugging Face and use
   a temporary Hugging Face token in the in-app setup dialog. Tokens are never
   written to config files or exported scores; model weights stay in the normal

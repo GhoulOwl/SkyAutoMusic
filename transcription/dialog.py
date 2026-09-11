@@ -21,13 +21,14 @@ from .pipeline import cleanup_result_artifacts, export_song_json, next_available
 from .preview import PreviewPlayer
 from .quality import arrange_quality_melody, choose_quality_device, prepare_quality_model, resolve_quality_model
 from .model_download import modelscope_model_url
+from .cuda_setup import ensure_cuda_runtime
 
 
 PRESET_LABELS = {"自动编配": "auto", "简洁": "simple", "标准": "standard", "丰满": "full"}
 METER_LABELS = {"自动": "auto", "4/4": "4/4", "3/4": "3/4", "6/8": "6/8"}
 ENGINE_LABELS = {"自动（当前为快速）": "auto", "快速（离线）": "fast", "高质量（MuScriptor）": "quality"}
-QUALITY_MODEL_LABELS = {"自动选择": "auto", "Small（CPU）": "small", "Small（GPU）": "small", "Medium（GPU / Apple 芯片）": "medium", "Large": "large"}
-QUALITY_DEVICE_LABELS = {"自动选择": "auto", "Small（CPU）": "cpu", "Small（GPU）": "gpu", "Medium（GPU / Apple 芯片）": "auto", "Large": "auto"}
+QUALITY_MODEL_LABELS = {"自动选择": "auto", "Small（CPU）": "small", "Small（CUDA）": "small", "Medium（CUDA / Apple 芯片）": "medium", "Large": "large"}
+QUALITY_DEVICE_LABELS = {"自动选择": "auto", "Small（CPU）": "cpu", "Small（CUDA）": "gpu", "Medium（CUDA / Apple 芯片）": "gpu", "Large": "auto"}
 DOWNLOAD_SOURCE_LABELS = {"自动（魔搭优先）": "auto", "仅魔搭社区": "modelscope", "仅 Hugging Face": "huggingface"}
 
 
@@ -106,7 +107,9 @@ class TranscriptionDialog:
         self.bpm_var = tk.StringVar(value="自动")
         self.meter_var = tk.StringVar(value="自动")
         self.engine_var = tk.StringVar(value="高质量（MuScriptor）")
-        self.quality_model_var = tk.StringVar(value="Medium（GPU / Apple 芯片）")
+        accelerated_device = choose_quality_device()
+        default_quality_label = "Medium（CUDA / Apple 芯片）" if accelerated_device in ("cuda", "mps") else "Small（CPU）"
+        self.quality_model_var = tk.StringVar(value=default_quality_label)
         self.quality_download_source_var = tk.StringVar(value=next((label for label, value in DOWNLOAD_SOURCE_LABELS.items() if value == quality_download_source), "自动（魔搭优先）"))
         self.rights_var = tk.BooleanVar(value=True)
         self.status_var = tk.StringVar(value="选择音频后生成草稿")
@@ -567,7 +570,7 @@ class TranscriptionDialog:
         if desired == "small" and result.options.quality_device == "cpu":
             self.quality_model_var.set("Small（CPU）")
         elif desired == "small" and result.options.quality_device == "gpu":
-            self.quality_model_var.set("Small（GPU）")
+            self.quality_model_var.set("Small（CUDA）")
         else:
             self.quality_model_var.set(next(label for label, value in QUALITY_MODEL_LABELS.items() if value == desired))
         quality_detail = ""
@@ -771,6 +774,8 @@ class TranscriptionDialog:
         ttk.Button(links, text="打开 Hugging Face", command=lambda: webbrowser.open(f"https://huggingface.co/MuScriptor/muscriptor-{model_name}")).pack(side="left", padx=4)
         ttk.Button(links, text="创建 Read Token", command=lambda: webbrowser.open("https://huggingface.co/settings/tokens/new?tokenType=read")).pack(side="left", padx=4)
         token_var = tk.StringVar()
+        download_status_var = tk.StringVar(value="准备下载模型")
+        download_progress_var = tk.DoubleVar(value=0.0)
         source_row = ttk.Frame(window); source_row.pack(fill="x", padx=14, pady=(4, 0))
         ttk.Label(source_row, text="下载地址").pack(side="left")
         source_box = ttk.Combobox(source_row, textvariable=self.quality_download_source_var, values=list(DOWNLOAD_SOURCE_LABELS), state="readonly", width=22)
@@ -779,21 +784,36 @@ class TranscriptionDialog:
         row = ttk.Frame(window); row.pack(fill="x", padx=14, pady=6)
         ttk.Label(row, text="临时 HF Token（可留空）").pack(side="left")
         ttk.Entry(row, textvariable=token_var, show="•", width=32).pack(side="left", padx=(8, 0))
+        ttk.Label(window, textvariable=download_status_var, wraplength=460, justify="left").pack(fill="x", padx=14, pady=(2, 0))
+        ttk.Progressbar(window, maximum=1.0, variable=download_progress_var).pack(fill="x", padx=14, pady=(4, 8))
         button = ttk.Button(window, text="下载并验证"); button.pack(pady=(4, 14))
         def start() -> None:
             selected_source = DOWNLOAD_SOURCE_LABELS[self.quality_download_source_var.get()]
             self._on_quality_download_source_changed(selected_source)
             button.config(state="disabled", text="正在准备…")
+            download_progress_var.set(0.0); download_status_var.set("正在准备模型下载")
             def worker() -> None:
                 try:
-                    name, device = prepare_quality_model(requested, token_var.get().strip() or None, device_preference=device_preference, download_source=selected_source)
-                    self._after(done, f"MuScriptor {name} 已在 {device} 就绪", None)
+                    def progress(_stage: str, fraction: float, message: str) -> None:
+                        self._after(download_progress_var.set, fraction)
+                        self._after(download_status_var.set, message)
+                    if device_preference == "gpu":
+                        cuda_setup = ensure_cuda_runtime(lambda fraction, message: progress("setup", fraction, message))
+                        if cuda_setup.restart_required:
+                            self._after(done, cuda_setup.message, None, True)
+                            return
+                    name, device = prepare_quality_model(requested, token_var.get().strip() or None, progress, device_preference=device_preference, download_source=selected_source)
+                    self._after(done, f"MuScriptor {name} 已在 {device} 就绪", None, False)
                 except Exception as exc:
-                    self._after(done, "", str(exc))
+                    self._after(done, "", str(exc), False)
             self._start_worker(worker)
-        def done(message: str, error: Optional[str]) -> None:
+        def done(message: str, error: Optional[str], restart_required: bool = False) -> None:
             if error:
                 button.config(state="normal", text="下载并验证"); messagebox.showerror("高质量模型", error, parent=window); return
+            if restart_required:
+                button.config(state="normal", text="重启后继续下载模型")
+                download_status_var.set(message); messagebox.showinfo("CUDA 环境已配置", message, parent=window)
+                return
             self.status_var.set(message); window.destroy()
         button.config(command=start)
 

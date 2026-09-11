@@ -45,6 +45,12 @@ _LOW_TIMING_THRESHOLD = .5
 _MIN_ACCOMPANIMENT_SCORE = 4.0
 
 
+def _notify(callback: Optional[ProgressCallback], stage: str, fraction: float, message: str) -> None:
+    """Send bounded model-loading progress updates when a UI callback exists."""
+    if callback:
+        callback(stage, max(0.0, min(1.0, float(fraction))), message)
+
+
 @dataclass(frozen=True)
 class _AccompanimentCandidate:
     """A safe, mapped accompaniment event ready for bar budgeting."""
@@ -143,8 +149,13 @@ def _load_model(model_name: str, device: str, token: Optional[str] = None,
                 "高质量模式未安装。请安装 muscriptor==0.3.0 与 beat-this==1.1.0。"
             ) from exc
         try:
-            weights = download_model(model_name, download_source, token, lambda message: _notify(progress_cb, "quality", .02, message))
+            download_progress = lambda fraction, message: _notify(
+                progress_cb, "quality", .02 + .38 * fraction, message
+            )
+            weights = download_model(model_name, download_source, token, progress=download_progress)
+            _notify(progress_cb, "quality", .42, f"正在加载 MuScriptor {model_name} 模型")
             model = TranscriptionModel.load_model(weights, device=device)
+            _notify(progress_cb, "quality", .45, f"MuScriptor {model_name} 模型已加载")
         except Exception as exc:
             message = str(exc)
             if "gated" in message.lower() or "401" in message or "403" in message:
@@ -195,7 +206,8 @@ def _extract_symbolic_events(model: object, path: str, cancel_event, progress_cb
         if name == "ProgressEvent":
             if progress_cb:
                 total = max(1, int(getattr(event, "total", 1)))
-                progress_cb("quality", min(.92, float(getattr(event, "completed", 0)) / total), "正在识别整曲音符与乐器")
+                fraction = float(getattr(event, "completed", 0)) / total
+                progress_cb("quality", min(.95, .45 + .50 * fraction), "正在识别整曲音符与乐器")
         elif name == "NoteStartEvent":
             active[int(getattr(event, "index"))] = event
         elif name == "NoteEndEvent":
