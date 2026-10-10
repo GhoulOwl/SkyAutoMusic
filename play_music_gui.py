@@ -3,7 +3,7 @@ import json
 import importlib.util
 import threading
 import tkinter as tk
-from tkinter import ttk, messagebox
+from tkinter import ttk, messagebox, filedialog
 import sys
 import webbrowser
 
@@ -119,6 +119,7 @@ class MusicGUI:
         self.hotkey_status_var = tk.StringVar(value="未注册")
         self.game_window_var = tk.StringVar(value="未检测")
         self.foreground_window_var = tk.StringVar(value="未检测")
+        self.playback_diagnostics_var = tk.StringVar(value="尚无演奏记录")
         self.admin_status_var = tk.StringVar(
             value="是" if CAPABILITIES.is_windows and is_admin() else "不适用"
         )
@@ -552,6 +553,7 @@ class MusicGUI:
             ("游戏窗口:", self.game_window_var),
             ("前台窗口:", self.foreground_window_var),
             ("覆盖层:", self.overlay_status_var),
+            ("按键发送:", self.playback_diagnostics_var),
         ]
         for row, (label, var) in enumerate(rows):
             ttk.Label(frame, text=label, width=12, anchor="e").grid(row=row, column=0, sticky="e", padx=4, pady=4)
@@ -561,6 +563,7 @@ class MusicGUI:
         btn_frame = ttk.Frame(parent)
         btn_frame.pack(fill="x", padx=10, pady=(0, 8))
         ttk.Button(btn_frame, text="刷新诊断", command=lambda: self._refresh_diagnostics(schedule=False), style='Accent.TButton').pack(side="left", padx=(0, 8))
+        ttk.Button(btn_frame, text="导出演奏记录", command=self._export_playback_diagnostics).pack(side="left", padx=(0, 8))
         ttk.Button(btn_frame, text="切换覆盖层锁定 (F10)", command=self.toggle_overlay_lock, style='Accent.TButton').pack(side="left")
 
         # ====== 键盘输入方式选择（虚拟HID/驱动级键盘） ======
@@ -1487,7 +1490,7 @@ class MusicGUI:
             return
         kc = self.key_controller
         driver_ok = kc.is_driver_available()
-        eff_name = kc.effective_backend()
+        eff_name = kc.last_backend or kc.effective_backend()
         eff_label = kc.get_backend_label(eff_name)
         parts = [f"当前使用: {eff_label}"]
         if kc.is_auto():
@@ -1497,6 +1500,21 @@ class MusicGUI:
         else:
             parts.append("；Interception 驱动已就绪")
         self.input_method_status_var.set("".join(parts))
+        summary = self.player.diagnostics_summary()
+        self.playback_diagnostics_var.set(
+            f"发送 {summary['sent_count']} · 失败 {summary['failed_count']} · 回退 {summary['fallback_count']}"
+            f" · 延迟 P95 {summary['p95_lateness_ms']:.1f} ms（不代表游戏发声）"
+        )
+
+    def _export_playback_diagnostics(self):
+        path = filedialog.asksaveasfilename(parent=self.root, title="导出演奏记录", defaultextension=".json",
+                                          initialfile="playback-diagnostics.json", filetypes=[("JSON", "*.json")])
+        if path:
+            try:
+                self.player.export_diagnostics(path)
+                self.status_var.set("演奏记录已导出（记录按键发送，不代表游戏发声）")
+            except Exception as exc:
+                messagebox.showerror("导出失败", str(exc), parent=self.root)
 
     def _on_input_method_change(self, event=None):
         """下拉框切换输入方式，写入控制器并持久化到 config。"""

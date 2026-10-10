@@ -12,6 +12,17 @@
 """
 
 import sys
+import threading
+from dataclasses import dataclass, field
+
+
+@dataclass
+class KeyBatchResult:
+    """Acknowledges input delivery to an API, never receipt by the game."""
+    sent_notes: list = field(default_factory=list)
+    failed_notes: list = field(default_factory=list)
+    backend_by_note: dict = field(default_factory=dict)
+    fallback_count: int = 0
 
 if sys.platform == "win32":
     try:
@@ -131,6 +142,35 @@ class _KeyboardBackend:
             raise RuntimeError("keyboard 后端不可用")
         keyboard.release(key)
 
+    def send_many(self, action, keys):
+        """Insert one chord as a single scan-code SendInput array."""
+        import ctypes
+        from ctypes import wintypes
+        class KeyboardInput(ctypes.Structure):
+            _fields_ = [("wVk", wintypes.WORD), ("wScan", wintypes.WORD),
+                        ("dwFlags", wintypes.DWORD), ("time", wintypes.DWORD),
+                        ("dwExtraInfo", ctypes.c_size_t)]
+        class MouseInput(ctypes.Structure):
+            _fields_ = [("dx", wintypes.LONG), ("dy", wintypes.LONG),
+                        ("mouseData", wintypes.DWORD), ("dwFlags", wintypes.DWORD),
+                        ("time", wintypes.DWORD), ("dwExtraInfo", ctypes.c_size_t)]
+        class HardwareInput(ctypes.Structure):
+            _fields_ = [("uMsg", wintypes.DWORD), ("wParamL", wintypes.WORD), ("wParamH", wintypes.WORD)]
+        class Payload(ctypes.Union):
+            _fields_ = [("ki", KeyboardInput), ("mi", MouseInput), ("hi", HardwareInput)]
+        class Input(ctypes.Structure):
+            _fields_ = [("type", wintypes.DWORD), ("payload", Payload)]
+        inputs = (Input * len(keys))()
+        for index, key in enumerate(keys):
+            scan = keyboard.key_to_scan_codes(key)[0]
+            flags = 0x0008 | (0x0002 if action == "release" else 0) | (0x0001 if scan > 255 else 0)
+            inputs[index].type = 1
+            inputs[index].payload.ki = KeyboardInput(0, scan & 255, flags, 0, 0)
+        send = ctypes.WinDLL("user32", use_last_error=True).SendInput
+        send.argtypes = [wintypes.UINT, ctypes.POINTER(Input), ctypes.c_int]
+        send.restype = wintypes.UINT
+        return int(send(len(inputs), inputs, ctypes.sizeof(Input)))
+
 
 class _PyAutoGUIBackend:
     """基于 ``pyautogui`` 的兼容兜底后端。"""
@@ -145,12 +185,12 @@ class _PyAutoGUIBackend:
     def press(self, key):
         if pyautogui is None:
             raise RuntimeError("pyautogui 后端不可用")
-        pyautogui.keyDown(key)
+        pyautogui.keyDown(key, _pause=False)
 
     def release(self, key):
         if pyautogui is None:
             raise RuntimeError("pyautogui 后端不可用")
-        pyautogui.keyUp(key)
+        pyautogui.keyUp(key, _pause=False)
 
 
 _BACKEND_CLASSES = {
@@ -170,6 +210,9 @@ class KeyController:
         self._backends = {name: cls() for name, cls in _BACKEND_CLASSES.items()}
         self._backend_name = BACKEND_KEYBOARD
         self._auto = False
+        self._held_backend = {}
+        self._input_lock = threading.RLock()
+        self.last_backend = None
         self.set_backend(backend)
 
     # ---------- 后端管理 ----------
@@ -242,6 +285,9 @@ class KeyController:
     def _resolve(self, note):
         return self.mapping.get(note)
 
+    def physical_key(self, note):
+        return self._normalize_key(self._resolve(note)) or note
+
     def _normalize_key(self, key):
         """Normalize letter key names to physical lowercase keys.
 
@@ -292,10 +338,63 @@ class KeyController:
             return
         self._send("release", key)
 
+    def _send_batch(self, action, notes):
+        result = KeyBatchResult()
+        with self._input_lock:
+            pending = {}
+            for note in dict.fromkeys(notes):
+                key = self._resolve(note)
+                if not key or self.debug:
+                    if self.debug and key:
+                        self.log_func(f"[DEBUG] {action} {note} -> {self._normalize_key(key)}")
+                    result.failed_notes.append(note)
+                else:
+                    pending.setdefault(self._normalize_key(key), []).append(note)
+            # Release each physical key on the backend that delivered key-down.
+            groups = {}
+            for key in pending:
+                preferred = self._held_backend.get(key, self._backend_name) if action == "release" else self._backend_name
+                groups.setdefault(preferred, []).append(key)
+            for preferred, keys in groups.items():
+                remaining = list(keys)
+                order = [preferred] + [name for name in _BACKEND_ORDER if name != preferred]
+                for name in order:
+                    backend = self._backends[name]
+                    if not backend.available or not remaining:
+                        continue
+                    succeeded = []
+                    try:
+                        if hasattr(backend, "send_many"):
+                            count = backend.send_many(action, remaining)
+                            succeeded = remaining[:max(0, min(len(remaining), count))]
+                        else:
+                            for key in remaining:
+                                try:
+                                    getattr(backend, action)(key)
+                                    succeeded.append(key)
+                                except Exception as exc:
+                                    self.log_func(f"[WARN] {name} {action} {key}: {exc}")
+                    except Exception as exc:
+                        self.log_func(f"[WARN] {name} {action}: {exc}")
+                    for key in succeeded:
+                        for note in pending[key]:
+                            result.sent_notes.append(note)
+                            result.backend_by_note[note] = name
+                        if name != preferred:
+                            result.fallback_count += 1
+                        if action == "press":
+                            self._held_backend[key] = name
+                        else:
+                            self._held_backend.pop(key, None)
+                        self.last_backend = name
+                    remaining = [key for key in remaining if key not in succeeded]
+                for key in remaining:
+                    result.failed_notes.extend(pending[key])
+                    self.log_func(f"[WARN] 按键{action}失败: {key}")
+        return result
+
     def press_keys(self, notes):
-        for note in notes:
-            self.press(note)
+        return self._send_batch("press", notes)
 
     def release_keys(self, notes):
-        for note in notes:
-            self.release(note)
+        return self._send_batch("release", notes)

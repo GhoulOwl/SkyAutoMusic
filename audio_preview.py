@@ -482,6 +482,8 @@ class AudioPreviewController:
                 backend.close()
 
     def press_keys(self, notes):
+        from key_controller import KeyBatchResult
+        notes = list(notes)
         indices = []
         seen = set()
         for note in notes:
@@ -490,16 +492,20 @@ class AudioPreviewController:
                 seen.add(index)
                 indices.append(index)
         if not indices:
-            return
+            return KeyBatchResult(failed_notes=notes)
         with self._lock:
             backend = self._backend
         if backend is None:
             self._report_error(AudioPreviewError("试听音色尚未准备完成"))
-            return
+            return KeyBatchResult(failed_notes=notes)
         try:
             backend.play_indices(indices)
+            valid = [note for note in notes if note_to_sample_index(note) is not None]
+            return KeyBatchResult(sent_notes=valid, failed_notes=[note for note in notes if note not in valid],
+                                  backend_by_note={note: type(backend).__name__ for note in valid})
         except Exception as exc:
             self._report_error(exc)
+            return KeyBatchResult(failed_notes=notes)
 
     def release_keys(self, notes):
         # Samples are one-shot sounds.  Releasing after MusicPlayer.NOTE_HOLD
