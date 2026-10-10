@@ -2,6 +2,7 @@ import tempfile
 import unittest
 import wave
 from pathlib import Path
+from unittest.mock import patch
 
 from player import PlaybackState
 from transcription.comparison import ComparisonTransport, NativeTrackPlayer, comparison_range, prepare_comparison_audio
@@ -75,3 +76,13 @@ class ComparisonTests(unittest.TestCase):
             render_preview_wav([], str(path), library=Library(), start_ms=0, end_ms=1000)
             audio, _sr = sf.read(path)
             self.assertTrue(np.all(audio == 0))
+
+    def test_pure_melody_uses_saved_roles_instead_of_reinterpreting_reviewed_notes(self):
+        notes = [{'time': 100, 'key': '1Key3'}, {'time': 100, 'key': '1Key10'}]
+        result = TranscriptionResult([], notes, 'C major', 120, {}, [], note_roles={'100:1Key3': 'melody', '100:1Key10': 'harmony'})
+        rendered = []
+        def render(chosen, path, **_kwargs):
+            rendered.extend(chosen); Path(path).write_bytes(b'wave'); return path
+        with tempfile.TemporaryDirectory() as root, patch('transcription.comparison.render_preview_wav', render):
+            prepare_comparison_audio(result, 'missing.wav', 0, 1000, 'melody', root)
+        self.assertEqual(rendered, [notes[0]])

@@ -956,6 +956,7 @@ class MusicGUI:
                 return False
             self._prepare_game_input()
             self.player.speed = self.speed
+            self.player.source_name = filename
             self.player.simulate = self.simulate
             self.player.miss_prob = self.miss_prob
             self.key_controller.set_debug(self.debug)

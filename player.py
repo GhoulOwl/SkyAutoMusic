@@ -53,6 +53,7 @@ class MusicPlayer:
         self._score_start_ms = 0
         self._paused_at = None
         self.diagnostics = []
+        self.source_name = ''
 
     def is_playing(self):
         return self.state == PlaybackState.PLAYING
@@ -94,7 +95,10 @@ class MusicPlayer:
             if self.is_playing():
                 self._paused_at = self._clock()
                 self.state = PlaybackState.PAUSED
-                self._release_held()
+                if self._release_held():
+                    self._stop.set()
+                    self.state = PlaybackState.STOPPED
+                    self.update_status('演奏失败：暂停时未能松开按键')
                 self._wake.set()
 
     def resume(self):
@@ -119,7 +123,10 @@ class MusicPlayer:
                 return
             self._seek_target_idx = max(0, min(int(target_idx), len(self.sorted_times) - 1))
             self._seek_requested = True
-            self._release_held()
+            if self._release_held():
+                self._stop.set()
+                self.state = PlaybackState.STOPPED
+                self.update_status('演奏失败：跳转时未能松开按键')
             self._wake.set()
 
     def _record(self, **entry):
@@ -133,6 +140,9 @@ class MusicPlayer:
             delays = sorted(row['lateness_ms'] for row in attacks)
             return {
                 'sent_count': sum(len(row['sent_notes']) for row in attacks),
+                'source_name': self.source_name,
+                'planned_count': sum(len(notes) for notes in (self.notes_by_time or {}).values()),
+                'failed_press_count': sum(len(row.get('failed_notes', [])) for row in attacks),
                 'failed_count': sum(len(row.get('failed_notes', [])) for row in self.diagnostics),
                 'fallback_count': sum(row.get('fallback_count', 0) for row in self.diagnostics),
                 'p95_lateness_ms': delays[min(len(delays)-1, int(.95*len(delays)))] if delays else 0,
@@ -166,7 +176,8 @@ class MusicPlayer:
         if notes:
             failed = self._release_notes(notes)
             if failed:
-                self._release_notes(failed)
+                return self._release_notes(failed)
+        return []
 
     def _run(self, session, stop_event):
         try:
@@ -180,7 +191,9 @@ class MusicPlayer:
         finally:
             with self._lock:
                 if session == self._session:
-                    self._release_held()
+                    if self._release_held():
+                        stop_event.set()
+                        self.update_status('演奏失败：未能松开按键')
                     self.state = PlaybackState.STOPPED
                     self.current_idx = 0
                     self.update_note(-1, None, [])
@@ -218,16 +231,22 @@ class MusicPlayer:
                 else:
                     now = self._clock()
                     due = []
+                    due_identities = []
                     while self._releases and self._releases[0][0] <= now:
                         _deadline, token, identity = heapq.heappop(self._releases)
                         held = self._held_keys.get(identity)
                         if held and held[1] == token:
-                            del self._held_keys[identity]
                             due.append(held[0])
+                            due_identities.append(identity)
                     if due:
                         failed = self._release_notes(due)
                         if failed:
-                            self._release_notes(failed)
+                            failed = self._release_notes(failed)
+                        for identity in due_identities:
+                            if self._held_keys[identity][0] not in failed:
+                                del self._held_keys[identity]
+                        if failed:
+                            raise RuntimeError('未能松开按键：' + ', '.join(failed))
                     if index >= len(times):
                         if not self._releases:
                             return
@@ -261,14 +280,21 @@ class MusicPlayer:
         for note in notes:
             identity = self._identity(note)
             if identity in self._held_keys:
-                held = self._held_keys.pop(identity)
-                self._release_notes([held[0]])
+                held = self._held_keys[identity]
+                failed = self._release_notes([held[0]])
+                if failed:
+                    failed = self._release_notes(failed)
+                if failed:
+                    raise RuntimeError('重奏前未能松开按键：' + held[0])
+                del self._held_keys[identity]
             unique.setdefault(identity, note)
         notes = list(unique.values())
         result = self.key_controller.press_keys(notes)
         sent = list(getattr(result, 'sent_notes', notes))
         now = self._clock()
         self._record(action='press', notes=notes, sent_notes=sent,
+                     score_time_ms=int(self.sorted_times[index]) if self.sorted_times else None,
+                     onset_index=index, speed=self.speed,
                      failed_notes=list(getattr(result, 'failed_notes', ())),
                      backends=dict(getattr(result, 'backend_by_note', {})),
                      fallback_count=getattr(result, 'fallback_count', 0),

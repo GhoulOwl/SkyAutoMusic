@@ -211,29 +211,46 @@ def _events_to_melody(
 ) -> List[MelodyNote]:
     by_time: Dict[int, List[NoteEvent]] = {}
     for event in events:
-        if not 40 <= event.midi_pitch <= 96:
-            continue
-        start = _nearest_grid(grid, event.start_ms)
-        by_time.setdefault(start, []).append(event)
+        if 40 <= event.midi_pitch <= 96:
+            by_time.setdefault(event.start_ms, []).append(event)
     selected: List[MelodyNote] = []
+    selected_events: List[NoteEvent] = []
+    positions = {}
     previous_pitch: Optional[int] = None
-    for start in sorted(by_time):
-        pool = by_time[start]
+    for raw_start in sorted(by_time):
+        pool = by_time[raw_start]
         def score(event: NoteEvent) -> Tuple[float, float, float]:
             continuity = 0.0 if previous_pitch is None or not previous_bias else -0.035 * abs(event.midi_pitch - previous_pitch)
             lead_bonus = 0.018 * event.midi_pitch if source == "instrumental" else 0.0
             return event.strength + continuity + lead_bonus, event.duration_ms, event.midi_pitch
         event = max(pool, key=score)
+        start = _nearest_grid(grid, event.start_ms)
         end = max(start + 1, _nearest_grid(grid, event.end_ms))
-        note = MelodyNote(start, end, event.midi_pitch, max(0.0, min(1.0, event.strength)), source)
-        # Merge overlapping detector fragments only. A later attack at the same
-        # pitch is a new syllable/key press even when the intervening gap is short.
-        if selected and note.midi_pitch == selected[-1].midi_pitch and event.start_ms <= selected[-1].start_ms + 35:
-            previous = selected[-1]
-            selected[-1] = MelodyNote(previous.start_ms, max(previous.end_ms, note.end_ms), previous.midi_pitch, max(previous.confidence, note.confidence), source)
-        else:
-            selected.append(note)
-            previous_pitch = note.midi_pitch
+        confidence = max(0.0, min(1.0, event.strength))
+        if selected_events:
+            previous_event = selected_events[-1]
+            overlap = max(0, min(previous_event.end_ms, event.end_ms) - max(previous_event.start_ms, event.start_ms))
+            duplicate_detector = (event.source != previous_event.source and event.midi_pitch == previous_event.midi_pitch
+                                  and event.start_ms - previous_event.start_ms <= 35
+                                  and overlap >= .70 * min(event.duration_ms, previous_event.duration_ms))
+            if duplicate_detector:
+                old = selected[-1]
+                selected[-1] = replace(old, end_ms=max(old.end_ms, end), confidence=max(old.confidence, confidence))
+                continue
+        collision = positions.get((start, event.midi_pitch))
+        if collision is not None:
+            old = selected[collision]
+            old_start = selected_events[collision].start_ms
+            # Restore both real attacks when a grid cell would merge them.
+            selected[collision] = replace(old, start_ms=old_start, end_ms=max(old_start+1, old.end_ms))
+            positions.pop((old.start_ms, old.midi_pitch), None)
+            positions[(old_start, old.midi_pitch)] = collision
+            start = event.start_ms
+            end = max(start+1, end)
+        positions[(start, event.midi_pitch)] = len(selected)
+        selected.append(MelodyNote(start, end, event.midi_pitch, confidence, source))
+        selected_events.append(event)
+        previous_pitch = event.midi_pitch
     return selected
 
 

@@ -49,22 +49,25 @@ def prepare_comparison_audio(result, source_path, start_ms, end_ms, mode, root, 
         stat = os.stat(source_path)
         source_identity = (os.path.abspath(source_path), stat.st_size, stat.st_mtime_ns)
     if mode == "melody":
-        if result.quality_analysis:
+        if result.note_roles:
+            # Saved roles describe the reviewed score, including older drafts.
+            notes = []
+            for note in result.song_notes:
+                label = f"{note['time']}:{note['key']}"
+                packed = (int(note['time']) << 4) | int(str(note['key'])[4:])
+                role = result.note_roles.get(label, result.note_roles.get(str(packed), result.note_roles.get(packed)))
+                if role == "melody":
+                    notes.append(note)
+        elif result.quality_analysis:
             from .quality import arrange_quality_melody
             notes = arrange_quality_melody(result.quality_analysis, result.options, result.semitone_shift)
+        elif result.analysis:
+            from .arranger import arrange_analysis
+            all_notes, _stats, roles = arrange_analysis(result.analysis, result.options)
+            notes = [n for n in all_notes if roles.get((int(n['time']) << 4) | int(str(n['key'])[4:])) == 'melody']
         else:
-            notes = [n for n in result.song_notes if result.note_roles.get(f"{n['time']}:{n['key']}") == "melody"]
-            if not result.note_roles:
-                # V2 uses a packed integer role id; old drafts have no roles.
-                # Re-arrange analysis to recover roles, rather than infer melody
-                # by taking the highest rendered accompaniment note.
-                if result.analysis:
-                    from .arranger import arrange_analysis
-                    all_notes, _stats, roles = arrange_analysis(result.analysis, result.options)
-                    notes = [n for n in all_notes if roles.get((int(n['time']) << 4) | int(str(n['key'])[4:])) == 'melody']
-                else:
-                    from .benchmark import _melody
-                    notes = _melody(result.song_notes)
+            from .benchmark import _melody
+            notes = _melody(result.song_notes)
     else:
         notes = result.song_notes
     identity = json.dumps([mode, start_ms, end_ms, source_identity, notes if mode in ('melody', 'arrangement') else None], sort_keys=True)

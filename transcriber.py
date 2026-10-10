@@ -152,46 +152,8 @@ class Transcriber:
 
     @staticmethod
     def _transcribe_metadata(result: TranscriptionResult) -> Dict[str, Any]:
-        metadata: Dict[str, Any] = {
-            "schemaVersion": 3 if result.quality_analysis is not None else 2,
-            "engine": result.engine,
-            "sourceFile": result.source_file,
-            "detectedKey": result.detected_key,
-            "semitoneShift": result.semitone_shift,
-            "arrangementPreset": result.options.arrangement_preset,
-            "maxPolyphony": result.options.max_polyphony,
-        }
-        if result.analysis is not None:
-            analysis = result.analysis
-            metadata.update({
-                "separationModel": result.separation_model,
-                "analysisVersion": 2,
-                "meter": analysis.tempo_map.meter,
-                "tempoMode": "bar_smooth",
-                "leadSource": analysis.lead_source,
-                "usedMixFallback": analysis.used_mix_fallback,
-                "confidence": {
-                    "timing": round(analysis.tempo_map.confidence, 3),
-                    "key": round(analysis.key_confidence, 3),
-                    "melody": round(analysis.melody_confidence, 3),
-                    "harmony": round(analysis.harmony_confidence, 3),
-                    "structure": round(analysis.structure_confidence, 3),
-                },
-            })
-        if result.quality_analysis is not None:
-            quality = result.quality_analysis
-            metadata.update({
-                "analysisVersion": 3,
-                "qualityArrangerVersion": 6,
-                "qualityModel": quality.model_name,
-                "qualityDevice": quality.device,
-                "timingBackend": quality.timing_backend,
-                "quantization": quality.quantization,
-                "meter": quality.meter,
-                "refinedRegions": [list(region) for region in quality.refined_regions],
-                "confidence": {"timing": round(quality.timing_confidence, 3)},
-            })
-        return metadata
+        from transcription.pipeline import _metadata
+        return _metadata(result)
 
     @staticmethod
     def transcribe_to_song_dict(

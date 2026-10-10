@@ -632,6 +632,7 @@ class TranscriptionDialog:
         if result.quality_analysis is not None:
             quality_detail = (
                 f"\n人声校验证据：{stats.get('vocalEvidenceCount', 0)} · 待复核片段：{len(stats.get('vocalReviewRegions', []))}"
+                f" · 八度修正：{stats.get('vocalOctaveRepairCount', 0)}"
                 f" · 校验降级：{len(stats.get('vocalCheckFailures', []))}"
                 f"\n旋律：{stats.get('melody_note_count', 0)}    伴奏：{stats.get('accompaniment_note_count', 0)}"
                 f"    旋律占比：{float(stats.get('melody_note_ratio', 0)):.0%}"

@@ -3,6 +3,8 @@ from __future__ import annotations
 
 import bisect
 import json
+import os
+import tempfile
 import hashlib
 import importlib.metadata
 import time
@@ -183,7 +185,17 @@ def _save_quality_cache(path: Path, result: TranscriptionResult) -> None:
         "draft": {**asdict(draft), "symbolic_notes": [asdict(note) for note in draft.symbolic_notes]},
     }
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
+    temporary = None
+    try:
+        with tempfile.NamedTemporaryFile('w', encoding='utf-8', dir=path.parent, prefix='.analysis-', suffix='.tmp', delete=False) as handle:
+            temporary = handle.name
+            json.dump(payload, handle, ensure_ascii=False)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temporary, path)
+    finally:
+        if temporary and os.path.exists(temporary):
+            os.unlink(temporary)
 
 
 def _load_quality_cache(path: Path, options: TranscriptionOptions) -> TranscriptionResult | None:
@@ -297,7 +309,7 @@ def _select_melody_v4(notes: Sequence[SymbolicNote], beats: Sequence[int]) -> Li
 def _original_v3_reference_arrangement(draft: QualityAnalysisDraft, options: TranscriptionOptions) -> Tuple[List[Dict[str, object]], Dict[Tuple[int, str], str]]:
     """Historical drum baseline using the frozen V4 lead selector."""
     melody = _select_melody_v4(draft.symbolic_notes, draft.beat_times_ms)
-    shift = _best_shift(melody, options)
+    shift = _best_shift(melody, options, preserve_v8=True)
     melody_ids = {(note.start_ms, note.end_ms, note.midi_pitch, note.instrument) for note in melody}
     by_time: Dict[int, Dict[int, Tuple[int, str]]] = defaultdict(dict)
     previous_source = previous_sky = None
@@ -362,6 +374,7 @@ def run_benchmark(manifest_path: Path, output_path: Path, require_cached: bool =
             raise RuntimeError(f"缺少可复用的原始模型缓存：{song_id}")
         cache_hit = result is not None
         timing_elapsed = vocal_elapsed = 0.0
+        evidence_cached = bool(result is not None and result.quality_analysis.vocal_evidence_version == 2)
         if result is not None and result.quality_analysis.timing_diagnostics.get("anchorVersion") != 1:
             from .quality import _timing_from_model
             timing_started = time.perf_counter()
@@ -393,6 +406,8 @@ def run_benchmark(manifest_path: Path, output_path: Path, require_cached: bool =
             "cache_hit": cache_hit,
             "timing_elapsed_sec": round(timing_elapsed, 3),
             "vocal_check_elapsed_sec": round(vocal_elapsed, 3),
+            "vocal_evidence_cached": evidence_cached,
+            "vocal_check_original_elapsed_sec": result.quality_analysis.timing_diagnostics.get("vocalCheckElapsedSec") if result.quality_analysis else None,
         }
         reference = song.get("reference") or song.get("score")
         if reference:
@@ -435,6 +450,10 @@ def run_benchmark(manifest_path: Path, output_path: Path, require_cached: bool =
                     "filteredDrumCount": result.stats.get("filteredDrumCount", 0),
                 }
         rows.append(row)
+        with open(output_path.with_suffix('.rows.jsonl'), 'a', encoding='utf-8') as journal:
+            journal.write(json.dumps({field: row.get(field) for field in (
+                'id', 'elapsed_sec', 'cache_hit', 'timing_elapsed_sec', 'vocal_check_elapsed_sec',
+                'vocal_evidence_cached', 'vocal_check_original_elapsed_sec')}, ensure_ascii=False) + '\n')
         output_path.with_suffix('.progress.json').write_text(json.dumps({
             'completed': len(rows), 'total': len(songs), 'last_id': song_id,
             'vocal_check_elapsed_sec': row.get('vocal_check_elapsed_sec', 0),

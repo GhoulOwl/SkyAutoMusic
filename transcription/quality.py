@@ -488,7 +488,7 @@ def _shift_candidates(options: TranscriptionOptions) -> Iterable[int]:
     return range(-6, 6)
 
 
-def _best_shift(melody: Sequence[SymbolicNote], options: TranscriptionOptions) -> int:
+def _best_shift(melody: Sequence[SymbolicNote], options: TranscriptionOptions, preserve_v8: bool = False) -> int:
     if not melody:
         return 0
     best_shift, best_cost = 0, float("inf")
@@ -499,7 +499,10 @@ def _best_shift(melody: Sequence[SymbolicNote], options: TranscriptionOptions) -
             key, adjusted = _pitch_to_key(note.midi_pitch + shift, previous_source, previous_sky)
             cost += (2.5 if adjusted else 0.0) + abs(SKY_MIDI[key] - (note.midi_pitch + shift)) * .35
             if previous_sky is not None:
-                source_delta, sky_delta = note.midi_pitch + shift - previous_source, SKY_MIDI[key] - previous_sky
+                # The stable profile is deliberately frozen after the new
+                # transpose objective failed the private validation gate.
+                source_delta = note.midi_pitch + (0 if preserve_v8 else shift) - previous_source
+                sky_delta = SKY_MIDI[key] - previous_sky
                 if source_delta and sky_delta and (source_delta > 0) != (sky_delta > 0):
                     cost += 4.0
             previous_source, previous_sky = note.midi_pitch + shift, SKY_MIDI[key]
@@ -510,7 +513,7 @@ def _best_shift(melody: Sequence[SymbolicNote], options: TranscriptionOptions) -
 
 def _key_for_shift(shift: int) -> str:
     for root, name in enumerate(("C", "C#", "D", "D#", "E", "F", "F#", "G", "G#", "A", "A#", "B")):
-        if key_transpose(f"{name} major") == shift:
+        if key_transpose(f"{name} major") % 12 == shift % 12:
             return f"{name} major"
     return "C major"
 
@@ -548,12 +551,13 @@ def _map_quality_melody(
     """Map the selected lead once for both rendering and benchmark scoring."""
     mapped: List[Tuple[SymbolicNote, int, int]] = []
     voice_positions = set()
+    position_indexes = {}
     previous_source = previous_sky = None
     offsets = _phrase_octave_offsets(melody, shift, options)
     candidate_keys = None
     if options.fidelity_mode == "candidate":
         from .fidelity import map_phrase_keys
-        _shift, candidate_keys = map_phrase_keys(melody, replace(options, source_key=_key_for_shift(shift)))
+        _shift, candidate_keys = map_phrase_keys(melody, options, forced_shift=shift)
     for index, (note, octave) in enumerate(zip(melody, offsets)):
         pitch = note.midi_pitch + shift + octave
         key, _ = _pitch_to_key(pitch, previous_source, previous_sky)
@@ -565,11 +569,22 @@ def _map_quality_melody(
         # deliberately applies only to vocals; instrumental timing retains its
         # established quantization behavior.
         if (note.instrument == "voice" or options.fidelity_mode == "candidate") and (time_ms, key) in voice_positions:
+            if options.fidelity_mode == "candidate":
+                earlier_index = position_indexes[(time_ms, key)]
+                earlier, earlier_time, earlier_key = mapped[earlier_index]
+                original = (earlier.start_ms, earlier_key)
+                if earlier.start_ms != note.start_ms and (original not in voice_positions or original == (earlier_time, earlier_key)):
+                    mapped[earlier_index] = (earlier, earlier.start_ms, earlier_key)
+                    voice_positions.discard((earlier_time, earlier_key))
+                    position_indexes.pop((earlier_time, earlier_key), None)
+                    voice_positions.add(original)
+                    position_indexes[original] = earlier_index
             source_position = (note.start_ms, key)
             if source_position not in voice_positions:
                 time_ms = note.start_ms
         if note.instrument == "voice" or options.fidelity_mode == "candidate":
             voice_positions.add((time_ms, key))
+            position_indexes[(time_ms, key)] = len(mapped)
         mapped.append((note, time_ms, key))
         previous_source, previous_sky = pitch, SKY_MIDI[key]
     return mapped
@@ -581,7 +596,7 @@ def arrange_quality_melody(draft: QualityAnalysisDraft, options: TranscriptionOp
     # part of the V8 symbolic model and must not change a V8 re-arrangement.
     if any(note.source.startswith("vocal_evidence:") for note in draft.symbolic_notes):
         draft = replace(draft, symbolic_notes=[note for note in draft.symbolic_notes if not note.source.startswith("vocal_evidence:")])
-    evidence = draft.vocal_evidence if draft.vocal_evidence_version == 2 else ()
+    evidence = draft.vocal_evidence if draft.vocal_evidence_version == 2 and options.vocal_check == "auto" else ()
     melody = select_melody(draft.symbolic_notes, draft.beat_times_ms, options.fidelity_mode, evidence)
     shift = _arrangement_shift(melody, options) if forced_shift is None else forced_shift
     return [{"time": time_ms, "key": f"1Key{key}"} for _note, time_ms, key in _map_quality_melody(melody, draft, options, shift)]
@@ -591,7 +606,7 @@ def _arrangement_shift(melody, options):
     if options.fidelity_mode == "candidate":
         from .fidelity import map_phrase_keys
         return map_phrase_keys(melody, options)[0]
-    return _best_shift(melody, options)
+    return _best_shift(melody, options, preserve_v8=True)
 
 
 def _diagnose_arrangement(draft: QualityAnalysisDraft, song_notes: Sequence[Dict[str, object]]) -> List[Dict[str, object]]:
@@ -658,7 +673,12 @@ def _beat_score(draft: QualityAnalysisDraft, time_ms: int, beat_ms: int) -> floa
     if distance > min(90, int(round(beat_ms * .18))):
         return -2.0
     meter_count = {"4/4": 4, "3/4": 3, "6/8": 6}[draft.meter]
-    downbeat_index, _ = _nearest_beat_index(draft.beat_times_ms, draft.downbeat_times_ms[0] if draft.downbeat_times_ms else 0)
+    if draft.downbeat_times_ms:
+        anchor = max(0, bisect.bisect_right(draft.downbeat_times_ms, time_ms)-1)
+        downbeat = draft.downbeat_times_ms[anchor]
+    else:
+        downbeat = 0
+    downbeat_index, _ = _nearest_beat_index(draft.beat_times_ms, downbeat)
     position = (index - downbeat_index) % meter_count
     if position == 0:
         return 6.0
@@ -1179,7 +1199,7 @@ def arrange_quality_analysis_with_roles(
     """V7 melody-locking arrangement with source-backed and inferred harmony."""
     if any(note.source.startswith("vocal_evidence:") for note in draft.symbolic_notes):
         draft = replace(draft, symbolic_notes=[note for note in draft.symbolic_notes if not note.source.startswith("vocal_evidence:")])
-    evidence = draft.vocal_evidence if draft.vocal_evidence_version == 2 else ()
+    evidence = draft.vocal_evidence if draft.vocal_evidence_version == 2 and options.vocal_check == "auto" else ()
     melody, segments = select_melody_with_segments(draft.symbolic_notes, draft.beat_times_ms, options.fidelity_mode, evidence)
     draft.lead_segments = segments
     shift = _arrangement_shift(melody, options) if forced_shift is None else forced_shift
@@ -1218,6 +1238,8 @@ def arrange_quality_analysis_with_roles(
     }
     grouped = Counter(int(note["time"]) for note in song_notes)
     accompaniment_count = sum(role != "melody" for role in rendered.values())
+    raw_notes = set(draft.symbolic_notes)
+    octave_repairs = sum(note.instrument == "voice" and note not in raw_notes for note in melody)
     source_accompaniment_count = sum(candidate.provenance == "source" for candidate in accompaniment)
     generated_accompaniment_count = sum(candidate.provenance == "inferred" for candidate in accompaniment)
     diagnostics = _diagnose_arrangement(draft, song_notes)
@@ -1274,6 +1296,7 @@ def arrange_quality_analysis_with_roles(
         "vocalCheck": options.vocal_check,
         "vocalEvidenceVersion": draft.vocal_evidence_version,
         "vocalEvidenceCount": len(draft.vocal_evidence),
+        "vocalOctaveRepairCount": octave_repairs,
         "vocalReviewRegions": [list(region) for region in review_regions],
         "vocalCheckFailures": list(draft.timing_diagnostics.get("vocalCheckFailures", [])),
     }

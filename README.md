@@ -73,7 +73,7 @@ leading rest. Audio is prepared on a worker thread; vocal clips are separated
 only when requested and cached locally for the dialog. A missing source file
 disables source/vocal comparison while the rendered score remains available.
 
-`稳定` retains the established lead selector. The optional `乐句优化` strategy
+`稳定` retains the established lead selector and transposition choices. The optional `乐句优化` strategy
 uses phrase-level dynamic programming and joint 15-key mapping. Its optional
 `校验疑似人声片段` check ranks octave jumps, overlaps, dense attacks and
 unexpected gaps; merged contexts are limited to 30 seconds each and 30% of a
@@ -114,6 +114,15 @@ For independently annotated lead excerpts, a manifest row can supply
 This evaluates the selected melody against the annotated part even when it
 lies below a chord's highest note. Without that file, reports explicitly label
 the reference melody as `top_voice_proxy`.
+
+The 2026-10-10 run used 17 private samples, with three held out for validation.
+The stable profile matched all V8 summary metrics. The candidate improved
+whole-set selected-melody F1 from 0.0347 to 0.0390, but validation fell from
+0.0577 to 0.0390, so it remains optional. The references lack independently
+annotated vocal lead parts; these proxy scores are not absolute vocal accuracy.
+The aggregate results are in `validation/fidelity-summary.json`; private audio,
+references, caches and detailed reports remain in ignored `golden_samples/`.
+Real Windows game triggering still requires a game-session check.
 
 ### Model memory and drafts
 

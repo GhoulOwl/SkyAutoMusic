@@ -1,0 +1,104 @@
+{
+  "date": "2026-10-10",
+  "baseline_commit": "a3e53ca623db5ed986a0784ce908173187e6d35b",
+  "models": [
+    "medium"
+  ],
+  "note_devices": [
+    "mps"
+  ],
+  "sample_count": 17,
+  "validation_count": 3,
+  "default_strategy": "stable",
+  "default_matches_v8_metrics": true,
+  "v8": {
+    "count": 17,
+    "scored_count": 17,
+    "median_key_onset_f1": 0.0432,
+    "median_onset_f1": 0.2699,
+    "median_top_voice_f1": 0.0346,
+    "median_selected_melody_f1": 0.0347,
+    "median_melody_f1": 0.0346,
+    "validation_count": 3,
+    "validation_median_key_onset_f1": 0.0606,
+    "validation_median_onset_f1": 0.3659,
+    "validation_median_top_voice_f1": 0.0577,
+    "validation_median_selected_melody_f1": 0.0577,
+    "validation_median_melody_f1": 0.0577
+  },
+  "stable": {
+    "count": 17,
+    "scored_count": 17,
+    "median_key_onset_f1": 0.0432,
+    "median_onset_f1": 0.2699,
+    "median_top_voice_f1": 0.0346,
+    "median_selected_melody_f1": 0.0347,
+    "median_melody_f1": 0.0346,
+    "validation_count": 3,
+    "validation_median_key_onset_f1": 0.0606,
+    "validation_median_onset_f1": 0.3659,
+    "validation_median_top_voice_f1": 0.0577,
+    "validation_median_selected_melody_f1": 0.0577,
+    "validation_median_melody_f1": 0.0577
+  },
+  "candidate": {
+    "count": 17,
+    "scored_count": 17,
+    "median_key_onset_f1": 0.0447,
+    "median_onset_f1": 0.2699,
+    "median_top_voice_f1": 0.0391,
+    "median_selected_melody_f1": 0.039,
+    "median_melody_f1": 0.0391,
+    "validation_count": 3,
+    "validation_median_key_onset_f1": 0.048,
+    "validation_median_onset_f1": 0.3673,
+    "validation_median_top_voice_f1": 0.039,
+    "validation_median_selected_melody_f1": 0.039,
+    "validation_median_melody_f1": 0.039
+  },
+  "candidate_gate": {
+    "passed": false,
+    "max_f1_drop": 0.005,
+    "failures": [
+      {
+        "reason": "metric_regression",
+        "metric": "validation_median_selected_melody_f1",
+        "baseline": 0.0577,
+        "candidate": 0.039
+      },
+      {
+        "reason": "targeted_vocal_improvement_unverified"
+      }
+    ],
+    "default_strategy": "stable",
+    "game_sound_acknowledgement": "not_tested"
+  },
+  "playback_without_keyboard_injection": {
+    "sent_count": 100,
+    "source_name": "",
+    "planned_count": 100,
+    "failed_press_count": 0,
+    "failed_count": 0,
+    "fallback_count": 0,
+    "p95_lateness_ms": 4.023,
+    "max_lateness_ms": 5.585,
+    "backends": [],
+    "acknowledgement": "input_sent_only",
+    "interval_ms": 20
+  },
+  "local_unit_tests": {
+    "total": 160,
+    "passed": 153,
+    "platform_skipped": 7
+  },
+  "real_audio_vocal_smoke": {
+    "evidence_count": 211,
+    "elapsed_sec": 63.848,
+    "failures": 0
+  },
+  "limitations": [
+    "Windows game sound/trigger acceptance has not been tested on a real game session.",
+    "Private score references do not contain independent vocal lead annotations; proxy F1 must not be interpreted as absolute vocal accuracy.",
+    "Original per-song vocal-check timings are unavailable for the first 15 reused evidence caches; warm-cache timings are not cold inference costs."
+  ]
+}

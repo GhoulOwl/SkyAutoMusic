@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import bisect
 import tempfile
+import time
 from collections import Counter
 from dataclasses import replace
 from typing import Sequence
@@ -40,7 +41,7 @@ def supported_pitch(note, evidence):
 
 def select_phrase_melody(notes, beats, evidence=()):
     from .quality import _inside_or_near_vocal_phrase, _lead_cost, _lead_segments, _vocal_guard_ms
-    vocals = [n for n in notes if n.instrument == "voice" and 45 <= n.midi_pitch <= 100]
+    vocals = [n for n in notes if n.instrument == "voice" and 40 <= n.midi_pitch <= 100]
     guard = _vocal_guard_ms(beats)
     candidates = [n for n in notes if n in vocals or (
         n.instrument != "voice" and n.role != "drums" and 54 <= n.midi_pitch <= 96
@@ -140,6 +141,15 @@ def suspect_regions(draft):
 
 
 def check_vocal_regions(path, draft, cancel_event=None, progress_cb=None):
+    from .model_runtime import model_runtime
+    with model_runtime.activity():
+        started = time.perf_counter()
+        result = _check_vocal_regions(path, draft, cancel_event, progress_cb)
+        draft.timing_diagnostics["vocalCheckElapsedSec"] = round(time.perf_counter()-started, 3)
+        return result
+
+
+def _check_vocal_regions(path, draft, cancel_event=None, progress_cb=None):
     if cancel_event is not None and cancel_event.is_set():
         raise CancelledError("转写已取消")
     from .backends import transcribe_monophonic
@@ -178,11 +188,12 @@ def check_vocal_regions(path, draft, cancel_event=None, progress_cb=None):
         progress_cb("vocal_check", 1, "疑似人声校验完成")
 
 
-def map_phrase_keys(melody, options):
+def map_phrase_keys(melody, options, forced_shift=None):
     """Jointly search transposition and phrase voicing over the 15-key lattice."""
     if not melody:
         return 0, []
-    shifts = [key_transpose(options.source_key)] if options.source_key else list(range(-6, 6))
+    shifts = ([forced_shift] if forced_shift is not None else
+              [key_transpose(options.source_key)] if options.source_key else list(range(-6, 6)))
     best = None
     for shift in shifts:
         all_keys, total = [], 0.0
@@ -192,7 +203,7 @@ def map_phrase_keys(melody, options):
             while end < len(melody) and melody[end].instrument == melody[end-1].instrument and melody[end].start_ms-melody[end-1].end_ms <= 1400:
                 end += 1
             phrase = melody[begin:end]
-            offsets = [12*options.melody_octave_shift] if options.melody_octave_shift is not None else [-12, 0, 12]
+            offsets = [12*options.melody_octave_shift] if options.melody_octave_shift is not None else [-24, -12, 0, 12, 24]
             phrase_best = None
             for offset in offsets:
                 rows, costs, links = [], [], []

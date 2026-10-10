@@ -88,6 +88,24 @@ class PlaybackFidelityTests(unittest.TestCase):
         self.assertEqual(player.diagnostics_summary()['failed_count'], 1)
         self.assertEqual(player.diagnostics[0]['sent_notes'], ['good'])
 
+    def test_unreleased_key_stops_playback_instead_of_silently_losing_retriggers(self):
+        clock = Clock()
+        class CannotRelease(Recorder):
+            def release_keys(self, notes):
+                return KeyBatchResult(failed_notes=list(notes))
+        controller = CannotRelease(clock)
+        finished = []
+        player = MusicPlayer(controller, clock=clock, waiter=clock.wait,
+                             update_finished=lambda: finished.append(True))
+        player.START_DELAY = 0
+        player.start({0: ['a'], 200: ['b']}, [0, 200])
+        player.thread.join(1)
+        self.assertFalse(player.thread.is_alive())
+        self.assertEqual([n for action, _time, n in controller.events if action == 'press'], [('a',)])
+        self.assertEqual(player.state, PlaybackState.STOPPED)
+        self.assertEqual(finished, [])
+        self.assertTrue(any(row['action'] == 'error' for row in player.diagnostics))
+
     def test_pause_freezes_origin_and_seek_clears_old_releases(self):
         seen = set()
         def hook(player, clock):
