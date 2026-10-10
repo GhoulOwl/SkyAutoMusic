@@ -19,6 +19,8 @@ from .netease import NetEaseClient, NetEaseTrack
 from .netease_auth import CookieValidationResult, NetEaseCookieStore, parse_netscape_cookies, serialize_netscape_cookies, validate_cookie_account
 from .pipeline import cleanup_result_artifacts, export_song_json, next_available_path, rearrange_draft, refine_region, sanitize_filename_stem, suggested_output_stem, transcribe_draft
 from .preview import PreviewPlayer
+from .comparison import MODES, ComparisonTransport, NativeTrackPlayer, comparison_range, prepare_comparison_audio
+from .model_runtime import model_runtime
 from .quality import arrange_quality_melody, choose_quality_device, prepare_quality_model, resolve_quality_model
 from .model_download import modelscope_model_url
 from .cuda_setup import ensure_cuda_runtime
@@ -89,6 +91,9 @@ class TranscriptionDialog:
         self.refinement_candidate: Optional[tuple[str, TranscriptionResult]] = None
         self.playhead_ms = 0
         self._transport_dragging = False
+        self.comparison = ComparisonTransport()
+        self._comparison_preparing = False
+        self._comparison_cancel = threading.Event()
 
         self.win = tk.Toplevel(parent)
         self.win.title("生成乐谱")
@@ -112,6 +117,9 @@ class TranscriptionDialog:
         self.quality_model_var = tk.StringVar(value=default_quality_label)
         self.quality_download_source_var = tk.StringVar(value=next((label for label, value in DOWNLOAD_SOURCE_LABELS.items() if value == quality_download_source), "自动（魔搭优先）"))
         self.rights_var = tk.BooleanVar(value=True)
+        self.vocal_check_var = tk.BooleanVar(value=True)
+        self.fidelity_var = tk.StringVar(value="稳定")
+        self.comparison_mode_var = tk.StringVar(value="原曲")
         self.status_var = tk.StringVar(value="选择音频后生成草稿")
         self.detail_var = tk.StringVar(value="")
         self.stats_var = tk.StringVar(value="尚未生成草稿")
@@ -211,6 +219,11 @@ class TranscriptionDialog:
         self.rights_check.grid(row=3, column=0, columnspan=4, sticky="w", padx=4, pady=4)
         self.model_setup_btn = ttk.Button(options, text="配置/下载高质量模型…", command=self.configure_quality_model)
         self.model_setup_btn.grid(row=3, column=4, columnspan=2, sticky="w", padx=4, pady=4)
+        ttk.Label(options, text="旋律策略").grid(row=4, column=0, sticky="e", padx=4, pady=4)
+        self.fidelity_box = ttk.Combobox(options, textvariable=self.fidelity_var, values=["稳定", "乐句优化"], state="readonly", width=12)
+        self.fidelity_box.grid(row=4, column=1, sticky="w", padx=4, pady=4)
+        self.vocal_check_box = ttk.Checkbutton(options, text="校验疑似人声片段", variable=self.vocal_check_var)
+        self.vocal_check_box.grid(row=4, column=2, columnspan=4, sticky="w", padx=4, pady=4)
 
         progress = ttk.Frame(body)
         progress.pack(fill="x", padx=12, pady=6)
@@ -237,6 +250,15 @@ class TranscriptionDialog:
         self.stop_preview_btn.pack(side="right", padx=(6, 0))
         self.preview_btn = ttk.Button(timeline_header, text="试听", command=self.preview_current, state="disabled", style="Accent.TButton", width=9)
         self.preview_btn.pack(side="right")
+        comparison_bar = ttk.Frame(right)
+        comparison_bar.pack(fill="x", pady=(4, 0))
+        self.comparison_box = ttk.Combobox(comparison_bar, textvariable=self.comparison_mode_var, values=list(MODES), state="readonly", width=12)
+        self.comparison_box.pack(side="left")
+        self.comparison_box.bind("<<ComboboxSelected>>", self._comparison_mode_changed)
+        self.comparison_btn = ttk.Button(comparison_bar, text="对照试听", command=self.compare_current, state="disabled")
+        self.comparison_btn.pack(side="left", padx=6)
+        self.comparison_pause_btn = ttk.Button(comparison_bar, text="暂停对照", command=self.pause_comparison, state="disabled")
+        self.comparison_pause_btn.pack(side="left")
         self.transport = tk.Canvas(right, background="#F7F8FB", highlightthickness=1, highlightbackground="#D9DEE7", height=38, cursor="sb_h_double_arrow")
         self.transport.pack(fill="x", pady=(4, 0))
         self.transport.bind("<Configure>", lambda _event: self._draw_transport())
@@ -394,6 +416,8 @@ class TranscriptionDialog:
             quality_device=QUALITY_DEVICE_LABELS[self.quality_model_var.get()],
             quality_download_source=DOWNLOAD_SOURCE_LABELS[self.quality_download_source_var.get()],
             rights_confirmed=bool(self.rights_var.get()),
+            vocal_check="auto" if self.vocal_check_var.get() else "off",
+            fidelity_mode="candidate" if self.fidelity_var.get() == "乐句优化" else "stable",
         )
 
     def choose_local_files(self) -> None:
@@ -429,11 +453,12 @@ class TranscriptionDialog:
         self.discard_refine_btn.config(state="normal" if not busy and self.refinement_candidate is not None else "disabled")
         self.save_btn.config(state="disabled" if busy or current is None else "normal")
         self.save_all_btn.config(state="disabled" if busy or not self.results else "normal")
-        for control in (self.preset_box, self.key_box, self.octave_box, self.polyphony_box, self.bpm_box, self.meter_box, self.engine_box, self.quality_model_box):
+        for control in (self.preset_box, self.key_box, self.octave_box, self.polyphony_box, self.bpm_box, self.meter_box, self.engine_box, self.quality_model_box, self.fidelity_box):
             control.config(state="disabled" if busy else "readonly")
         self.bpm_box.config(state="disabled" if busy else "normal")
         self.rights_check.config(state="disabled" if busy else "normal")
         self.model_setup_btn.config(state="disabled" if busy else "normal")
+        self.vocal_check_box.config(state="disabled" if busy else "normal")
 
     def _sync_preview_controls(self) -> None:
         if self.closed:
@@ -452,6 +477,19 @@ class TranscriptionDialog:
         else:
             self.preview_btn.config(text="试听", state="normal" if current is not None and not self.busy else "disabled")
             self.stop_preview_btn.config(state="disabled")
+        active = self.comparison.state.name != "STOPPED"
+        if active or self._comparison_preparing:
+            self.stop_preview_btn.config(state="normal")
+        self.comparison_btn.config(text="准备中…" if self._comparison_preparing else "对照试听",
+                                   state="normal" if current is not None and not self.busy and not self._comparison_preparing else "disabled")
+        self.comparison_pause_btn.config(text="继续对照" if self.comparison.state.name == "PAUSED" else "暂停对照",
+                                         state="normal" if active and not self.busy else "disabled")
+        self.comparison_box.config(state="disabled" if self.busy else "readonly")
+        source = self._source_path(self._selected_path()) if self._selected_path() else ""
+        available = list(MODES) if os.path.isfile(source) else ["纯旋律", "完整编配"]
+        self.comparison_box.config(values=available)
+        if self.comparison_mode_var.get() not in available:
+            self.comparison_mode_var.set(available[0])
 
     def generate_all(self) -> None:
         if self.busy or not self.files:
@@ -487,9 +525,22 @@ class TranscriptionDialog:
         options = self._options(); self.cancel_event = threading.Event(); self._set_busy(True)
         def worker() -> None:
             try:
-                requires_analysis = options.bpm_override != previous.options.bpm_override or options.meter != previous.options.meter
-                if previous.analysis is not None and not requires_analysis:
-                    result = rearrange_draft(previous, options, self.cancel_event, lambda _s, f, m: self._after(self._apply_progress, f, m, self.source_labels[draft_id]))
+                requires_analysis = (options.bpm_override != previous.options.bpm_override or options.meter != previous.options.meter
+                                     or options.engine != previous.options.engine or options.quality_model != previous.options.quality_model
+                                     or options.quality_device != previous.options.quality_device)
+                if (previous.analysis is not None or previous.quality_analysis is not None) and not requires_analysis:
+                    cached = previous
+                    quality = previous.quality_analysis
+                    if quality is not None and options.fidelity_mode == "candidate" and options.vocal_check == "auto" and quality.vocal_evidence_version != 2:
+                        from .fidelity import check_vocal_regions
+                        source_path = self._source_path(draft_id)
+                        if os.path.isfile(source_path):
+                            quality = replace(quality, timing_diagnostics=dict(quality.timing_diagnostics))
+                            with model_runtime.activity():
+                                check_vocal_regions(source_path, quality, self.cancel_event,
+                                                    lambda _s, f, m: self._after(self._apply_progress, f, m, self.source_labels[draft_id]))
+                            cached = replace(previous, quality_analysis=quality)
+                    result = rearrange_draft(cached, options, self.cancel_event, lambda _s, f, m: self._after(self._apply_progress, f, m, self.source_labels[draft_id]))
                 else:
                     source_path = self._source_path(draft_id)
                     if not os.path.isfile(source_path):
@@ -566,6 +617,8 @@ class TranscriptionDialog:
             self.octave_var.set("自动" if result.options.melody_octave_shift is None else f"{result.options.melody_octave_shift:+d}".replace("+0", "0"))
             self.polyphony_var.set(result.options.max_polyphony)
         self.engine_var.set(next(label for label, value in ENGINE_LABELS.items() if value == result.options.engine))
+        self.fidelity_var.set("乐句优化" if result.options.fidelity_mode == "candidate" else "稳定")
+        self.vocal_check_var.set(result.options.vocal_check == "auto")
         desired = result.options.quality_model
         if desired == "small" and result.options.quality_device == "cpu":
             self.quality_model_var.set("Small（CPU）")
@@ -719,7 +772,8 @@ class TranscriptionDialog:
             return
         self.playhead_ms = int(time_ms)
         if seek:
-            actual = self.preview_player.seek_ms(self.playhead_ms)
+            transport = self.comparison if self.comparison.state.name != "STOPPED" else self.preview_player
+            actual = transport.seek_ms(self.playhead_ms)
             if actual is not None:
                 self.playhead_ms = actual
         self._draw_transport()
@@ -935,11 +989,97 @@ class TranscriptionDialog:
             self._sync_preview_controls()
             messagebox.showerror("试听失败", str(exc), parent=self.win)
 
+    def compare_current(self, _event=None) -> None:
+        result = self._current_result()
+        if self.busy or self._comparison_preparing or result is None:
+            return
+        active = self.comparison.state.name != "STOPPED"
+        position = self.comparison.position_ms if active else self.playhead_ms
+        paused = self.comparison.state.name == "PAUSED"
+        selection = None
+        if self.refine_start_ms is not None and self.refine_end_ms is not None:
+            selection = tuple(sorted((self.refine_start_ms, self.refine_end_ms)))
+        start, end = ((self.comparison.start_ms, self.comparison.end_ms) if active else comparison_range(result, position, selection))
+        self._set_playhead(position)
+        self.stop_preview()
+        session = self._preview_session
+        cancel_event = self._comparison_cancel = threading.Event()
+        mode = MODES[self.comparison_mode_var.get()]
+        source = self._source_path(self._selected_path()) if self._selected_path() else ""
+        root = os.path.join(self._temp_root.name, "comparison")
+        self._comparison_preparing = True
+        self._sync_preview_controls()
+        def worker():
+            backend = None
+            try:
+                with model_runtime.activity():
+                    path = prepare_comparison_audio(result, source, start, end, mode, root,
+                                                    self.preview_player.controller.library, cancel_event)
+                    backend = NativeTrackPlayer(path)
+                if cancel_event.is_set() or self.closed or session != self._preview_session:
+                    backend.close()
+                    return
+                self._after(self._comparison_ready, session, backend, start, end, position, paused)
+            except Exception as exc:
+                if backend:
+                    backend.close()
+                self._after(self._comparison_failed, session, str(exc))
+            finally:
+                if self.closed:
+                    self._temp_root.cleanup()
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _comparison_ready(self, session, backend, start, end, position, paused):
+        if self.closed or session != self._preview_session:
+            backend.close()
+            return
+        self._comparison_preparing = False
+        try:
+            self.comparison.load(backend, start, end, position, paused)
+            self.status_var.set(f"对照试听：{self.comparison_mode_var.get()}")
+            self._sync_preview_controls()
+            self._poll_comparison(session)
+        except Exception as exc:
+            backend.close()
+            self._comparison_failed(session, str(exc))
+
+    def _comparison_failed(self, session, message):
+        if not self.closed and session == self._preview_session:
+            self._comparison_preparing = False
+            self._sync_preview_controls()
+            self.status_var.set(message)
+
+    def _comparison_mode_changed(self, _event=None):
+        if self._comparison_preparing:
+            self.stop_preview()
+            self.compare_current()
+        elif self.comparison.state.name != "STOPPED":
+            self.compare_current()
+
+    def pause_comparison(self):
+        if self.comparison.state.name == "PLAYING":
+            self.comparison.pause()
+        elif self.comparison.state.name == "PAUSED":
+            self.comparison.resume()
+        self._sync_preview_controls()
+
+    def _poll_comparison(self, session):
+        if self.closed or session != self._preview_session or self.comparison.state.name == "STOPPED":
+            return
+        self._update_preview_position(self.comparison.position_ms)
+        if self.comparison.position_ms >= self.comparison.end_ms:
+            self.stop_preview()
+            return
+        self.win.after(40, lambda: self._poll_comparison(session))
+
     def stop_preview(self) -> None:
         self._preview_session += 1
         self._preview_preparing = False
         self._pending_preview = None
         self.preview_player.stop()
+        self._comparison_cancel.set()
+        self.comparison.stop()
+        self._comparison_preparing = False
         self._clear_key_highlights()
         self._sync_preview_controls()
 
@@ -1206,6 +1346,7 @@ class TranscriptionDialog:
             return False
         self._clear_key_highlights()
         self.closed = True; self.cancel_event.set(); self.preview_player.close()
+        self._comparison_cancel.set(); self.comparison.close()
         self._remove_content_scroll_bindings()
         for result in self.results.values(): cleanup_result_artifacts(result)
         self._temp_root.cleanup(); self.win.destroy()

@@ -137,6 +137,8 @@ def suspect_regions(draft):
 
 
 def check_vocal_regions(path, draft, cancel_event=None, progress_cb=None):
+    if cancel_event is not None and cancel_event.is_set():
+        raise CancelledError("转写已取消")
     from .backends import transcribe_monophonic
     from .separation import separate_audio
     import librosa

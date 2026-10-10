@@ -33,6 +33,8 @@ def render_preview_wav(
     output_path: Optional[str] = None,
     sample_rate: int = PREVIEW_SR,
     library: Optional[PianoSampleLibrary] = None,
+    start_ms: Optional[int] = None,
+    end_ms: Optional[int] = None,
 ) -> str:
     """Render with the bundled Sky samples; kept for export/tests, not live playback."""
 
@@ -43,7 +45,11 @@ def render_preview_wav(
         raise TranscriptionError("缺少 librosa / numpy，无法生成钢琴音色试听") from exc
 
     notes = list(song_notes)
-    if not notes:
+    if start_ms is not None and end_ms is not None and end_ms <= start_ms:
+        raise TranscriptionError("试听结束时间必须晚于开始时间")
+    notes = [note for note in notes if (start_ms is None or int(note["time"]) >= start_ms)
+             and (end_ms is None or int(note["time"]) < end_ms)]
+    if not notes and (start_ms is None or end_ms is None):
         raise TranscriptionError("没有可试听的音符")
     sample_paths = (library or PianoSampleLibrary()).ensure_samples()
     used_indices = sorted({_key_index(note) for note in notes})
@@ -59,9 +65,9 @@ def render_preview_wav(
             raise TranscriptionError(f"无法读取钢琴音色 {index}: {exc}") from exc
         decoded[index] = np.asarray(audio, dtype=np.float32)
 
-    first_ms = min(int(note["time"]) for note in notes)
-    last_ms = max(int(note["time"]) for note in notes)
-    longest = max(len(decoded[index]) for index in used_indices)
+    first_ms = start_ms if start_ms is not None else min(int(note["time"]) for note in notes)
+    last_ms = end_ms if end_ms is not None else max(int(note["time"]) for note in notes)
+    longest = 0 if end_ms is not None else max((len(decoded[index]) for index in used_indices), default=0)
     total_samples = (
         int(math.ceil((last_ms - first_ms) / 1000.0 * sample_rate))
         + longest
