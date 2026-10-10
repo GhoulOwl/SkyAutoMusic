@@ -60,7 +60,9 @@ def select_phrase_melody(notes, beats, evidence=()):
         rows, scores, links = [], [], []
         for group in groups[begin:end]:
             voice = [n for n in group if n.instrument == "voice"]
-            row = sorted(voice or group, key=lambda n: _lead_cost(n, None), reverse=True)[:8] + [None]
+            # Gaps between observed groups are rests. Do not delete an observed
+            # attack merely because overlapping model durations look implausible.
+            row = sorted(voice or group, key=lambda n: _lead_cost(n, None), reverse=True)[:8]
             row_scores, row_links = [], []
             for current in row:
                 emission = -15.0 if current is None else _lead_cost(current, None) - 95.0
@@ -102,7 +104,8 @@ def select_phrase_melody(notes, beats, evidence=()):
 def suspect_regions(draft):
     """Rank contexts, merge neighbours, cap each at 30 s and total at 30%."""
     vocals = sorted([n for n in draft.symbolic_notes if n.instrument == "voice"], key=lambda n: n.start_ms)
-    bars = sorted(set([0, *draft.bar_starts_ms, int(draft.duration_sec*1000)]))
+    duration_ms = int(draft.duration_sec*1000)
+    bars = sorted(set([0, *(bar for bar in draft.bar_starts_ms if 0 <= bar <= duration_ms), duration_ms]))
     flags = []
     for index, note in enumerate(vocals):
         previous = vocals[index-1] if index else None
@@ -127,12 +130,12 @@ def suspect_regions(draft):
         # Union first, then enforce the actual decoded duration budget.
         merged = []
         for a, b in sorted([*accepted, (left, right)]):
-            if merged and a <= merged[-1][1] and b-merged[-1][0] <= 30000:
+            if merged and a <= merged[-1][1]:
                 merged[-1] = (merged[-1][0], max(b, merged[-1][1]))
             else:
                 merged.append((a, b))
         if sum(b-a for a, b in merged) <= budget:
-            accepted = merged
+            accepted = [(start, min(b, start+30000)) for a, b in merged for start in range(a, b, 30000)]
     return accepted
 
 

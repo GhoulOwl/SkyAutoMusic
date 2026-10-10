@@ -329,7 +329,7 @@ def _note_delta(before: Sequence[Dict[str, object]], after: Sequence[Dict[str, o
     return sum((old - new).values()), sum((new - old).values())
 
 
-def run_benchmark(manifest_path: Path, output_path: Path) -> Dict[str, Any]:
+def run_benchmark(manifest_path: Path, output_path: Path, require_cached: bool = False) -> Dict[str, Any]:
     manifest_path, output_path = Path(manifest_path), Path(output_path)
     manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
     songs = manifest.get("songs", manifest if isinstance(manifest, list) else [])
@@ -346,15 +346,32 @@ def run_benchmark(manifest_path: Path, output_path: Path) -> Dict[str, Any]:
         )
         audio = Path(song["audio"]); audio = audio if audio.is_absolute() else manifest_path.parent / audio
         song_id = str(song.get("id", audio.stem)); cache = _cache_path(cache_root, song_id, options, audio)
+        tracemalloc.start(); started = time.perf_counter()
         result = _load_quality_cache(cache, options) if options.engine == "quality" else None
+        if require_cached and options.engine == "quality" and result is None:
+            tracemalloc.stop()
+            raise RuntimeError(f"缺少可复用的原始模型缓存：{song_id}")
         cache_hit = result is not None
+        timing_elapsed = vocal_elapsed = 0.0
+        if result is not None and result.quality_analysis.timing_diagnostics.get("anchorVersion") != 1:
+            from .quality import _timing_from_model
+            timing_started = time.perf_counter()
+            quality = result.quality_analysis
+            beats, downbeats, bars, bpm, meter, confidence, backend, diagnostics = _timing_from_model(None, str(audio), quality.symbolic_notes, options, quality.device)
+            quality.beat_times_ms, quality.downbeat_times_ms, quality.bar_starts_ms = beats, downbeats, bars
+            quality.bpm, quality.meter, quality.timing_confidence, quality.timing_backend = bpm, meter, confidence, backend
+            quality.timing_diagnostics.update(diagnostics)
+            timing_elapsed = time.perf_counter()-timing_started
         if result is not None and options.fidelity_mode == "candidate" and options.vocal_check == "auto" and result.quality_analysis.vocal_evidence_version != 2:
             from .fidelity import check_vocal_regions
+            vocal_started = time.perf_counter()
             check_vocal_regions(str(audio), result.quality_analysis)
+            vocal_elapsed = time.perf_counter()-vocal_started
+        if result is not None:
             notes, roles, key, shift, stats = arrange_quality_analysis_with_roles(result.quality_analysis, options)
             result.song_notes, result.note_roles, result.detected_key, result.semitone_shift, result.stats = notes, roles, key, shift, stats
+            result.bpm, result.beat_times_ms = result.quality_analysis.bpm, list(result.quality_analysis.beat_times_ms)
             _save_quality_cache(cache, result)
-        tracemalloc.start(); started = time.perf_counter()
         if result is None:
             result = transcribe_draft(str(audio), options)
             if options.engine == "quality": _save_quality_cache(cache, result)
@@ -365,6 +382,8 @@ def run_benchmark(manifest_path: Path, output_path: Path) -> Dict[str, Any]:
             "noteCount": len(result.song_notes), "stats": result.stats, "warnings": result.warnings,
             "elapsed_sec": round(time.perf_counter() - started, 3), "peak_memory_mb": round(peak / 1024 / 1024, 2),
             "cache_hit": cache_hit,
+            "timing_elapsed_sec": round(timing_elapsed, 3),
+            "vocal_check_elapsed_sec": round(vocal_elapsed, 3),
         }
         reference = song.get("reference") or song.get("score")
         if reference:
@@ -400,6 +419,10 @@ def run_benchmark(manifest_path: Path, output_path: Path) -> Dict[str, Any]:
                     "filteredDrumCount": result.stats.get("filteredDrumCount", 0),
                 }
         rows.append(row)
+        output_path.with_suffix('.progress.json').write_text(json.dumps({
+            'completed': len(rows), 'total': len(songs), 'last_id': song_id,
+            'vocal_check_elapsed_sec': row.get('vocal_check_elapsed_sec', 0),
+        }, ensure_ascii=False), encoding='utf-8')
     metric_rows = [row["metrics"] for row in rows if "metrics" in row]
     summary: Dict[str, Any] = {"count": len(rows), "scored_count": len(metric_rows)}
     if metric_rows:

@@ -14,8 +14,11 @@ def main() -> int:
     parser = argparse.ArgumentParser(description="Run the private SkyAutoMusic V2/V3 15-key golden set.")
     parser.add_argument("manifest", type=Path)
     parser.add_argument("output", type=Path)
+    parser.add_argument("--require-cached", action="store_true", help="Refuse a new MuScriptor run; reuse raw model notes")
+    parser.add_argument("--summary-only", action="store_true")
     args = parser.parse_args()
-    print(json.dumps(run_benchmark(args.manifest, args.output), ensure_ascii=False, indent=2))
+    report = run_benchmark(args.manifest, args.output, require_cached=args.require_cached)
+    print(json.dumps(report['summary'] if args.summary_only else report, ensure_ascii=False, indent=2))
     return 0
 
 

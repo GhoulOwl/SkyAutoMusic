@@ -36,6 +36,10 @@ def _notify(callback: Optional[ProgressCallback], stage: str, fraction: float, m
         callback(stage, max(0.0, min(1.0, float(fraction))), message)
 
 
+def _role_labels(roles):
+    return {f"{identity >> 4}:1Key{identity & 15}": role for identity, role in roles.items()}
+
+
 def transcribe_draft(
     path: str,
     options: Optional[TranscriptionOptions] = None,
@@ -90,7 +94,7 @@ def _transcribe_draft(
         _notify(progress_cb, "arrange", 1.0, "高质量 15 键编配完成")
         return TranscriptionResult(
             events=raw_events, song_notes=notes, detected_key=key, bpm=quality.bpm,
-            stats=stats, warnings=[], engine="arrangement_v3_quality", source_file=os.path.basename(path),
+            stats=stats, warnings=[f"人声校验降级：{message}" for message in quality.timing_diagnostics.get("vocalCheckFailures", [])], engine="arrangement_v3_quality", source_file=os.path.basename(path),
             semitone_shift=shift, beat_times_ms=list(quality.beat_times_ms), options=options,
             source=source, quality_analysis=quality, note_roles=note_roles,
         )
@@ -121,6 +125,7 @@ def _transcribe_draft(
         stats=stats, warnings=warnings, engine="arrangement_v2", source_file=os.path.basename(path),
         semitone_shift=analysis.semitone_shift, octave_shift=0, beat_times_ms=list(analysis.tempo_map.beat_times_ms),
         options=options, source=source, analysis=analysis, separation_model=model, artifact_root=artifact_root,
+        note_roles=_role_labels(_roles),
     )
 
 
@@ -164,6 +169,7 @@ def rearrange_draft(
         semitone_shift=key_transpose(options.source_key or result.analysis.detected_key), octave_shift=0,
         beat_times_ms=list(result.analysis.tempo_map.beat_times_ms), options=options, source=result.source,
         analysis=result.analysis, separation_model=result.separation_model, artifact_root=result.artifact_root,
+        note_roles=_role_labels(_roles),
     )
 
 

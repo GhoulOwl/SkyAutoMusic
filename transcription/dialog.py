@@ -222,6 +222,8 @@ class TranscriptionDialog:
         ttk.Label(options, text="旋律策略").grid(row=4, column=0, sticky="e", padx=4, pady=4)
         self.fidelity_box = ttk.Combobox(options, textvariable=self.fidelity_var, values=["稳定", "乐句优化"], state="readonly", width=12)
         self.fidelity_box.grid(row=4, column=1, sticky="w", padx=4, pady=4)
+        self.fidelity_box.bind("<<ComboboxSelected>>", lambda _event: self._set_busy(self.busy))
+        self.engine_box.bind("<<ComboboxSelected>>", lambda _event: self._set_busy(self.busy))
         self.vocal_check_box = ttk.Checkbutton(options, text="校验疑似人声片段", variable=self.vocal_check_var)
         self.vocal_check_box.grid(row=4, column=2, columnspan=4, sticky="w", padx=4, pady=4)
 
@@ -458,7 +460,7 @@ class TranscriptionDialog:
         self.bpm_box.config(state="disabled" if busy else "normal")
         self.rights_check.config(state="disabled" if busy else "normal")
         self.model_setup_btn.config(state="disabled" if busy else "normal")
-        self.vocal_check_box.config(state="disabled" if busy else "normal")
+        self.vocal_check_box.config(state="disabled" if busy or self.fidelity_var.get() != "乐句优化" or ENGINE_LABELS[self.engine_var.get()] != "quality" else "normal")
 
     def _sync_preview_controls(self) -> None:
         if self.closed:
@@ -629,6 +631,8 @@ class TranscriptionDialog:
         quality_detail = ""
         if result.quality_analysis is not None:
             quality_detail = (
+                f"\n人声校验证据：{stats.get('vocalEvidenceCount', 0)} · 待复核片段：{len(stats.get('vocalReviewRegions', []))}"
+                f" · 校验降级：{len(stats.get('vocalCheckFailures', []))}"
                 f"\n旋律：{stats.get('melody_note_count', 0)}    伴奏：{stats.get('accompaniment_note_count', 0)}"
                 f"    旋律占比：{float(stats.get('melody_note_ratio', 0)):.0%}"
                 f"    未选旋律过滤：{stats.get('filtered_unselected_melody_count', 0)}"
@@ -1000,6 +1004,8 @@ class TranscriptionDialog:
         if self.refine_start_ms is not None and self.refine_end_ms is not None:
             selection = tuple(sorted((self.refine_start_ms, self.refine_end_ms)))
         start, end = ((self.comparison.start_ms, self.comparison.end_ms) if active else comparison_range(result, position, selection))
+        if not active and not start <= position < end:
+            position = start
         self._set_playhead(position)
         self.stop_preview()
         session = self._preview_session

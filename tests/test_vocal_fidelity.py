@@ -8,6 +8,8 @@ from transcription.backends import BackendOutput, _monophonic_chunk
 from transcription.fidelity import check_vocal_regions, map_phrase_keys, select_phrase_melody, supported_pitch, suspect_regions
 from transcription.models import CancelledError, NoteEvent, QualityAnalysisDraft, SymbolicNote, TempoMap, TranscriptionError, TranscriptionOptions, VocalEvidence
 from transcription.quality import _timing_from_model
+from transcription.arranger import arrange_analysis
+from transcription.models import AnalysisDraft, MelodyNote, Section
 
 
 def draft(notes, duration=40):
@@ -70,6 +72,7 @@ class VocalFidelityTests(unittest.TestCase):
         self.assertTrue(regions)
         self.assertLessEqual(sum(b-a for a, b in regions), 12000)
         self.assertTrue(all(b-a <= 30000 for a, b in regions))
+        self.assertTrue(all(a >= previous[1] for previous, (a, b) in zip(regions, regions[1:])))
 
     def test_cancel_during_evidence_is_not_a_fallback(self):
         event = threading.Event(); event.set()
@@ -90,3 +93,11 @@ class VocalFidelityTests(unittest.TestCase):
         self.assertEqual(keys, [7, 8, 9, 11])
         shift, _keys = map_phrase_keys(notes, TranscriptionOptions(source_key='D major'))
         self.assertEqual(shift, -2)
+
+    def test_fast_arranger_respects_manual_octave(self):
+        tempo = TempoMap(120, '4/4', (0, 500, 1000), (0,), (0, 125, 250), .9)
+        analysis = AnalysisDraft(1, tempo, 'C major', .9, 0, [MelodyNote(0, 300, 72, .9, 'vocal')], [], [Section(0, 1000, 'verse', 1)], 'vocal', .9, 0, .5)
+        low, _stats, _roles = arrange_analysis(analysis, TranscriptionOptions(melody_octave_shift=-1))
+        high, _stats, _roles = arrange_analysis(analysis, TranscriptionOptions(melody_octave_shift=1))
+        self.assertEqual(low[0]['key'], '1Key0')
+        self.assertEqual(high[0]['key'], '1Key14')

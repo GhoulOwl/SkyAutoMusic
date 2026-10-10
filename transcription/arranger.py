@@ -179,8 +179,9 @@ def arrange_analysis(analysis: AnalysisDraft, options: TranscriptionOptions) -> 
     previous_sky_pitch: Optional[int] = None
     for melody in analysis.melody:
         pitch = melody.midi_pitch + semitone_shift + (12 * (options.melody_octave_shift or 0))
-        choices = [pitch + shift for shift in (-24, -12, 0, 12, 24)]
-        pitch = min(choices, key=lambda value: (0 if 72 <= value <= 84 else 50 + abs(value - 78), abs(value - (previous_sky_pitch or 78))))
+        if options.melody_octave_shift is None:
+            choices = [pitch + shift for shift in (-24, -12, 0, 12, 24)]
+            pitch = min(choices, key=lambda value: (0 if 72 <= value <= 84 else 50 + abs(value - 78), abs(value - (previous_sky_pitch or 78))))
         key_index, _adjusted = _pitch_to_key(pitch, previous_melody_pitch, previous_sky_pitch)
         key_index = max(7, key_index) if key_index < 7 and pitch >= 72 else key_index
         add(melody.start_ms, key_index, 5, "melody")

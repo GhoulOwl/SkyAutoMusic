@@ -54,6 +54,62 @@ last-resort option for `full` only.
 
 Changing preset, key, octave or polyphony re-arranges the in-memory analysis; it does not run separation or pitch detection again. BPM/meter changes rerun audio analysis.
 
+### Playback fidelity and comparison
+
+Game playback schedules key-down and key-up independently. Different keys can
+overlap without delaying the next attack. The default press is 50 ms; repeated
+physical keys release 5 ms before their next attack when the score allows it.
+Pause, stop and seek clear pending releases, and an older playback session
+cannot release keys belonging to a newly started session. Normal Windows input
+batches chords through SendInput; the PyAutoGUI fallback omits its per-call
+pause. The diagnostic tab shows the actual backend, failed sends, fallbacks and
+lateness, and can export the current session. **A successful send acknowledges
+the input API, not a sound produced by the game.**
+
+The generation dialog offers `原曲`, `分离人声`, `纯旋律` and `完整编配`
+comparison previews. Select bars first, or compare the bar containing the
+playhead. Switching modes retains source time and pause state, including the
+leading rest. Audio is prepared on a worker thread; vocal clips are separated
+only when requested and cached locally for the dialog. A missing source file
+disables source/vocal comparison while the rendered score remains available.
+
+`稳定` retains the established lead selector. The optional `乐句优化` strategy
+uses phrase-level dynamic programming and joint 15-key mapping. Its optional
+`校验疑似人声片段` check ranks octave jumps, overlaps, dense attacks and
+unexpected gaps; merged contexts are limited to 30 seconds each and 30% of a
+song. Stem evidence can rank existing candidates or repair an octave only at
+confidence >= 0.85 and union coverage >= 70%; it never creates a symbolic note.
+Unresolved regions are marked for review. Separation failures retain the
+model transcription, and cancellation propagates instead of becoming a
+fallback. Manual octave choices also take precedence in the fast arranger.
+
+The stable strategy remains the default until a fresh V8 comparison passes the
+whole-set and validation gates **and** targeted vocal improvement is verified.
+`TranscriptionOptions` exposes `fidelity_mode="stable"|"candidate"` and
+`vocal_check="auto"|"off"`. Old drafts keep their saved notes on load;
+re-arrangement explicitly applies the selected strategy. Raw symbolic notes
+stay unchanged, and vocal evidence has its own version in drafts and caches.
+
+Measure scheduling without injecting any real keyboard input:
+
+```bash
+python scripts/benchmark_playback.py --interval-ms 20 --count 100 --output playback-report.json
+```
+
+For a private candidate manifest, set each row's `fidelity_mode` to `candidate`
+and `vocal_check` to `auto`. Capture the V8 baseline from commit
+`a3e53ca623db5ed986a0784ce908173187e6d35b` first. After raw model caches exist:
+
+```bash
+python scripts/benchmark_transcription.py golden_samples/golden-manifest-fidelity-candidate.json golden_samples/fidelity-candidate-report.json --require-cached --summary-only
+python scripts/verify_fidelity.py golden_samples/v8-fidelity-baseline-report.json golden_samples/fidelity-candidate-report.json --targeted golden_samples/fidelity-targeted-report.json --output golden_samples/fidelity-verdict.json
+```
+
+The gate allows a maximum 0.005 decrease in whole-set and validation onset/
+selected-melody F1, requires the same sample IDs and verified targeted evidence,
+and never treats an unmeasured game sound as a successful trigger. Reports
+separate timing refresh and added vocal-check time from cached arrangement work.
+
 ### Model memory and drafts
 
 MuScriptor, Demucs and Basic Pitch remain ready while a transcription task is active, then release their in-memory model caches after three idle minutes. The next task reloads only the model it needs; downloaded model weights are never removed.

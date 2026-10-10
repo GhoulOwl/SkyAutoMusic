@@ -223,8 +223,10 @@ class NativeTrackPlayer:
     def stop(self): self._call('stop')
     def close(self):
         if not self.closed:
-            self._call('close')
-            self.closed = True
+            try:
+                self._call('close')
+            finally:
+                self.closed = True
 
 
 class ComparisonTransport:

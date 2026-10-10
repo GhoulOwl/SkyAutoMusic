@@ -276,7 +276,7 @@ def _timing_from_model(model: object, path: str, notes: Sequence[SymbolicNote], 
     so rejecting them and snapping notes to 120 BPM was worse than retaining a
     low-confidence grid.  Only a tracker failure creates the synthetic grid.
     """
-    diagnostics: Dict[str, object] = {}
+    diagnostics: Dict[str, object] = {"anchorVersion": 1}
     beats: List[int] = []
     downbeats: List[int] = []
     try:
@@ -1221,6 +1221,15 @@ def arrange_quality_analysis_with_roles(
     source_accompaniment_count = sum(candidate.provenance == "source" for candidate in accompaniment)
     generated_accompaniment_count = sum(candidate.provenance == "inferred" for candidate in accompaniment)
     diagnostics = _diagnose_arrangement(draft, song_notes)
+    review_regions = []
+    if options.fidelity_mode == "candidate":
+        from .fidelity import suspect_regions, supported_pitch
+        review_regions = suspect_regions(draft)
+        for bar in diagnostics:
+            affected = [note for note in melody if note.instrument == "voice" and bar["startMs"] <= note.start_ms < bar["endMs"]]
+            unresolved = any(supported_pitch(note, evidence) is None for note in affected)
+            bar["vocalReview"] = unresolved and any(a < bar["endMs"] and b > bar["startMs"] for a, b in review_regions)
+            bar["suspicious"] = bar["suspicious"] or bar["vocalReview"]
     stats: Dict[str, object] = {
         "arranged_note_count": len(song_notes), "onset_count": len(grouped),
         "chord_count": sum(count > 1 for count in grouped.values()),
@@ -1265,6 +1274,8 @@ def arrange_quality_analysis_with_roles(
         "vocalCheck": options.vocal_check,
         "vocalEvidenceVersion": draft.vocal_evidence_version,
         "vocalEvidenceCount": len(draft.vocal_evidence),
+        "vocalReviewRegions": [list(region) for region in review_regions],
+        "vocalCheckFailures": list(draft.timing_diagnostics.get("vocalCheckFailures", [])),
     }
     return song_notes, note_roles, options.source_key or _key_for_shift(shift), shift, stats
 
