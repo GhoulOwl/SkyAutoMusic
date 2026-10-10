@@ -614,10 +614,10 @@ class TranscriptionDialog:
         confidence = ""
         if analysis:
             confidence = f"\n拍速 {analysis.tempo_map.confidence:.2f} · 旋律 {analysis.melody_confidence:.2f} · 和弦 {analysis.harmony_confidence:.2f} · 段落 {analysis.structure_confidence:.2f}"
-            self.preset_var.set(next(label for label, value in PRESET_LABELS.items() if value == result.options.arrangement_preset))
-            self.key_var.set(result.options.source_key or "自动")
-            self.octave_var.set("自动" if result.options.melody_octave_shift is None else f"{result.options.melody_octave_shift:+d}".replace("+0", "0"))
-            self.polyphony_var.set(result.options.max_polyphony)
+        self.preset_var.set(next(label for label, value in PRESET_LABELS.items() if value == result.options.arrangement_preset))
+        self.key_var.set(result.options.source_key or "自动")
+        self.octave_var.set("自动" if result.options.melody_octave_shift is None else f"{result.options.melody_octave_shift:+d}".replace("+0", "0"))
+        self.polyphony_var.set(result.options.max_polyphony)
         self.engine_var.set(next(label for label, value in ENGINE_LABELS.items() if value == result.options.engine))
         self.fidelity_var.set("乐句优化" if result.options.fidelity_mode == "candidate" else "稳定")
         self.vocal_check_var.set(result.options.vocal_check == "auto")

@@ -109,6 +109,11 @@ The gate allows a maximum 0.005 decrease in whole-set and validation onset/
 selected-melody F1, requires the same sample IDs and verified targeted evidence,
 and never treats an unmeasured game sound as a successful trigger. Reports
 separate timing refresh and added vocal-check time from cached arrangement work.
+For independently annotated lead excerpts, a manifest row can supply
+`melody_reference`, `melody_reference_offset_ms`, and `melody_windows_ms`.
+This evaluates the selected melody against the annotated part even when it
+lies below a chord's highest note. Without that file, reports explicitly label
+the reference melody as `top_voice_proxy`.
 
 ### Model memory and drafts
 

@@ -1,5 +1,6 @@
 import unittest
 from scripts.verify_fidelity import METRICS, verify
+from transcription.benchmark import evaluate_15_key
 
 
 class FidelityGateTests(unittest.TestCase):
@@ -18,5 +19,13 @@ class FidelityGateTests(unittest.TestCase):
         candidate = self.report()
         candidate['summary'][METRICS[-1]] = .49
         self.assertFalse(verify(self.report(), candidate, targeted={'passed': True})['passed'])
+
+    def test_explicit_reference_melody_can_be_below_top_voice(self):
+        reference = [{'time': 0, 'key': '1Key3'}, {'time': 0, 'key': '1Key10'},
+                     {'time': 500, 'key': '1Key4'}, {'time': 500, 'key': '1Key11'}]
+        lead = [reference[0], reference[2]]
+        metrics = evaluate_15_key(reference, reference, selected_melody=lead, reference_melody=lead)
+        self.assertEqual(metrics['selected_melody']['f1'], 1)
+        self.assertEqual(metrics['reference_melody_kind'], 'explicit')
         candidate = self.report(); candidate['results'].pop()
         self.assertFalse(verify(self.report(), candidate, targeted={'passed': True})['passed'])

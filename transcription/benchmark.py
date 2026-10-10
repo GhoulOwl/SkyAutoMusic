@@ -106,6 +106,8 @@ def evaluate_15_key(
     reference: Sequence[Dict[str, Any]], estimate: Sequence[Dict[str, Any]],
     coverage_windows: Sequence[Tuple[int, int]] | None = None,
     selected_melody: Sequence[Dict[str, Any]] | None = None,
+    reference_melody: Sequence[Dict[str, Any]] | None = None,
+    melody_windows: Sequence[Tuple[int, int]] | None = None,
 ) -> Dict[str, Any]:
     windows = list(coverage_windows) if coverage_windows is not None else _coverage_windows(reference)
     if coverage_windows is not None and not windows:
@@ -116,7 +118,13 @@ def evaluate_15_key(
         estimate = _in_windows(estimate, windows)
         selected_melody = _in_windows(selected_melody, windows) if selected_melody is not None else None
     top_voice = _f1(_melody(reference), _melody(estimate), require_key=True)
-    selected = _f1(_melody(reference), selected_melody, require_key=True) if selected_melody is not None else top_voice
+    reference_lead = _melody(reference) if reference_melody is None else _in_windows(reference_melody, windows)
+    selected_lead = selected_melody
+    if reference_melody is not None:
+        lead_windows = list(melody_windows) if melody_windows is not None else _coverage_windows(reference_melody)
+        reference_lead = _in_windows(reference_lead, lead_windows)
+        selected_lead = _in_windows(selected_melody or [], lead_windows)
+    selected = _f1(reference_lead, selected_lead, require_key=True) if selected_melody is not None else top_voice
     return {
         "key_onset": _f1(reference, estimate, require_key=True),
         "onset": _f1(reference, estimate, require_key=False),
@@ -124,6 +132,7 @@ def evaluate_15_key(
         # Kept for dashboards written before the selected-melody metric existed.
         "melody": top_voice,
         "selected_melody": selected,
+        "reference_melody_kind": "explicit" if reference_melody is not None else "top_voice_proxy",
         "reference_note_count": len(reference), "estimate_note_count": len(estimate),
         "max_polyphony": max(CounterLike(estimate).values(), default=0),
         "coverage_windows_ms": [list(window) for window in windows],
@@ -389,11 +398,18 @@ def run_benchmark(manifest_path: Path, output_path: Path, require_cached: bool =
         if reference:
             score = Path(reference); score = score if score.is_absolute() else manifest_path.parent / score
             hand_score = _offset_score(_score_notes(score), int(song.get("reference_offset_ms", 0)))
+            reference_lead = None
+            lead_windows = None
+            if song.get("melody_reference"):
+                lead_path = Path(song["melody_reference"])
+                lead_path = lead_path if lead_path.is_absolute() else manifest_path.parent / lead_path
+                reference_lead = _offset_score(_score_notes(lead_path), int(song.get("melody_reference_offset_ms", song.get("reference_offset_ms", 0))))
+                lead_windows = song.get("melody_windows_ms")
             raw_windows = song.get("reference_windows_ms")
             windows = [tuple(map(int, window)) for window in raw_windows] if raw_windows else _coverage_windows(hand_score)
             selected = arrange_quality_melody(result.quality_analysis, options, result.semitone_shift) if result.quality_analysis else None
             row["window_metrics"] = {
-                name: evaluate_15_key(hand_score, result.song_notes, part, selected)
+                name: evaluate_15_key(hand_score, result.song_notes, part, selected, reference_lead, lead_windows)
                 for name, part in _split_windows(windows).items()
             }
             row["metrics"] = row["window_metrics"]["all"]

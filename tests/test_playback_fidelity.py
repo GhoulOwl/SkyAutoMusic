@@ -1,7 +1,11 @@
 import threading
 import unittest
+import ctypes
+import sys
+from types import SimpleNamespace
+from unittest.mock import patch
 
-from key_controller import KeyBatchResult, KeyController
+from key_controller import KeyBatchResult, KeyController, _KeyboardBackend, _PyAutoGUIBackend
 from player import MusicPlayer, PlaybackState
 
 
@@ -134,3 +138,25 @@ class PlaybackFidelityTests(unittest.TestCase):
         controller.set_backend('keyboard')
         controller.press_keys(['a', 'alias'])
         self.assertEqual(backend.calls, [('press', ('y',))])
+
+    def test_sendinput_batch_has_scan_codes_and_release_flags(self):
+        calls = []
+        def send(count, inputs, size):
+            calls.append((count, [(entry.payload.ki.wScan, entry.payload.ki.dwFlags) for entry in inputs]))
+            if sys.platform == 'win32':
+                self.assertEqual(size, 40 if ctypes.sizeof(ctypes.c_void_p) == 8 else 28)
+            return count
+        module = SimpleNamespace(key_to_scan_codes=lambda key: (21 if key == 'y' else 22,))
+        with patch('key_controller.keyboard', module), patch.object(ctypes, 'WinDLL', return_value=SimpleNamespace(SendInput=send), create=True):
+            backend = _KeyboardBackend()
+            self.assertEqual(backend.send_many('press', ['y', 'u']), 2)
+            self.assertEqual(backend.send_many('release', ['y', 'u']), 2)
+        self.assertEqual(calls, [(2, [(21, 8), (22, 8)]), (2, [(21, 10), (22, 10)])])
+
+    def test_pyautogui_playback_omits_implicit_pause(self):
+        calls = []
+        module = SimpleNamespace(keyDown=lambda key, **kwargs: calls.append(('down', key, kwargs)),
+                                 keyUp=lambda key, **kwargs: calls.append(('up', key, kwargs)))
+        with patch('key_controller.pyautogui', module):
+            backend = _PyAutoGUIBackend(); backend.press('y'); backend.release('y')
+        self.assertEqual(calls, [('down', 'y', {'_pause': False}), ('up', 'y', {'_pause': False})])
