@@ -1295,6 +1295,8 @@ class MusicGUI:
 
     def _apply_mode_status(self, mode, msg):
         if self._active_mode == mode:
+            if msg.startswith("演奏失败"):
+                self.stop_play()
             self.status_var.set(msg)
 
     def _on_elapsed(self, sec):

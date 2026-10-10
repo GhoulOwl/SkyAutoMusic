@@ -23,6 +23,7 @@ class KeyBatchResult:
     failed_notes: list = field(default_factory=list)
     backend_by_note: dict = field(default_factory=dict)
     fallback_count: int = 0
+    fatal_error: str = ""
 
 if sys.platform == "win32":
     try:
@@ -190,7 +191,15 @@ class _PyAutoGUIBackend:
     def release(self, key):
         if pyautogui is None:
             raise RuntimeError("pyautogui 后端不可用")
-        pyautogui.keyUp(key, _pause=False)
+        try:
+            pyautogui.keyUp(key, _pause=False)
+        except Exception as exc:
+            if isinstance(exc, getattr(pyautogui, "FailSafeException", ())):
+                # Corner-stop must still let go of keys already pressed. This
+                # uses the same Windows key-up implementation, never key-down.
+                pyautogui._platformModule._keyUp(key)
+            else:
+                raise
 
 
 _BACKEND_CLASSES = {
@@ -359,6 +368,8 @@ class KeyController:
                 remaining = list(keys)
                 order = [preferred] + [name for name in _BACKEND_ORDER if name != preferred]
                 for name in order:
+                    if result.fatal_error:
+                        break
                     backend = self._backends[name]
                     if not backend.available or not remaining:
                         continue
@@ -374,6 +385,9 @@ class KeyController:
                                     succeeded.append(key)
                                 except Exception as exc:
                                     self.log_func(f"[WARN] {name} {action} {key}: {exc}")
+                                    if isinstance(exc, getattr(pyautogui, "FailSafeException", ())) and action == "press":
+                                        result.fatal_error = "鼠标角落紧急停止"
+                                        break
                     except Exception as exc:
                         self.log_func(f"[WARN] {name} {action}: {exc}")
                     for key in succeeded:

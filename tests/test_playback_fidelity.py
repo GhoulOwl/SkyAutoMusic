@@ -160,3 +160,26 @@ class PlaybackFidelityTests(unittest.TestCase):
         with patch('key_controller.pyautogui', module):
             backend = _PyAutoGUIBackend(); backend.press('y'); backend.release('y')
         self.assertEqual(calls, [('down', 'y', {'_pause': False}), ('up', 'y', {'_pause': False})])
+
+    def test_corner_stop_does_not_fall_back_and_still_releases_pressed_key(self):
+        class CornerStop(Exception): pass
+        calls = []
+        def down(key, **_kwargs):
+            if key == 'u': raise CornerStop('corner')
+            calls.append(('down', key))
+        def up(key, **_kwargs): raise CornerStop('corner')
+        module = SimpleNamespace(keyDown=down, keyUp=up, FailSafeException=CornerStop,
+                                 _platformModule=SimpleNamespace(_keyUp=lambda key: calls.append(('up', key))))
+        controller = KeyController({'a': 'y', 'b': 'u'}, log_func=lambda _: None)
+        fallback = Backend()
+        controller._backends = {'interception': fallback, 'keyboard': fallback, 'pyautogui': _PyAutoGUIBackend()}
+        controller.set_backend('pyautogui')
+        player = MusicPlayer(controller); player.START_DELAY = 0
+        with patch('key_controller.pyautogui', module):
+            player.start({0: ['a', 'b']}, [0])
+            player.thread.join(1)
+        self.assertFalse(player.thread.is_alive())
+        self.assertEqual(player.state, PlaybackState.STOPPED)
+        self.assertEqual(calls, [('down', 'y'), ('up', 'y')])
+        self.assertEqual(fallback.calls, [])
+        self.assertEqual(controller._held_backend, {})

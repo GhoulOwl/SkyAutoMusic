@@ -290,6 +290,8 @@ class MusicPlayer:
                     self._record(action='retrigger_conflict', notes=[note])
             self._held_keys[identity] = (note, token)
             heapq.heappush(self._releases, (deadline, token, identity))
+        if getattr(result, 'fatal_error', ''):
+            raise RuntimeError(result.fatal_error)
 
     def _target_perf(self, t_ms):
         speed = self.speed if self.speed and self.speed > 0 else 1.0
