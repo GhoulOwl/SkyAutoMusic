@@ -247,7 +247,20 @@ def _monophonic_chunk(
         onset_times = []
 
     events: List[NoteEvent] = []
+    runs = []
     for value, start, end in _run_length_encode(values):
+        cuts = [start]
+        # Separate repeated attacks inside a steady-pitch run. Keep at least
+        # 80 ms on both sides to avoid splitting ordinary vibrato/noisy edges.
+        if value is not None:
+            for onset in onset_times:
+                frame = int(round(float(onset) * sr / hop_length))
+                margin = max(3, int(round(.08 * sr / hop_length)))
+                if frame - cuts[-1] >= margin and end - frame >= margin:
+                    cuts.append(frame)
+        cuts.append(end)
+        runs.extend((value, left, right) for left, right in zip(cuts, cuts[1:]))
+    for value, start, end in runs:
         if value is None or end - start < 3:
             continue
         start_sec = float(frame_times[start])

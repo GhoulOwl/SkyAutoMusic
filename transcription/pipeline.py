@@ -246,6 +246,10 @@ def _refine_region(
     updated = replace(
         quality, symbolic_notes=sorted(retained + replacement, key=lambda note: (note.start_ms, note.midi_pitch)),
         refined_regions=[*quality.refined_regions, (core_start, core_end)],
+        vocal_evidence=[item for item in quality.vocal_evidence if item.end_ms <= core_start or item.start_ms >= core_end] + [
+            replace(item, start_ms=item.start_ms+offset, end_ms=item.end_ms+offset)
+            for item in local.vocal_evidence if core_start <= item.start_ms+offset < core_end],
+        vocal_evidence_version=local.vocal_evidence_version,
     )
     notes, note_roles, key, shift, stats = arrange_quality_analysis_with_roles(updated, active_options, forced_shift=result.semitone_shift)
     if progress_cb:
@@ -268,6 +272,8 @@ def _metadata(result: TranscriptionResult) -> Dict[str, object]:
         "semitoneShift": result.semitone_shift,
         "arrangementPreset": result.options.arrangement_preset,
         "maxPolyphony": result.options.max_polyphony,
+        "fidelityMode": result.options.fidelity_mode,
+        "vocalCheck": result.options.vocal_check,
     }
     if result.source is not None:
         metadata["sourcePlatform"] = result.source.platform
@@ -290,7 +296,8 @@ def _metadata(result: TranscriptionResult) -> Dict[str, object]:
         quality = result.quality_analysis
         metadata.update({
             "analysisVersion": 3,
-            "qualityArrangerVersion": 8,
+            "qualityArrangerVersion": result.stats.get("qualityArrangerVersion", 8),
+            "vocalEvidenceVersion": quality.vocal_evidence_version,
             "qualityModel": quality.model_name,
             "qualityDevice": quality.device,
             "timingBackend": quality.timing_backend,

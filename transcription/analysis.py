@@ -226,7 +226,9 @@ def _events_to_melody(
         event = max(pool, key=score)
         end = max(start + 1, _nearest_grid(grid, event.end_ms))
         note = MelodyNote(start, end, event.midi_pitch, max(0.0, min(1.0, event.strength)), source)
-        if selected and note.midi_pitch == selected[-1].midi_pitch and note.start_ms - selected[-1].end_ms <= 90:
+        # Merge overlapping detector fragments only. A later attack at the same
+        # pitch is a new syllable/key press even when the intervening gap is short.
+        if selected and note.midi_pitch == selected[-1].midi_pitch and event.start_ms <= selected[-1].start_ms + 35:
             previous = selected[-1]
             selected[-1] = MelodyNote(previous.start_ms, max(previous.end_ms, note.end_ms), previous.midi_pitch, max(previous.confidence, note.confidence), source)
         else:
@@ -245,12 +247,14 @@ def extract_melody(
     warnings: List[str] = []
     _check_cancel(cancel_event)
     _notify(progress_cb, "melody", 0.0, "正在提取人声主旋律")
-    try:
-        pyin = transcribe_monophonic(vocal_path, "normal", cancel_event, None, 40, 96)
-        basic = transcribe_polyphonic(vocal_path, "normal", cancel_event, None, 40, 96)
-        pitch_events = list(pyin.events) + list(basic.events)
-    except TranscriptionError:
-        pitch_events = []
+    pitch_events = []
+    for backend in (transcribe_monophonic, transcribe_polyphonic):
+        try:
+            pitch_events.extend(backend(vocal_path, "normal", cancel_event, None, 40, 96).events)
+        except CancelledError:
+            raise
+        except TranscriptionError as exc:
+            warnings.append(f"人声检测器 {getattr(backend, '__name__', type(backend).__name__)} 未返回结果：{exc}")
     melody = _events_to_melody(pitch_events, tempo.grid_times_ms, "vocal")
     duration = max(1, (tempo.grid_times_ms[-1] if tempo.grid_times_ms else 1))
     coverage = sum(note.end_ms - note.start_ms for note in melody) / duration

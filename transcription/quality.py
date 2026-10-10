@@ -312,8 +312,16 @@ def _timing_from_model(model: object, path: str, notes: Sequence[SymbolicNote], 
         if not downbeats:
             downbeats = beats[::count]
         else:
-            anchor = min(range(len(beats)), key=lambda index: abs(beats[index] - downbeats[0]))
-            downbeats = beats[anchor::count]
+            # Preserve observed anchors; only fill whole missing bars.
+            observed = list(downbeats)
+            repaired = []
+            for left, right in zip(observed, observed[1:]):
+                repaired.append(left)
+                a = min(range(len(beats)), key=lambda index: abs(beats[index]-left))
+                b = min(range(len(beats)), key=lambda index: abs(beats[index]-right))
+                if b-a > count and (b-a) % count == 0:
+                    repaired.extend(beats[index] for index in range(a+count, b, count))
+            downbeats = sorted(set([*repaired, observed[-1]]))
         confidence = max(.35, min(.95, .50 + .30 * regularity + .20 * agreement))
         diagnostics.update({
             "medianBeatMs": round(period, 2), "beatMadMs": round(mad, 2),
@@ -354,6 +362,9 @@ def analyze_quality_audio(path: str, options: TranscriptionOptions, cancel_event
             model_name, device, timing_backend=timing_backend,
             timing_diagnostics=timing_diagnostics, lead_segments=lead_segments,
         )
+        if options.fidelity_mode == "candidate" and options.vocal_check == "auto":
+            from .fidelity import check_vocal_regions
+            check_vocal_regions(path, draft, cancel_event, progress_cb)
         events = [NoteEvent(note.start_ms, note.end_ms, note.midi_pitch, 1.0, f"quality:{note.instrument}") for note in symbolic if note.role != "drums"]
         if progress_cb:
             progress_cb("quality", 1.0, "整曲音符、节拍与重拍识别完成")
@@ -426,8 +437,11 @@ def _lead_segments(selected: Sequence[SymbolicNote], duration_ms: int) -> List[L
     return segments
 
 
-def select_melody_with_segments(notes: Sequence[SymbolicNote], beats: Sequence[int]) -> Tuple[List[SymbolicNote], List[LeadSegment]]:
+def select_melody_with_segments(notes: Sequence[SymbolicNote], beats: Sequence[int], mode: str = "stable", evidence=()) -> Tuple[List[SymbolicNote], List[LeadSegment]]:
     """Choose vocals by phrase and use BGM only in a clear non-vocal passage."""
+    if mode == "candidate":
+        from .fidelity import select_phrase_melody
+        return select_phrase_melody(notes, beats, evidence)
     vocals = [note for note in notes if note.instrument == "voice" and 45 <= note.midi_pitch <= 100]
     instruments = [note for note in notes if note.instrument != "voice" and note.role != "drums" and 54 <= note.midi_pitch <= 96]
     guard_ms = _vocal_guard_ms(beats)
@@ -457,9 +471,9 @@ def select_melody_with_segments(notes: Sequence[SymbolicNote], beats: Sequence[i
     return selected, _lead_segments(selected, duration)
 
 
-def select_melody(notes: Sequence[SymbolicNote], beats: Sequence[int]) -> List[SymbolicNote]:
+def select_melody(notes: Sequence[SymbolicNote], beats: Sequence[int], mode: str = "stable", evidence=()) -> List[SymbolicNote]:
     """Compatibility wrapper for callers interested only in selected notes."""
-    return select_melody_with_segments(notes, beats)[0]
+    return select_melody_with_segments(notes, beats, mode, evidence)[0]
 
 
 def _adaptive_key(time_ms: int, beats: Sequence[int]) -> int:
@@ -485,7 +499,7 @@ def _best_shift(melody: Sequence[SymbolicNote], options: TranscriptionOptions) -
             key, adjusted = _pitch_to_key(note.midi_pitch + shift, previous_source, previous_sky)
             cost += (2.5 if adjusted else 0.0) + abs(SKY_MIDI[key] - (note.midi_pitch + shift)) * .35
             if previous_sky is not None:
-                source_delta, sky_delta = note.midi_pitch - previous_source, SKY_MIDI[key] - previous_sky
+                source_delta, sky_delta = note.midi_pitch + shift - previous_source, SKY_MIDI[key] - previous_sky
                 if source_delta and sky_delta and (source_delta > 0) != (sky_delta > 0):
                     cost += 4.0
             previous_source, previous_sky = note.midi_pitch + shift, SKY_MIDI[key]
@@ -536,19 +550,25 @@ def _map_quality_melody(
     voice_positions = set()
     previous_source = previous_sky = None
     offsets = _phrase_octave_offsets(melody, shift, options)
-    for note, octave in zip(melody, offsets):
+    candidate_keys = None
+    if options.fidelity_mode == "candidate":
+        from .fidelity import map_phrase_keys
+        _shift, candidate_keys = map_phrase_keys(melody, replace(options, source_key=_key_for_shift(shift)))
+    for index, (note, octave) in enumerate(zip(melody, offsets)):
         pitch = note.midi_pitch + shift + octave
         key, _ = _pitch_to_key(pitch, previous_source, previous_sky)
+        if candidate_keys is not None:
+            key = candidate_keys[index]
         time_ms = _adaptive_quantize(note.start_ms, draft)
         # Adjacent syllables can snap to the same 15-key onset.  Keep their
         # distinct attacks by falling back to the model's source time.  This
         # deliberately applies only to vocals; instrumental timing retains its
         # established quantization behavior.
-        if note.instrument == "voice" and (time_ms, key) in voice_positions:
+        if (note.instrument == "voice" or options.fidelity_mode == "candidate") and (time_ms, key) in voice_positions:
             source_position = (note.start_ms, key)
             if source_position not in voice_positions:
                 time_ms = note.start_ms
-        if note.instrument == "voice":
+        if note.instrument == "voice" or options.fidelity_mode == "candidate":
             voice_positions.add((time_ms, key))
         mapped.append((note, time_ms, key))
         previous_source, previous_sky = pitch, SKY_MIDI[key]
@@ -561,9 +581,17 @@ def arrange_quality_melody(draft: QualityAnalysisDraft, options: TranscriptionOp
     # part of the V8 symbolic model and must not change a V8 re-arrangement.
     if any(note.source.startswith("vocal_evidence:") for note in draft.symbolic_notes):
         draft = replace(draft, symbolic_notes=[note for note in draft.symbolic_notes if not note.source.startswith("vocal_evidence:")])
-    melody = select_melody(draft.symbolic_notes, draft.beat_times_ms)
-    shift = _best_shift(melody, options) if forced_shift is None else forced_shift
+    evidence = draft.vocal_evidence if draft.vocal_evidence_version == 2 else ()
+    melody = select_melody(draft.symbolic_notes, draft.beat_times_ms, options.fidelity_mode, evidence)
+    shift = _arrangement_shift(melody, options) if forced_shift is None else forced_shift
     return [{"time": time_ms, "key": f"1Key{key}"} for _note, time_ms, key in _map_quality_melody(melody, draft, options, shift)]
+
+
+def _arrangement_shift(melody, options):
+    if options.fidelity_mode == "candidate":
+        from .fidelity import map_phrase_keys
+        return map_phrase_keys(melody, options)[0]
+    return _best_shift(melody, options)
 
 
 def _diagnose_arrangement(draft: QualityAnalysisDraft, song_notes: Sequence[Dict[str, object]]) -> List[Dict[str, object]]:
@@ -1151,9 +1179,10 @@ def arrange_quality_analysis_with_roles(
     """V7 melody-locking arrangement with source-backed and inferred harmony."""
     if any(note.source.startswith("vocal_evidence:") for note in draft.symbolic_notes):
         draft = replace(draft, symbolic_notes=[note for note in draft.symbolic_notes if not note.source.startswith("vocal_evidence:")])
-    melody, segments = select_melody_with_segments(draft.symbolic_notes, draft.beat_times_ms)
+    evidence = draft.vocal_evidence if draft.vocal_evidence_version == 2 else ()
+    melody, segments = select_melody_with_segments(draft.symbolic_notes, draft.beat_times_ms, options.fidelity_mode, evidence)
     draft.lead_segments = segments
-    shift = _best_shift(melody, options) if forced_shift is None else forced_shift
+    shift = _arrangement_shift(melody, options) if forced_shift is None else forced_shift
     mapped_melody, locked, melody_ids = _locked_melody(melody, draft, options, shift)
     filtering: Counter[str] = Counter()
     protected = draft.timing_confidence < _LOW_TIMING_THRESHOLD or draft.timing_backend in ("fixed_120_fallback", "fixed_grid_fallback")
@@ -1231,7 +1260,11 @@ def arrange_quality_analysis_with_roles(
         "unsnappedNoteCount": sum(not _quantize_with_status(note.start_ms, draft)[1] for note in draft.symbolic_notes if note.role != "drums"),
         "barDiagnostics": diagnostics,
         "suspiciousBarCount": sum(bool(item["suspicious"]) for item in diagnostics),
-        "qualityArrangerVersion": 8,
+        "qualityArrangerVersion": 9 if options.fidelity_mode == "candidate" else 8,
+        "fidelityMode": options.fidelity_mode,
+        "vocalCheck": options.vocal_check,
+        "vocalEvidenceVersion": draft.vocal_evidence_version,
+        "vocalEvidenceCount": len(draft.vocal_evidence),
     }
     return song_notes, note_roles, options.source_key or _key_for_shift(shift), shift, stats
 

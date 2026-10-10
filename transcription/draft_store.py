@@ -86,6 +86,7 @@ def _result_to_dict(result: TranscriptionResult) -> Dict[str, Any]:
             "timing_diagnostics": dict(value.timing_diagnostics),
             "lead_segments": [item.__dict__ for item in value.lead_segments],
             "vocal_evidence": [item.__dict__ for item in value.vocal_evidence],
+            "vocal_evidence_version": value.vocal_evidence_version,
         }
     source = None
     if result.source is not None:
@@ -145,6 +146,7 @@ def _result_from_dict(value: Dict[str, Any]) -> TranscriptionResult:
             timing_diagnostics=dict(quality_value.get("timing_diagnostics", {})),
             lead_segments=[LeadSegment(**item) for item in quality_value.get("lead_segments", [])],
             vocal_evidence=[VocalEvidence(**item) for item in quality_value.get("vocal_evidence", [])],
+            vocal_evidence_version=int(quality_value.get("vocal_evidence_version", 0)),
         )
     return TranscriptionResult(
         events=[NoteEvent(**item) for item in value.get("events", [])], song_notes=list(value.get("song_notes", [])),

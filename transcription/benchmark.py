@@ -13,7 +13,7 @@ from pathlib import Path
 from statistics import median
 from typing import Any, Dict, Iterable, List, Sequence, Tuple
 
-from .models import LeadSegment, QualityAnalysisDraft, SymbolicNote, TranscriptionOptions, TranscriptionResult
+from .models import LeadSegment, QualityAnalysisDraft, SymbolicNote, TranscriptionOptions, TranscriptionResult, VocalEvidence
 from .pipeline import transcribe_draft
 from .arranger import SKY_MIDI, _pitch_to_key
 from .quality import _adaptive_quantize, _best_shift, arrange_quality_analysis_with_roles, arrange_quality_melody, select_melody
@@ -165,7 +165,8 @@ def _save_quality_cache(path: Path, result: TranscriptionResult) -> None:
         return
     draft = result.quality_analysis
     payload = {
-        "cacheVersion": 4,
+        "cacheVersion": 5,
+        "postprocessVersion": result.stats.get("qualityArrangerVersion", 8),
         "modelName": draft.model_name,
         "modelVersion": _quality_model_version(),
         # Only the expensive symbolic analysis belongs in the cache.  Current
@@ -181,11 +182,14 @@ def _load_quality_cache(path: Path, options: TranscriptionOptions) -> Transcript
         return None
     try:
         payload = json.loads(path.read_text(encoding="utf-8"))
-        if payload.get("cacheVersion") != 4 or payload.get("modelVersion") != _quality_model_version():
+        if payload.get("cacheVersion") not in (4, 5) or payload.get("modelVersion") != _quality_model_version():
             return None
         value = payload["draft"]
         value["symbolic_notes"] = [SymbolicNote(**note) for note in value["symbolic_notes"]]
         value["lead_segments"] = [LeadSegment(**segment) for segment in value.get("lead_segments", [])]
+        value["vocal_evidence"] = [VocalEvidence(**item) for item in value.get("vocal_evidence", [])]
+        if value.get("vocal_evidence_version", 0) != 2:
+            value["vocal_evidence"] = []
         draft = QualityAnalysisDraft(**value)
         notes, note_roles, key, shift, stats = arrange_quality_analysis_with_roles(draft, options)
         return TranscriptionResult(
@@ -337,11 +341,19 @@ def run_benchmark(manifest_path: Path, output_path: Path) -> Dict[str, Any]:
             bpm_override=song.get("bpm"), meter=str(song.get("meter", "auto")),
             engine=str(song.get("engine", "fast")), quality_model=str(song.get("quality_model", "auto")),
             rights_confirmed=bool(song.get("rights_confirmed", False)),
+            vocal_check=str(song.get("vocal_check", "auto")),
+            fidelity_mode=str(song.get("fidelity_mode", "stable")),
         )
         audio = Path(song["audio"]); audio = audio if audio.is_absolute() else manifest_path.parent / audio
         song_id = str(song.get("id", audio.stem)); cache = _cache_path(cache_root, song_id, options, audio)
         result = _load_quality_cache(cache, options) if options.engine == "quality" else None
         cache_hit = result is not None
+        if result is not None and options.fidelity_mode == "candidate" and options.vocal_check == "auto" and result.quality_analysis.vocal_evidence_version != 2:
+            from .fidelity import check_vocal_regions
+            check_vocal_regions(str(audio), result.quality_analysis)
+            notes, roles, key, shift, stats = arrange_quality_analysis_with_roles(result.quality_analysis, options)
+            result.song_notes, result.note_roles, result.detected_key, result.semitone_shift, result.stats = notes, roles, key, shift, stats
+            _save_quality_cache(cache, result)
         tracemalloc.start(); started = time.perf_counter()
         if result is None:
             result = transcribe_draft(str(audio), options)

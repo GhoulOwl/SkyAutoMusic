@@ -170,8 +170,12 @@ class TranscriptionOptions:
     quality_device: QualityDevice = "auto"
     quality_download_source: QualityDownloadSource = "auto"
     rights_confirmed: bool = False
+    vocal_check: Literal["auto", "off"] = "auto"
+    fidelity_mode: Literal["stable", "candidate"] = "stable"
 
     def __post_init__(self) -> None:
+        if self.vocal_check not in ("auto", "off") or self.fidelity_mode not in ("stable", "candidate"):
+            raise ValueError("unsupported vocal check / fidelity mode")
         if self.mode not in ("audio_arrangement", "midi"):
             raise ValueError(f"unsupported transcription mode: {self.mode}")
         if self.arrangement_preset not in ("auto", "simple", "standard", "full"):
